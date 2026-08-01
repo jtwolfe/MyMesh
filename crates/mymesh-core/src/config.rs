@@ -1,6 +1,6 @@
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -9,9 +9,15 @@ pub struct Config {
     pub daemon: DaemonConfig,
     #[serde(default)]
     pub limits: Limits,
-    /// Optional custom rendezvous URL for pairing (empty = built-in public set).
+    /// HTTP mailbox base URL for SPAKE2 rendezvous (e.g. http://127.0.0.1:9876).
     #[serde(default)]
     pub rendezvous_url: Option<String>,
+    /// Shared directory mailbox (cross-process, same host / NFS).
+    #[serde(default)]
+    pub mailbox_dir: Option<PathBuf>,
+    /// Host path sandbox root for remote file access (default: $HOME).
+    #[serde(default)]
+    pub sandbox_root: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -20,19 +26,31 @@ impl Default for Config {
             device_label: crate::DeviceLabel::default_host().as_str().to_string(),
             daemon: DaemonConfig::default(),
             limits: Limits::default(),
-            rendezvous_url: None,
+            rendezvous_url: std::env::var("MYMESH_MAILBOX").ok(),
+            mailbox_dir: std::env::var_os("MYMESH_MAILBOX_DIR").map(PathBuf::from),
+            sandbox_root: None,
         }
+    }
+}
+
+impl Config {
+    pub fn effective_sandbox_root(&self) -> PathBuf {
+        if let Some(p) = &self.sandbox_root {
+            return p.clone();
+        }
+        if let Some(u) = directories::UserDirs::new() {
+            return u.home_dir().to_path_buf();
+        }
+        PathBuf::from(".")
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DaemonConfig {
-    /// Listen for local CLI control socket.
     pub control_socket: String,
     pub enable_terminal: bool,
     pub enable_files: bool,
     pub enable_desktop: bool,
-    /// Auto-start on boot (documented for systemd unit generation).
     pub auto_start: bool,
 }
 
@@ -59,13 +77,9 @@ fn default_control_socket() -> String {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Limits {
-    /// Max concurrent terminal sessions.
     pub max_terminals: u32,
-    /// Max concurrent file transfers.
     pub max_transfers: u32,
-    /// Max desktop frame rate (soft).
     pub desktop_fps: u32,
-    /// Pairing code TTL seconds.
     pub pair_ttl_secs: u64,
 }
 
@@ -87,8 +101,7 @@ impl Config {
             return Ok(Self::default());
         }
         let raw = std::fs::read_to_string(path)?;
-        let cfg: Self = toml::from_str(&raw)?;
-        Ok(cfg)
+        Ok(toml::from_str(&raw)?)
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
@@ -96,8 +109,7 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let raw = toml::to_string_pretty(self)?;
-        std::fs::write(path, raw)?;
+        std::fs::write(path, toml::to_string_pretty(self)?)?;
         Ok(())
     }
 

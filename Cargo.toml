@@ -19,7 +19,7 @@ edition = "2021"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/jtwolfe/MyMesh"
 authors = ["Jamie T. Wolfe"]
-rust-version = "1.75"
+rust-version = "1.91"
 description = "Peer-to-peer remote access mesh with Signal-style pairing"
 
 [workspace.dependencies]
@@ -63,3 +63,8 @@ crossterm = "0.27"
 indicatif = "0.17"
 console = "0.15"
 data-encoding = "2"
+iroh = "1.0.3"
+axum = { version = "0.8", features = ["macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+url = "2"

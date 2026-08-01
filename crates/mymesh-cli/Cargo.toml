@@ -1,6 +1,6 @@
 [package]
 name = "mymesh-cli"
-description = "MyMesh command-line interface and daemon entrypoint"
+description = "MyMesh command-line interface and agent entrypoint"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -31,3 +31,6 @@ rand = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+crossterm = { workspace = true }

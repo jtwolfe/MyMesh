@@ -1,6 +1,6 @@
 [package]
 name = "mymesh-session"
-description = "Pairing ceremony and authenticated session orchestration"
+description = "Pairing ceremony, sessions, and agent accept loop"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,6 +11,8 @@ mymesh-core = { workspace = true }
 mymesh-crypto = { workspace = true }
 mymesh-protocol = { workspace = true }
 mymesh-net = { workspace = true }
+mymesh-terminal = { workspace = true }
+mymesh-files = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

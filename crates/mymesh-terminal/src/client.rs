@@ -1,7 +1,7 @@
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use mymesh_core::Result;
 use mymesh_protocol::TerminalMessage;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 
 /// Local interactive side of a remote terminal.
 pub struct TerminalClient {
@@ -31,7 +31,6 @@ impl TerminalClient {
     }
 
     pub fn read_input(&self, buf: &mut [u8]) -> Result<usize> {
-        // Blocking read from stdin — caller should spawn a thread / use asyncify.
         let n = io::stdin().read(buf).map_err(mymesh_core::Error::Io)?;
         Ok(n)
     }
@@ -44,5 +43,3 @@ impl Drop for TerminalClient {
         }
     }
 }
-
-use std::io::Read;

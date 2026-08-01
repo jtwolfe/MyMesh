@@ -2,89 +2,81 @@
 
 **Peer-to-peer remote access for people who hate port forwards.**
 
-Pair two machines with a short code (Signal linked-devices style). After that you get:
+Pair two machines with a short code (Signal linked-devices style). After that:
 
-- **Remote terminal** (real PTY — WAN path in progress)
-- **File copy** (chunked, sandboxed — WAN path in progress)
-- **Desktop control** (capture + input; platform backends feature-gated)
+- **Remote terminal** (real PTY over iroh)
+- **File copy** (chunked, sandboxed)
+- **Desktop** — deferred to M4 after validation
 
-NAT hole punching + relay fallback is designed around [iroh](https://iroh.computer) (QUIC, dial by public key). The workspace builds today with a **local fabric** for demos and tests; the production transport plugs in behind the `Transport` trait.
+NAT hole punching + relay fallback via [iroh](https://iroh.computer) (QUIC, dial by public key).
 
 ## Status
 
 | Milestone | Scope | State |
 |-----------|--------|--------|
-| **M0** | Scaffold, SPAKE2 pairing demo, protocol, local fabric, CLI, install script, CI (disabled) | **done** |
-| M1 | iroh transport, mailbox rendezvous, real `mymesh link` over WAN | next |
-| M2 | PTY shell end-to-end over iroh | planned |
-| M3 | File cp/get/put + progress | planned |
-| M4 | Desktop capture backends (X11 / Wayland portal) | planned |
-| M5 | Packaging, signed releases, enable CI | planned |
+| **M0** | Scaffold, SPAKE2, protocol, local fabric | **done** |
+| **M1** | iroh transport, FS/HTTP mailbox, `link`, `serve` | **done** |
+| **M2** | Remote PTY shell | **done** |
+| **M3** | File cp push/pull + progress | **done** |
+| **M4** | Desktop capture | deferred |
+| **M5** | Packaging / enable CI | planned |
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) and [docs/M1-M3.md](docs/M1-M3.md).
 
 ## Quick start
 
 ```bash
-# install from source (Linux)
-curl -fsSL https://raw.githubusercontent.com/jtwolfe/MyMesh/main/install.sh | bash
-
-# or build locally
+# build
 cargo build --release -p mymesh-cli
-./target/release/mymesh init
-./target/release/mymesh status
-./target/release/mymesh demo pair
-./target/release/mymesh demo session
+
+# machine A
+./target/release/mymesh init --label desktop
+./target/release/mymesh link --mailbox-dir /shared/mymesh-mb   # or MYMESH_MAILBOX=http://...
+
+# machine B (same mailbox)
+./target/release/mymesh init --label laptop
+./target/release/mymesh link <code> --mailbox-dir /shared/mymesh-mb
+
+# both machines
+./target/release/mymesh serve --foreground
+
+# laptop → desktop
+./target/release/mymesh shell desktop
+./target/release/mymesh cp ./file desktop:~/file
+./target/release/mymesh cp desktop:~/file ./file
 ```
+
+### Mailbox options
+
+| Backend | How |
+|---------|-----|
+| **Filesystem** (same host / NFS) | `--mailbox-dir PATH` or `MYMESH_MAILBOX_DIR` |
+| **HTTP** (WAN-friendly) | `mymesh mailbox --bind 0.0.0.0:9876` then `MYMESH_MAILBOX=http://host:9876` |
 
 ## CLI
 
 ```text
-mymesh init                 # create identity + config
-mymesh status               # show device id + fingerprint
-mymesh link                 # host: print pairing code (WAN: M1)
-mymesh link 42-maple-orbit  # guest: enter code (WAN: M1)
-mymesh devices              # list linked devices
-mymesh unlink <id>          # revoke a device
-mymesh shell <device>       # remote terminal (WAN: M2)
-mymesh cp <src> <dst>       # file copy (WAN: M3)
-mymesh desktop <device>     # remote desktop (WAN: M4)
-mymesh serve --foreground   # agent process
-mymesh demo pair            # in-process SPAKE2 ceremony
-mymesh demo session         # pair + framed terminal open
-mymesh install-notes        # systemd unit hints
-```
-
-## Workspace layout
-
-```text
-crates/
-  mymesh-core       identity, config, device store
-  mymesh-crypto     Ed25519 identity, SPAKE2, pairing codes
-  mymesh-protocol   frames + control/terminal/files/desktop messages
-  mymesh-net        Transport trait, local fabric, directional rendezvous
-  mymesh-session    pairing ceremony + session handshake
-  mymesh-terminal   portable-pty host + client
-  mymesh-files      sandboxed transfers
-  mymesh-desktop    desktop controller (null + future capture)
-  mymesh-cli        `mymesh` binary
-docs/
-  RESEARCH.md       library survey & decisions
-  ARCHITECTURE.md   system design
-  PROTOCOL.md       wire format
-install.sh          Linux from-source installer
-.github/workflows/ci.yml   Linux CI (currently disabled)
+mymesh init [--label NAME]
+mymesh status
+mymesh link [--mailbox-dir DIR | --mailbox URL]
+mymesh link <code>
+mymesh devices
+mymesh unlink <id|label>
+mymesh serve --foreground
+mymesh shell <device>
+mymesh cp <src> <dst>          # device:path syntax
+mymesh mailbox --bind ADDR     # HTTP pairing mailbox
+mymesh demo pair|session
+mymesh install-notes
 ```
 
 ## Security model
 
-1. **Pairing** uses SPAKE2 so a short code becomes a strong shared secret.
-2. **Long-term** Ed25519 identities are exchanged under that secret and stored as linked devices.
-3. **Sessions** only accept peers present in the local device store with required capabilities.
-4. **Files** never escape a configured sandbox root.
-5. **Transport** (iroh, planned) provides authenticated encryption on the wire (QUIC).
-
-## CI
-
-GitHub Actions workflow exists at [`.github/workflows/ci.yml`](.github/workflows/ci.yml) for Linux (`fmt`, `clippy`, `test`, release build, smoke). **It is disabled** (`if: false`, no push/PR triggers). Enable when ready by removing the gate and uncommenting triggers.
+1. SPAKE2 short-code pairing → strong shared secret  
+2. Long-term Ed25519 identity = iroh endpoint id  
+3. Sessions only from devices in the local allowlist  
+4. File ops confined to `sandbox_root` (default `$HOME`)  
+5. Wire: QUIC/TLS via iroh  
 
 ## License
 

@@ -74,9 +74,11 @@ Each `DeviceRecord` stores:
 
 ## Milestone plan
 
-| M0 | Workspace, crypto, pairing demo, protocol, local fabric | **done in tree** |
-| M1 | iroh transport, public/self-host mailbox, real `mymesh link` WAN |
-| M2 | PTY shell end-to-end over iroh |
-| M3 | File cp/get/put + progress UI |
-| M4 | Desktop capture backends (X11/Wayland portal) |
-| M5 | Packaging: deb/rpm/pkgbuild, `curl | sh`, signed releases |
+| M0 | Workspace, crypto, pairing demo, protocol, local fabric | **done** |
+| M1 | iroh transport, HTTP/FS mailbox, real `mymesh link` + `serve` | **implemented** |
+| M2 | PTY shell end-to-end over iroh | **implemented** |
+| M3 | File cp/get/put + progress | **implemented** |
+| M4 | Desktop capture backends (X11/Wayland portal) | deferred (after validation) |
+| M5 | Packaging: deb/rpm/pkgbuild, `curl | sh`, signed releases | planned |
+
+See [ROADMAP.md](ROADMAP.md) and [M1-M3.md](M1-M3.md) for detail.

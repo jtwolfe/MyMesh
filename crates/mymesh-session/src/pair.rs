@@ -130,6 +130,115 @@ pub async fn run_host_pair(
     })
 }
 
+
+/// Host ceremony with a pre-chosen pairing code (so the UI can print it first).
+pub async fn run_host_pair_code(
+    identity: &Identity,
+    label: &str,
+    capabilities: Vec<Capability>,
+    store: &mut DeviceStore,
+    rendezvous: &impl Rendezvous,
+    code: &PairingCode,
+) -> Result<PairOutcome> {
+    let code_str = code.as_string();
+    info!(%code_str, "pairing code ready — enter on the other device");
+
+    let spake = PairingSession::start(PairingRole::Host, &code.password_bytes())?;
+    let my_spake = spake.outbound_message().to_vec();
+    rendezvous
+        .send(&code_str, true, PairingMessage::Spake(my_spake))
+        .await?;
+
+    let peer_spake = match rendezvous.recv(&code_str, true).await? {
+        PairingMessage::Spake(m) => m,
+        other => {
+            return Err(mymesh_core::Error::Pairing(format!(
+                "expected SPAKE message, got {other:?}"
+            )))
+        }
+    };
+    let secret = spake.finish(&peer_spake)?;
+
+    let vk = identity.verifying_key_bytes();
+    let device_id = identity.device_id();
+    let sign_material = [
+        device_id.as_bytes().as_slice(),
+        label.as_bytes(),
+        &vk,
+    ]
+    .concat();
+    let signature = identity.sign(&sign_material);
+    let offer_binder = binder(&secret, &sign_material);
+    rendezvous
+        .send(
+            &code_str,
+            true,
+            PairingMessage::IdentityOffer {
+                device_id,
+                label: label.to_string(),
+                verifying_key: vk,
+                capabilities: capabilities.clone(),
+                signature,
+                binder: offer_binder,
+            },
+        )
+        .await?;
+
+    let peer = match rendezvous.recv(&code_str, true).await? {
+        PairingMessage::IdentityAccept {
+            device_id: peer_id,
+            label: peer_label,
+            verifying_key,
+            accepted_capabilities,
+            signature,
+            binder: peer_binder,
+        } => {
+            let material = [
+                peer_id.as_bytes().as_slice(),
+                peer_label.as_bytes(),
+                &verifying_key,
+            ]
+            .concat();
+            let expect = binder(&secret, &material);
+            if expect != peer_binder {
+                return Err(mymesh_core::Error::Pairing("binder mismatch".into()));
+            }
+            let pub_id = mymesh_crypto::IdentityPublic {
+                verifying_key,
+            };
+            pub_id.verify(&material, &signature)?;
+            if pub_id.device_id() != peer_id {
+                return Err(mymesh_core::Error::Pairing("device id mismatch".into()));
+            }
+            DeviceRecord {
+                id: peer_id,
+                label: DeviceLabel::new(peer_label),
+                fingerprint: NodeFingerprint::from_device_id(&peer_id).as_str().to_string(),
+                capabilities: accepted_capabilities,
+                trust: TrustState::Trusted,
+                linked_at: Utc::now(),
+                last_seen: Some(Utc::now()),
+                endpoint_hint: None,
+            }
+        }
+        PairingMessage::Reject { reason } => {
+            return Err(mymesh_core::Error::Pairing(reason));
+        }
+        other => {
+            return Err(mymesh_core::Error::Pairing(format!(
+                "unexpected message: {other:?}"
+            )))
+        }
+    };
+
+    store.upsert(peer.clone())?;
+    Ok(PairOutcome {
+        code: Some(code.clone()),
+        peer,
+        shared_confirm: secret.derive(b"mymesh/confirm"),
+    })
+}
+
 /// Guest: enter code, complete ceremony, store host as trusted.
 pub async fn run_guest_pair(
     identity: &Identity,

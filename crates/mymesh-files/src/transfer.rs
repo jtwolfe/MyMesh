@@ -116,7 +116,6 @@ pub fn apply_host_message(
             }
             let f = fs::OpenOptions::new()
                 .create(true)
-            .truncate(true)
                 .write(true)
                 .truncate(resume_from == 0)
                 .open(&p)

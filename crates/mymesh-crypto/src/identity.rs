@@ -81,6 +81,17 @@ impl Identity {
     pub fn verifying_key_bytes(&self) -> [u8; 32] {
         self.signing.verifying_key().to_bytes()
     }
+
+    /// Raw 32-byte seed (also used as iroh SecretKey material).
+    pub fn to_secret_bytes(&self) -> [u8; 32] {
+        self.signing.to_bytes()
+    }
+
+    pub fn from_secret_bytes(bytes: [u8; 32]) -> Self {
+        Self {
+            signing: SigningKey::from_bytes(&bytes),
+        }
+    }
 }
 
 impl IdentityPublic {

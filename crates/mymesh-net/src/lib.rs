@@ -1,19 +1,19 @@
 //! Transport layer for MyMesh.
 //!
-//! ## Backends
-//! - **Local fabric** (always available): in-process / same-host mesh for tests
-//!   and `mymesh demo pair`.
-//! - **Iroh** (production): enable via the `iroh` integration module documented
-//!   in `docs/ARCHITECTURE.md`. The `Transport` trait is the stable boundary.
-//!
-//! NAT hole punching, relay fallback, and dial-by-public-key are provided by
-//! iroh when wired in; this crate keeps that behind a clean interface so the
-//! rest of the stack never depends on a specific QUIC stack.
+//! - **Iroh** (production): QUIC, dial-by-public-key, hole punch + relays
+//! - **Local fabric**: in-process tests / demos
+//! - **Mailboxes**: filesystem (multiproc local) + HTTP (self-hosted)
 
 mod fabric;
+mod iroh_transport;
+mod mailbox_fs;
+mod mailbox_http;
 mod rendezvous;
 mod traits;
 
 pub use fabric::{FabricConnection, LocalFabric};
+pub use iroh_transport::{IrohTransport, SharedIroh};
+pub use mailbox_fs::{default_local_mailbox_dir, open_default_fs, FsMailbox};
+pub use mailbox_http::{run_mailbox_server, HttpMailbox};
 pub use rendezvous::{LocalRendezvous, Rendezvous};
 pub use traits::{PeerConnection, Transport};
