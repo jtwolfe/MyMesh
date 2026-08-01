@@ -166,7 +166,7 @@ impl FileTransferEngine {
         let p = self.sandbox.resolve(path)?;
         let mut f = fs::OpenOptions::new()
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .write(true)
             .open(p)
             .map_err(Error::Io)?;
