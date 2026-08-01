@@ -1,0 +1,24 @@
+[package]
+name = "mymesh-net"
+description = "P2P transport abstraction (local fabric + iroh-ready interface)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mymesh-core = { workspace = true }
+mymesh-crypto = { workspace = true }
+mymesh-protocol = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }

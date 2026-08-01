@@ -1,0 +1,20 @@
+[package]
+name = "mymesh-session"
+description = "Pairing ceremony and authenticated session orchestration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mymesh-core = { workspace = true }
+mymesh-crypto = { workspace = true }
+mymesh-protocol = { workspace = true }
+mymesh-net = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+chrono = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }

@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/mymesh-core",
+  "crates/mymesh-crypto",
+  "crates/mymesh-protocol",
+  "crates/mymesh-net",
+  "crates/mymesh-session",
+  "crates/mymesh-terminal",
+  "crates/mymesh-files",
+  "crates/mymesh-desktop",
+  "crates/mymesh-cli",
+]
+default-members = ["crates/mymesh-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/jtwolfe/MyMesh"
+authors = ["Jamie T. Wolfe"]
+rust-version = "1.75"
+description = "Peer-to-peer remote access mesh with Signal-style pairing"
+
+[workspace.dependencies]
+mymesh-core = { path = "crates/mymesh-core" }
+mymesh-crypto = { path = "crates/mymesh-crypto" }
+mymesh-protocol = { path = "crates/mymesh-protocol" }
+mymesh-net = { path = "crates/mymesh-net" }
+mymesh-session = { path = "crates/mymesh-session" }
+mymesh-terminal = { path = "crates/mymesh-terminal" }
+mymesh-files = { path = "crates/mymesh-files" }
+mymesh-desktop = { path = "crates/mymesh-desktop" }
+
+anyhow = "1"
+thiserror = "1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+rand = "0.8"
+hex = "0.4"
+sha2 = "0.10"
+hkdf = "0.12"
+zeroize = { version = "1", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "serde"] }
+spake2 = "0.4"
+base64 = "0.22"
+directories = "5"
+toml = "0.8"
+futures = "0.3"
+async-trait = "0.1"
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+portable-pty = "0.8"
+crossterm = "0.27"
+indicatif = "0.17"
+console = "0.15"
+data-encoding = "2"

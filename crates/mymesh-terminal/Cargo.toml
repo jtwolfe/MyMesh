@@ -1,0 +1,18 @@
+[package]
+name = "mymesh-terminal"
+description = "Remote PTY host and interactive client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mymesh-core = { workspace = true }
+mymesh-protocol = { workspace = true }
+mymesh-net = { workspace = true }
+portable-pty = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+crossterm = { workspace = true }
+futures = { workspace = true }

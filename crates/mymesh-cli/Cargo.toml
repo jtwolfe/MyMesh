@@ -1,0 +1,33 @@
+[package]
+name = "mymesh-cli"
+description = "MyMesh command-line interface and daemon entrypoint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mymesh"
+path = "src/main.rs"
+
+[dependencies]
+mymesh-core = { workspace = true }
+mymesh-crypto = { workspace = true }
+mymesh-protocol = { workspace = true }
+mymesh-net = { workspace = true }
+mymesh-session = { workspace = true }
+mymesh-terminal = { workspace = true }
+mymesh-files = { workspace = true }
+mymesh-desktop = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+console = { workspace = true }
+indicatif = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }

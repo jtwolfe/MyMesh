@@ -1,0 +1,14 @@
+[package]
+name = "mymesh-files"
+description = "Secure file transfer and remote filesystem operations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mymesh-core = { workspace = true }
+mymesh-protocol = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
