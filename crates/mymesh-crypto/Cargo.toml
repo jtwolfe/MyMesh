@@ -9,7 +9,6 @@ rust-version.workspace = true
 [dependencies]
 mymesh-core = { workspace = true }
 ed25519-dalek = { workspace = true }
-x25519-dalek = { workspace = true }
 spake2 = { workspace = true }
 sha2 = { workspace = true }
 hkdf = { workspace = true }

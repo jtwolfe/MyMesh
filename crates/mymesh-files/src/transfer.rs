@@ -116,6 +116,7 @@ pub fn apply_host_message(
             }
             let f = fs::OpenOptions::new()
                 .create(true)
+            .truncate(true)
                 .write(true)
                 .truncate(resume_from == 0)
                 .open(&p)
@@ -165,6 +166,7 @@ impl FileTransferEngine {
         let p = self.sandbox.resolve(path)?;
         let mut f = fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .open(p)
             .map_err(Error::Io)?;

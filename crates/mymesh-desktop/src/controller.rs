@@ -3,19 +3,12 @@ use mymesh_core::Result;
 use mymesh_protocol::{DesktopInput, DesktopMessage};
 use tracing::debug;
 
+#[derive(Default)]
 pub struct DesktopController {
     capture: NullCapture,
     running: bool,
 }
 
-impl Default for DesktopController {
-    fn default() -> Self {
-        Self {
-            capture: NullCapture::default(),
-            running: false,
-        }
-    }
-}
 
 impl DesktopController {
     pub fn handle(&mut self, msg: DesktopMessage) -> Result<Vec<DesktopMessage>> {
