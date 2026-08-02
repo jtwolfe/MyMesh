@@ -32,7 +32,7 @@ machine.
   not only TCP 17878.
 
 {}
-  mymesh firewall help
+  mymesh firewall explain
   mymesh firewall status
   mymesh firewall ufw status|allow|deny
   mymesh firewall firewalld status|allow|deny

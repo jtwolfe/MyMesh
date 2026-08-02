@@ -7,7 +7,7 @@ mod tui_app;
 mod term_pane;
 
 use anyhow::{bail, Context, Result};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use console::style;
 use mymesh_core::{
     ArmState, Capability, Config, DeviceStore, JoinDecision, JoinStore, MeshState, Paths,
@@ -35,7 +35,12 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "mymesh",
     version,
-    about = "Peer-to-peer remote access — pair like Signal, connect like Syncthing"
+    about = "Peer-to-peer remote access — pair like Signal, connect like Syncthing",
+    propagate_version = true,
+    arg_required_else_help = false,
+    after_help = "Tips:
+  mymesh install · mymesh serve · mymesh hosts · mymesh firewall help
+  mymesh completions bash|zsh|fish   # regenerate shell autocomplete"
 )]
 pub struct Cli {
     #[arg(long, global = true, env = "MYMESH_HOME")]
@@ -51,77 +56,121 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Open the TUI dashboard (default when no command is given)
+    /// Open the interactive TUI (default when run with no subcommand)
     Tui,
+    /// Show local identity, arm state, and user-service status
     Status,
+    /// Print this device id (hex / words / QR / join URI)
     Id {
+        /// Print QR code of the join URI
         #[arg(long)]
         qr: bool,
+        /// Print BIP39-style 24-word id
         #[arg(long)]
         words: bool,
+        /// Print mymesh:// join URI
         #[arg(long)]
         uri: bool,
     },
+    /// Create local identity + config (first-run)
     Init {
+        /// Human-readable device label (default: hostname)
         #[arg(long)]
         label: Option<String>,
     },
+    /// Link devices (join by id/words, or SPAKE2 local mailbox)
     Link {
+        /// Peer hex id or 24-word id (Syncthing-style join)
+        #[arg(value_name = "DEVICE")]
         target: Option<String>,
+        /// SPAKE2 guest: pairing code from host
         #[arg(long)]
         code: Option<String>,
+        /// SPAKE2 host: fixed nameplate id
         #[arg(long)]
         nameplate: Option<u16>,
+        /// Shared directory mailbox (SPAKE2)
         #[arg(long, env = "MYMESH_MAILBOX_DIR")]
         mailbox_dir: Option<PathBuf>,
+        /// HTTP mailbox base URL (SPAKE2)
         #[arg(long, env = "MYMESH_MAILBOX")]
         mailbox: Option<String>,
+        /// Use in-process local rendezvous (same machine only)
         #[arg(long)]
         local: bool,
     },
+    /// Arm / disarm accepting new connection requests
+    #[command(visible_alias = "arm")]
     ConnectRequest {
         #[command(subcommand)]
         action: ConnectRequestCmd,
     },
+    /// List / accept / deny pending join requests
     Requests {
         #[command(subcommand)]
         action: RequestsCmd,
     },
+    /// List linked devices
     Devices {
+        /// Machine-readable JSON
         #[arg(long)]
         json: bool,
     },
-    Unlink { device: String },
-    Shell {
+    /// Revoke trust for a linked device
+    Unlink {
+        #[arg(value_name = "DEVICE")]
         device: String,
+    },
+    /// Open an interactive remote shell on a peer
+    Shell {
+        #[arg(value_name = "DEVICE")]
+        device: String,
+        /// Remote shell binary (default: peer $SHELL)
         #[arg(long)]
         shell: Option<String>,
     },
-    Cp { src: String, dst: String },
+    /// Copy files (local path or device:path)
+    Cp {
+        #[arg(value_name = "SRC")]
+        src: String,
+        #[arg(value_name = "DST")]
+        dst: String,
+    },
     /// Ping a peer and record RTT history
-    Ping { device: String },
-    /// Bandwidth test (push) to a peer
-    Bw {
+    Ping {
+        #[arg(value_name = "DEVICE")]
         device: String,
+    },
+    /// Bandwidth test (push) to a peer
+    #[command(visible_alias = "bandwidth")]
+    Bw {
+        #[arg(value_name = "DEVICE")]
+        device: String,
+        /// Payload size in bytes
         #[arg(long, default_value_t = 1_048_576)]
         bytes: u64,
     },
-    /// Probe all trusted peers once
+    /// Probe all trusted peers once (RTT)
     ProbeAll,
+    /// Remote desktop (deferred / stub)
     Desktop {
+        #[arg(value_name = "DEVICE")]
         device: String,
         #[arg(long, default_value_t = 30)]
         fps: u8,
     },
+    /// Run the mesh agent (sessions + magic plane)
     Serve {
+        /// Keep in foreground (default for CLI)
         #[arg(long)]
         foreground: bool,
     },
+    /// Run a standalone HTTP SPAKE2 mailbox
     Mailbox {
         #[arg(long, default_value = "0.0.0.0:9876")]
         bind: String,
     },
-    /// Install agent + systemd unit + completions
+    /// Install agent binary, systemd unit, and shell completions
     Install {
         /// System-wide unit (requires root). Prefer user install.
         #[arg(long)]
@@ -133,36 +182,47 @@ enum Commands {
         #[arg(long)]
         runtime_user: Option<String>,
     },
+    /// Remove installed unit/binary (optional purge of state)
     Uninstall {
+        /// Also delete identity, devices, and config
         #[arg(long)]
         purge: bool,
     },
+    /// Reset local state (links and/or identity)
     Reset {
+        /// Drop linked devices / mesh roster
         #[arg(long)]
         links: bool,
+        /// Delete local identity key (re-init required)
         #[arg(long)]
         identity: bool,
     },
+    /// Control the systemd mymesh service
     Service {
         #[command(subcommand)]
         action: ServiceCmd,
     },
+    /// Generate shell completion scripts (bash|zsh|fish)
     Completions {
-        shell: String,
-        #[arg(long)]
+        /// Target shell
+        shell: CompletionShell,
+        /// Write to file instead of stdout
+        #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
     },
+    /// Built-in demos (pair / session)
     Demo {
         #[command(subcommand)]
         scenario: DemoCmd,
     },
-    /// Show mesh id + roster
+    /// Show mesh id + roster / force gossip sync
     Mesh {
         #[command(subcommand)]
         action: MeshCmd,
     },
     /// Kick a device from the mesh (double confirmation required)
     Kick {
+        #[arg(value_name = "DEVICE")]
         device: String,
         /// Force: remove immediately mesh-wide; still queues notice if offline
         #[arg(long)]
@@ -173,59 +233,100 @@ enum Commands {
         #[arg(long)]
         yes_i_am_sure: bool,
     },
+    /// Print install policy / notes
     InstallNotes,
-    /// List mesh hostnames, IPs, aliases, groups
+    /// List mesh hostnames, mesh IPs, aliases, groups
+    #[command(visible_alias = "host")]
     Hosts {
+        /// Filter by group tag
         #[arg(long)]
         group: Option<String>,
     },
     /// Rename a device label
     Label {
+        #[arg(value_name = "DEVICE")]
         device: String,
+        #[arg(value_name = "NAME")]
         name: String,
     },
-    /// Add or remove an alias
+    /// Add or remove a DNS/ssh alias for a device
     Alias {
+        #[arg(value_name = "DEVICE")]
         device: String,
+        #[arg(value_name = "ALIAS")]
         name: String,
+        /// Remove the alias instead of adding
         #[arg(long)]
         remove: bool,
     },
-    /// Add or remove a group tag
+    /// Add or remove a group tag on a device
     Group {
+        #[arg(value_name = "DEVICE")]
         device: String,
+        #[arg(value_name = "GROUP")]
         name: String,
+        /// Remove the group instead of adding
         #[arg(long)]
         remove: bool,
     },
-    /// Resolve a name / alias / id
-    Resolve { name: String },
-    /// Print OpenSSH config for *.mym
+    /// Resolve a name / alias / id to device + mesh-ip
+    Resolve {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Print OpenSSH config for Host *.mym (ProxyCommand)
+    #[command(visible_alias = "ssh-conf")]
     SshConfig {
+        /// Override magic domain (default: mym)
         #[arg(long)]
         domain: Option<String>,
     },
-    /// ProxyCommand helper: bridge stdio to peer:22
-    ProxySsh { host: String },
+    /// OpenSSH ProxyCommand helper (stdio → peer:22)
+    ProxySsh {
+        #[arg(value_name = "HOST")]
+        host: String,
+    },
     /// Listen locally and tunnel TCP to peer:port
     Expose {
+        #[arg(value_name = "DEVICE")]
         device: String,
+        /// Remote port on the peer
         port: u16,
+        /// Local listen port (default: same as remote)
         #[arg(long)]
         local: Option<u16>,
     },
-    /// Connect-by-carrier (phone QR page, no phone mesh node)
+    /// Connect-by-carrier (phone QR page; phone is not a mesh node)
     Carrier {
+        /// HTTP listen port (default 17878)
         #[arg(long, default_value_t = 17878)]
         port: u16,
     },
-    /// Magic plane help
+    /// Print magic-plane help (DNS / SOCKS / *.mym)
     Magic,
-    /// Host firewall helpers (explicit only; never auto)
+    /// Host firewall helpers (explicit only; never auto-open)
     Firewall {
         #[command(subcommand)]
         action: FirewallCmd,
     },
+}
+
+/// Shells supported by `mymesh completions`
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+}
+
+impl CompletionShell {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::Zsh => "zsh",
+            Self::Fish => "fish",
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -238,16 +339,17 @@ enum MeshCmd {
 
 #[derive(Subcommand, Debug)]
 enum FirewallCmd {
-    /// Explain ports and usage
-    Help,
+    /// Explain which ports to open and how (not named "help" — reserved by clap)
+    #[command(name = "explain", visible_alias = "ports")]
+    Explain,
     /// Detect ufw/firewalld and show current state
     Status,
-    /// Ubuntu/Debian UFW
+    /// Ubuntu/Debian UFW backend
     Ufw {
         #[command(subcommand)]
         action: FirewallAction,
     },
-    /// Fedora/RHEL firewalld
+    /// Fedora/RHEL firewalld backend
     Firewalld {
         #[command(subcommand)]
         action: FirewallAction,
@@ -256,6 +358,7 @@ enum FirewallCmd {
 
 #[derive(Subcommand, Debug)]
 enum FirewallAction {
+    /// Show MyMesh-related rules / ports
     Status,
     /// Open MyMesh LAN ports (requires root)
     Allow,
@@ -263,22 +366,32 @@ enum FirewallAction {
     Deny,
 }
 
-
 #[derive(Subcommand, Debug)]
 enum ConnectRequestCmd {
+    /// Temporarily accept new join requests
     Allow {
+        /// Arm duration in seconds
         #[arg(long)]
         secs: Option<u64>,
     },
+    /// Stop accepting join requests
     Deny,
+    /// Show whether join requests are armed
     Status,
 }
 
 #[derive(Subcommand, Debug)]
 enum RequestsCmd {
+    /// List pending join requests
     List,
-    Accept { device: String },
+    /// Accept a pending device
+    Accept {
+        #[arg(value_name = "DEVICE")]
+        device: String,
+    },
+    /// Deny a pending device
     Deny {
+        #[arg(value_name = "DEVICE")]
         device: String,
         #[arg(long, default_value = "denied by operator")]
         reason: String,
@@ -287,18 +400,23 @@ enum RequestsCmd {
 
 #[derive(Subcommand, Debug)]
 enum ServiceCmd {
+    /// systemctl status mymesh
     Status {
+        /// Use system unit instead of user unit
         #[arg(long)]
         system: bool,
     },
+    /// systemctl start mymesh
     Start {
         #[arg(long)]
         system: bool,
     },
+    /// systemctl stop mymesh
     Stop {
         #[arg(long)]
         system: bool,
     },
+    /// systemctl restart mymesh
     Restart {
         #[arg(long)]
         system: bool,
@@ -307,7 +425,9 @@ enum ServiceCmd {
 
 #[derive(Subcommand, Debug)]
 enum DemoCmd {
+    /// SPAKE2 pair demo (two local identities)
     Pair,
+    /// Local fabric session demo
     Session,
 }
 
@@ -438,7 +558,7 @@ async fn main() -> Result<()> {
             ServiceCmd::Stop { system } => install::cmd_service("stop", system)?,
             ServiceCmd::Restart { system } => install::cmd_service("restart", system)?,
         },
-        Commands::Completions { shell, out } => install::cmd_completions(&shell, out)?,
+        Commands::Completions { shell, out } => install::cmd_completions(shell.as_str(), out)?,
         Commands::Demo { scenario } => match scenario {
             DemoCmd::Pair => demo_pair().await?,
             DemoCmd::Session => demo_session().await?,
@@ -471,7 +591,7 @@ async fn main() -> Result<()> {
         Commands::Carrier { port } => magic_cmd::cmd_carrier(&paths, port).await?,
         Commands::Magic => magic_cmd::print_magic_help(),
         Commands::Firewall { action } => match action {
-            FirewallCmd::Help => firewall::print_help(),
+            FirewallCmd::Explain => firewall::print_help(),
             FirewallCmd::Status => firewall::cmd_status()?,
             FirewallCmd::Ufw { action } => match action {
                 FirewallAction::Status => firewall::ufw_status()?,

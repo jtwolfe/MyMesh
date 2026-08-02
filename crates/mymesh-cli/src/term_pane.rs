@@ -286,6 +286,7 @@ async fn session_task(
         )
         .await?;
     let conn = session.into_conn();
+    #[allow(unused_assignments)]
     let mut exit_note: Option<String> = None;
     loop {
         tokio::select! {

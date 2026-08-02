@@ -314,7 +314,8 @@ fn install_system(
     // system completions
     let bash = PathBuf::from("/usr/share/bash-completion/completions/mymesh");
     let zsh = PathBuf::from("/usr/local/share/zsh/site-functions/_mymesh");
-    write_completions_to(&bash, &zsh)?;
+    let fish = PathBuf::from("/usr/share/fish/vendor_completions.d/mymesh.fish");
+    write_completions_to(&bash, &zsh, Some(&fish))?;
 
     let marker = InstallMarker {
         mode: InstallMode::System,
@@ -350,48 +351,61 @@ fn install_system(
     Ok(())
 }
 
-fn write_completions_to(bash: &Path, zsh: &Path) -> Result<()> {
+fn write_completions_to(bash: &Path, zsh: &Path, fish: Option<&Path>) -> Result<()> {
     use clap::CommandFactory;
-    use clap_complete::{generate, shells::Bash, shells::Zsh};
+    use clap_complete::{generate, shells::Bash, shells::Fish, shells::Zsh};
     use std::io::Write;
 
-    let mut cmd = crate::Cli::command();
-    if let Some(p) = bash.parent() {
-        let _ = fs::create_dir_all(p);
-    }
-    if let Some(p) = zsh.parent() {
-        let _ = fs::create_dir_all(p);
-    }
-    {
-        let mut f = fs::File::create(bash)?;
-        generate(Bash, &mut cmd, "mymesh", &mut f);
+    // Rebuild command each time so generate state is clean.
+    let write_one = |path: &Path, kind: &str| -> Result<()> {
+        if let Some(p) = path.parent() {
+            let _ = fs::create_dir_all(p);
+        }
+        let mut cmd = crate::Cli::command();
+        let mut f = fs::File::create(path)?;
+        match kind {
+            "bash" => generate(Bash, &mut cmd, "mymesh", &mut f),
+            "zsh" => generate(Zsh, &mut cmd, "mymesh", &mut f),
+            "fish" => generate(Fish, &mut cmd, "mymesh", &mut f),
+            _ => unreachable!(),
+        }
         f.flush()?;
-    }
-    {
-        let mut f = fs::File::create(zsh)?;
-        generate(Zsh, &mut cmd, "mymesh", &mut f);
-        f.flush()?;
+        Ok(())
+    };
+    write_one(bash, "bash")?;
+    write_one(zsh, "zsh")?;
+    if let Some(fish) = fish {
+        write_one(fish, "fish")?;
     }
     Ok(())
 }
 
 fn install_completions_user() -> Result<()> {
     let (bash_dir, zsh_dir) = user_completion_dirs();
-    write_completions_to(
-        &bash_dir.join("mymesh"),
-        &zsh_dir.join("_mymesh"),
-    )?;
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let fish_dir = home.join(".config/fish/completions");
+    let bash = bash_dir.join("mymesh");
+    let zsh = zsh_dir.join("_mymesh");
+    let fish = fish_dir.join("mymesh.fish");
+    write_completions_to(&bash, &zsh, Some(&fish))?;
     println!(
-        "  completions bash={} zsh={}",
-        bash_dir.join("mymesh").display(),
-        zsh_dir.join("_mymesh").display()
+        "  completions bash={} zsh={} fish={}",
+        bash.display(),
+        zsh.display(),
+        fish.display()
+    );
+    println!(
+        "  reload   {}",
+        style("source the file or open a new shell").dim()
     );
     Ok(())
 }
 
 pub fn cmd_completions(shell: &str, out: Option<PathBuf>) -> Result<()> {
     use clap::CommandFactory;
-    use clap_complete::{generate, shells::Bash, shells::Zsh, shells::Fish};
+    use clap_complete::{generate, shells::Bash, shells::Fish, shells::Zsh};
     use std::io::{self, Write};
 
     let mut cmd = crate::Cli::command();
@@ -400,12 +414,62 @@ pub fn cmd_completions(shell: &str, out: Option<PathBuf>) -> Result<()> {
         "bash" => generate(Bash, &mut cmd, "mymesh", &mut buf),
         "zsh" => generate(Zsh, &mut cmd, "mymesh", &mut buf),
         "fish" => generate(Fish, &mut cmd, "mymesh", &mut buf),
-        other => bail!("unsupported shell '{other}' (bash|zsh|fish)"),
+        other => bail!("unsupported shell '{other}' (use: bash | zsh | fish)"),
     }
+    let text = std::str::from_utf8(&buf).unwrap_or("");
+    completion_covers_surface(text)?;
     if let Some(path) = out {
-        fs::write(path, buf)?;
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        fs::write(&path, &buf)?;
+        println!("{} wrote {} bytes → {}", style("ok").green().bold(), buf.len(), path.display());
     } else {
         io::stdout().write_all(&buf)?;
+    }
+    Ok(())
+}
+
+/// Assert generated completion script mentions key subcommands (used by install checks / tests).
+pub fn completion_covers_surface(script: &str) -> Result<()> {
+    let required = [
+        "tui",
+        "status",
+        "init",
+        "link",
+        "connect-request",
+        "requests",
+        "devices",
+        "shell",
+        "cp",
+        "ping",
+        "bw",
+        "serve",
+        "install",
+        "service",
+        "mesh",
+        "kick",
+        "hosts",
+        "label",
+        "alias",
+        "group",
+        "resolve",
+        "ssh-config",
+        "proxy-ssh",
+        "expose",
+        "carrier",
+        "magic",
+        "firewall",
+        "explain",
+        "completions",
+    ];
+    let missing: Vec<_> = required
+        .iter()
+        .filter(|k| !script.contains(*k))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        bail!("completion script missing subcommands: {missing:?}");
     }
     Ok(())
 }
