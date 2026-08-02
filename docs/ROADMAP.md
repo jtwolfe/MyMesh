@@ -4,6 +4,9 @@ Status: **done** · planned · deferred
 
 ## Product goal
 
+Before leaving alpha, maintainability gates live in [v0.1-promotion-goals.md](v0.1-promotion-goals.md).
+
+
 Personal machine mesh: install → link with explicit approval → remote **terminal**, **files**, **SSH/TCP services**, later **desktop**, with NAT traversal and no port forwards.
 
 ---

@@ -157,6 +157,7 @@ Linking model: **[docs/JOIN.md](docs/JOIN.md)**
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crate layout, endpoint ownership |
 | [docs/INSTALL-POLICY.md](docs/INSTALL-POLICY.md) | User vs root install |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | What’s next |
+| [docs/v0.1-promotion-goals.md](docs/v0.1-promotion-goals.md) | Maintainability gates before non-alpha v0.1 |
 | [CHANGELOG.md](CHANGELOG.md) | Release notes |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | Frame notes |
 | [docs/M1-M3.md](docs/M1-M3.md) | Early milestone design |
