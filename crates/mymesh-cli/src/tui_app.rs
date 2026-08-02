@@ -616,7 +616,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 app.term.scroll = app.term.scroll.saturating_sub(app.term.rows / 2);
             }
             other => {
-                if let Some(bytes) = term_pane::key_to_bytes(other) {
+                if let Some(bytes) = term_pane::key_to_bytes(other, app.term.parser.screen().application_cursor()) {
                     app.term.send(&bytes);
                     app.term.scroll = 0;
                 }

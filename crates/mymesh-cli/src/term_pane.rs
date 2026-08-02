@@ -284,7 +284,7 @@ pub fn maybe_resize(term: &mut TermPane) {
     }
     term.cols = cols;
     term.rows = rows;
-    term.parser = vt100::Parser::new(rows, cols, 5000);
+    term.parser.set_size(rows, cols);
     if term.connected {
         term.send_resize();
     }
@@ -302,16 +302,40 @@ pub fn drain_output(term: &mut TermPane) {
     }
 }
 
-pub fn key_to_bytes(code: KeyCode) -> Option<Vec<u8>> {
+pub fn key_to_bytes(code: KeyCode, app_cursor: bool) -> Option<Vec<u8>> {
     Some(match code {
         KeyCode::Enter => b"\r".to_vec(),
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Delete => b"\x1b[3~".to_vec(),
         KeyCode::Tab => b"\t".to_vec(),
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
+        KeyCode::Up => {
+            if app_cursor {
+                b"\x1bOA".to_vec()
+            } else {
+                b"\x1b[A".to_vec()
+            }
+        }
+        KeyCode::Down => {
+            if app_cursor {
+                b"\x1bOB".to_vec()
+            } else {
+                b"\x1b[B".to_vec()
+            }
+        }
+        KeyCode::Right => {
+            if app_cursor {
+                b"\x1bOC".to_vec()
+            } else {
+                b"\x1b[C".to_vec()
+            }
+        }
+        KeyCode::Left => {
+            if app_cursor {
+                b"\x1bOD".to_vec()
+            } else {
+                b"\x1b[D".to_vec()
+            }
+        }
         KeyCode::Home => b"\x1b[H".to_vec(),
         KeyCode::End => b"\x1b[F".to_vec(),
         KeyCode::Char(c) => c.to_string().into_bytes(),
@@ -385,7 +409,8 @@ pub fn draw(f: &mut TuiFrame, area: Rect, term: &mut TermPane) {
     let screen = term.parser.screen();
     let rows = inner.height.min(term.rows);
     let cols = inner.width.min(term.cols);
-    let (cx, cy) = screen.cursor_position();
+    // vt100 returns (row, col) — NOT (x, y)
+    let (cursor_row, cursor_col) = screen.cursor_position();
 
     for row in 0..rows {
         let mut line = String::with_capacity(cols as usize);
@@ -414,10 +439,15 @@ pub fn draw(f: &mut TuiFrame, area: Rect, term: &mut TermPane) {
         );
     }
 
-    // cursor
-    if focus && term.scroll == 0 && cy < rows && (cx as u16) < cols {
+    // cursor: x = col, y = row
+    let show_cursor = focus
+        && term.scroll == 0
+        && !screen.hide_cursor()
+        && cursor_row < rows
+        && cursor_col < cols;
+    if show_cursor {
         let ch = screen
-            .cell(cy, cx)
+            .cell(cursor_row, cursor_col)
             .map(|c| {
                 let s = c.contents();
                 if s.is_empty() {
@@ -435,8 +465,8 @@ pub fn draw(f: &mut TuiFrame, area: Rect, term: &mut TermPane) {
                     .add_modifier(Modifier::BOLD),
             ),
             Rect {
-                x: inner.x + cx as u16,
-                y: inner.y + cy,
+                x: inner.x + cursor_col,
+                y: inner.y + cursor_row,
                 width: 1,
                 height: 1,
             },
