@@ -7,6 +7,7 @@ pub enum ChannelKind {
     Terminal = 2,
     Files = 3,
     Desktop = 4,
+    Tcp = 5,
 }
 
 impl ChannelKind {
@@ -16,6 +17,7 @@ impl ChannelKind {
             2 => Some(Self::Terminal),
             3 => Some(Self::Files),
             4 => Some(Self::Desktop),
+            5 => Some(Self::Tcp),
             _ => None,
         }
     }
@@ -53,6 +55,13 @@ impl ChannelId {
     pub fn desktop(stream: u32) -> Self {
         Self {
             kind: ChannelKind::Desktop,
+            stream,
+        }
+    }
+
+    pub fn tcp(stream: u32) -> Self {
+        Self {
+            kind: ChannelKind::Tcp,
             stream,
         }
     }

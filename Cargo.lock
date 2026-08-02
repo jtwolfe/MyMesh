@@ -2336,7 +2336,7 @@ dependencies = [
 
 [[package]]
 name = "mymesh-cli"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2371,7 +2371,7 @@ dependencies = [
 
 [[package]]
 name = "mymesh-core"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "chrono",
  "directories",
@@ -2386,7 +2386,7 @@ dependencies = [
 
 [[package]]
 name = "mymesh-crypto"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "base64",
  "bip39",
@@ -2405,7 +2405,7 @@ dependencies = [
 
 [[package]]
 name = "mymesh-desktop"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "mymesh-core",
  "mymesh-protocol",
@@ -2416,7 +2416,7 @@ dependencies = [
 
 [[package]]
 name = "mymesh-files"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "mymesh-core",
  "mymesh-protocol",
@@ -2427,7 +2427,7 @@ dependencies = [
 
 [[package]]
 name = "mymesh-net"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2456,7 +2456,7 @@ dependencies = [
 
 [[package]]
 name = "mymesh-protocol"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "bincode",
  "bytes",
@@ -2471,9 +2471,11 @@ dependencies = [
 
 [[package]]
 name = "mymesh-session"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
+ "anyhow",
  "async-trait",
+ "axum",
  "bytes",
  "chrono",
  "hex",
@@ -2487,12 +2489,13 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "tower-http",
  "tracing",
 ]
 
 [[package]]
 name = "mymesh-terminal"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "bytes",
  "crossterm 0.27.0",

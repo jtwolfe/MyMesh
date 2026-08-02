@@ -353,3 +353,26 @@ pub enum PairingMessage {
         reason: String,
     },
 }
+
+
+/// TCP tunnel control/data on ChannelKind::Tcp.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum TcpMessage {
+    /// Client asks host to dial 127.0.0.1:port (or host:port if host set).
+    Dial {
+        port: u16,
+        #[serde(default)]
+        host: Option<String>,
+    },
+    /// Host accepted the dial; stream is live.
+    DialOk,
+    DialErr {
+        message: String,
+    },
+    Data {
+        data: Vec<u8>,
+    },
+    Close {
+        reason: String,
+    },
+}

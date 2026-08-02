@@ -11,13 +11,15 @@ pub enum Capability {
     Terminal,
     Files,
     Desktop,
+    /// TCP port tunnels (magic hostname / socks / expose).
+    Tcp,
     /// Administrative: can approve further links, view logs.
     Admin,
 }
 
 impl Capability {
     pub fn all() -> Vec<Self> {
-        vec![Self::Terminal, Self::Files, Self::Desktop]
+        vec![Self::Terminal, Self::Files, Self::Desktop, Self::Tcp]
     }
 }
 
@@ -48,6 +50,12 @@ pub struct DeviceRecord {
     /// Mesh this peer belongs to (gossip roster).
     #[serde(default)]
     pub mesh_id: Option<String>,
+    /// Extra human names (ssh/dns aliases), lowercase recommended.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// Optional tags/groups for filtering (e.g. home, lab).
+    #[serde(default)]
+    pub groups: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -120,6 +128,128 @@ impl DeviceStore {
             .filter(|d| d.trust == TrustState::Trusted)
             .map(|d| d.capabilities.contains(cap))
             .unwrap_or(false)
+    }
+
+    /// Resolve by full id hex, short prefix, label, or alias (case-insensitive).
+    pub fn resolve_query(&self, q: &str) -> Result<DeviceId> {
+        let q = q.trim();
+        let q_host = q.strip_suffix(".mym").unwrap_or(q);
+        let q_host = q_host.strip_suffix('.').unwrap_or(q_host);
+        let ql = q_host.to_lowercase();
+
+        // exact label / alias
+        let mut hits: Vec<DeviceId> = Vec::new();
+        for d in self.devices.values() {
+            if d.label.as_str().eq_ignore_ascii_case(q_host)
+                || d.aliases.iter().any(|a| a.eq_ignore_ascii_case(q_host))
+            {
+                hits.push(d.id);
+            }
+        }
+        hits.sort_by_key(|id| id.to_string());
+        hits.dedup();
+        if hits.len() == 1 {
+            return Ok(hits[0]);
+        }
+        if hits.len() > 1 {
+            return Err(Error::Config(format!("ambiguous name '{q_host}'")));
+        }
+
+        // prefix match label/alias/short
+        for d in self.devices.values() {
+            if d.label.as_str().to_lowercase().starts_with(&ql)
+                || d.id.short().starts_with(&ql)
+                || d.aliases.iter().any(|a| a.to_lowercase().starts_with(&ql))
+            {
+                hits.push(d.id);
+            }
+        }
+        hits.sort_by_key(|id| id.to_string());
+        hits.dedup();
+        match hits.as_slice() {
+            [one] => Ok(*one),
+            [] => Err(Error::NotFound(format!("no device matched '{q}'"))),
+            _ => Err(Error::Config(format!("ambiguous device '{q}'"))),
+        }
+    }
+
+    pub fn set_label(&mut self, id: &DeviceId, label: DeviceLabel) -> Result<()> {
+        let r = self
+            .devices
+            .get_mut(id)
+            .ok_or_else(|| Error::NotFound(id.to_string()))?;
+        r.label = label;
+        self.flush()
+    }
+
+    pub fn add_alias(&mut self, id: &DeviceId, alias: &str) -> Result<()> {
+        let alias = alias.trim().to_lowercase();
+        if alias.is_empty() {
+            return Err(Error::Config("empty alias".into()));
+        }
+        // uniqueness
+        for d in self.devices.values() {
+            if d.id != *id
+                && (d.label.as_str().eq_ignore_ascii_case(&alias)
+                    || d.aliases.iter().any(|a| a == &alias))
+            {
+                return Err(Error::Config(format!("alias '{alias}' already used")));
+            }
+        }
+        let r = self
+            .devices
+            .get_mut(id)
+            .ok_or_else(|| Error::NotFound(id.to_string()))?;
+        if !r.aliases.iter().any(|a| a == &alias) {
+            r.aliases.push(alias);
+        }
+        self.flush()
+    }
+
+    pub fn remove_alias(&mut self, id: &DeviceId, alias: &str) -> Result<()> {
+        let alias = alias.trim().to_lowercase();
+        let r = self
+            .devices
+            .get_mut(id)
+            .ok_or_else(|| Error::NotFound(id.to_string()))?;
+        r.aliases.retain(|a| a != &alias);
+        self.flush()
+    }
+
+    pub fn add_group(&mut self, id: &DeviceId, group: &str) -> Result<()> {
+        let g = group.trim().to_lowercase();
+        if g.is_empty() {
+            return Err(Error::Config("empty group".into()));
+        }
+        let r = self
+            .devices
+            .get_mut(id)
+            .ok_or_else(|| Error::NotFound(id.to_string()))?;
+        if !r.groups.iter().any(|x| x == &g) {
+            r.groups.push(g);
+        }
+        self.flush()
+    }
+
+    pub fn remove_group(&mut self, id: &DeviceId, group: &str) -> Result<()> {
+        let g = group.trim().to_lowercase();
+        let r = self
+            .devices
+            .get_mut(id)
+            .ok_or_else(|| Error::NotFound(id.to_string()))?;
+        r.groups.retain(|x| x != &g);
+        self.flush()
+    }
+
+    pub fn in_group(&self, group: &str) -> Vec<&DeviceRecord> {
+        let g = group.to_lowercase();
+        let mut v: Vec<_> = self
+            .devices
+            .values()
+            .filter(|d| d.groups.iter().any(|x| x == &g))
+            .collect();
+        v.sort_by(|a, b| a.label.as_str().cmp(b.label.as_str()));
+        v
     }
 
     fn flush(&self) -> Result<()> {

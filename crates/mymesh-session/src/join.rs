@@ -102,7 +102,10 @@ pub async fn run_join_as_guest(
                     last_seen: Some(Utc::now()),
                     endpoint_hint: None,
                     mesh_id: None,
-                };
+                
+                aliases: Vec::new(),
+                groups: Vec::new(),
+            };
                 store.upsert(rec.clone())?;
                 host_rec = Some(rec);
             }
@@ -324,6 +327,7 @@ pub async fn handle_join_as_host(
                 last_seen: Some(Utc::now()),
                 endpoint_hint: None,
                 mesh_id: Some(mesh.mesh_id.clone()),
+            aliases: Vec::new(), groups: Vec::new(),
             };
             store.upsert(rec)?;
 

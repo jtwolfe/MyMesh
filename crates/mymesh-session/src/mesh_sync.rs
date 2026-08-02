@@ -212,6 +212,8 @@ pub fn apply_membership(
             last_seen: Some(Utc::now()),
             endpoint_hint: None,
             mesh_id: Some(mesh.mesh_id.clone()),
+                aliases: Vec::new(),
+                groups: Vec::new(),
         };
         store.upsert(rec)?;
         added += 1;

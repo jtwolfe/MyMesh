@@ -18,6 +18,9 @@ pub struct Config {
     /// Host path sandbox root for remote file access (default: $HOME).
     #[serde(default)]
     pub sandbox_root: Option<PathBuf>,
+    /// Magic LAN plane: DNS + SOCKS + mesh-IP port forwards.
+    #[serde(default)]
+    pub magic: MagicConfig,
 }
 
 impl Default for Config {
@@ -29,6 +32,51 @@ impl Default for Config {
             rendezvous_url: std::env::var("MYMESH_MAILBOX").ok(),
             mailbox_dir: std::env::var_os("MYMESH_MAILBOX_DIR").map(PathBuf::from),
             sandbox_root: None,
+            magic: MagicConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MagicConfig {
+    /// Enable magic plane when agent serves.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// DNS suffix without leading dot (default mym).
+    #[serde(default = "default_domain")]
+    pub domain: String,
+    /// UDP bind for userspace DNS (default 127.0.0.1:5353).
+    #[serde(default = "default_dns_bind")]
+    pub dns_bind: String,
+    /// SOCKS5 bind for browser/CLI tools (default 127.0.0.1:18080).
+    #[serde(default = "default_socks_bind")]
+    pub socks_bind: String,
+    /// Ports auto-bound on each peer mesh IP → tunnel to peer localhost:port.
+    #[serde(default = "default_auto_ports")]
+    pub auto_ports: Vec<u16>,
+    /// How often to probe peers for presence (seconds). 0 = disable.
+    #[serde(default = "default_reconnect_secs")]
+    pub reconnect_probe_secs: u64,
+}
+
+fn default_true() -> bool { true }
+fn default_domain() -> String { "mym".into() }
+fn default_dns_bind() -> String { "127.0.0.1:5353".into() }
+fn default_socks_bind() -> String { "127.0.0.1:18080".into() }
+fn default_auto_ports() -> Vec<u16> {
+    vec![22, 80, 443, 3000, 7878, 8000, 8080, 8443, 9090]
+}
+fn default_reconnect_secs() -> u64 { 30 }
+
+impl Default for MagicConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            domain: default_domain(),
+            dns_bind: default_dns_bind(),
+            socks_bind: default_socks_bind(),
+            auto_ports: default_auto_ports(),
+            reconnect_probe_secs: default_reconnect_secs(),
         }
     }
 }

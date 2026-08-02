@@ -22,6 +22,9 @@ pub enum Error {
     #[error("session: {0}")]
     Session(String),
 
+    #[error("network: {0}")]
+    Network(String),
+
     #[error("not found: {0}")]
     NotFound(String),
 

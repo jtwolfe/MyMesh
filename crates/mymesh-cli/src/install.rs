@@ -105,7 +105,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart={bin} serve --foreground
-Restart=on-failure
+Restart=always
 RestartSec=3
 Environment=RUST_LOG=mymesh=info
 
@@ -129,7 +129,7 @@ Type=simple
 User={user}
 Group={user}
 ExecStart={bin} serve --foreground
-Restart=on-failure
+Restart=always
 RestartSec=3
 Environment=RUST_LOG=mymesh=info
 # State lives in the service user's XDG dirs

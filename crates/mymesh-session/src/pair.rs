@@ -111,6 +111,9 @@ pub async fn run_host_pair(
                 last_seen: Some(Utc::now()),
                 endpoint_hint: None,
                 mesh_id: None,
+            
+                aliases: Vec::new(),
+                groups: Vec::new(),
             }
         }
         PairingMessage::Reject { reason } => {
@@ -221,6 +224,9 @@ pub async fn run_host_pair_code(
                 last_seen: Some(Utc::now()),
                 endpoint_hint: None,
                 mesh_id: None,
+            
+                aliases: Vec::new(),
+                groups: Vec::new(),
             }
         }
         PairingMessage::Reject { reason } => {
@@ -304,6 +310,9 @@ pub async fn run_guest_pair(
                 last_seen: Some(Utc::now()),
                 endpoint_hint: None,
                 mesh_id: None,
+            
+                aliases: Vec::new(),
+                groups: Vec::new(),
             }
         }
         other => {

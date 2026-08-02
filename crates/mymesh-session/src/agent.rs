@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::join::handle_join_as_host;
+use crate::tcp_tunnel;
 use crate::mesh_sync::{
     apply_kick_notice_local, apply_kick_target, apply_membership, build_announce, build_snapshot,
     sign_leave_ack, verify_kick, verify_leave_ack, verify_membership,
@@ -357,6 +358,17 @@ impl Agent {
                         }
                         ChannelKind::Desktop => {
                             warn!("desktop not enabled yet");
+                        }
+                        ChannelKind::Tcp => {
+                            // Trusted peers may open TCP tunnels (magic plane).
+                            if !self.store()?.is_trusted(&peer) {
+                                continue;
+                            }
+                            if let Some(h) = term.take() {
+                                h.kill();
+                            }
+                            let _ = term_out.take();
+                            return tcp_tunnel::host_bridge(conn, &frame.payload).await;
                         }
                     }
                 }
@@ -829,7 +841,10 @@ impl Agent {
                     last_seen: None,
                     endpoint_hint: None,
                     mesh_id: Some(k.mesh_id),
-                })?;
+                
+                aliases: Vec::new(),
+                groups: Vec::new(),
+            })?;
             }
         }
         let identity = self.identity();

@@ -2,7 +2,7 @@
 //!
 //! Design:
 //! - One QUIC connection per peer pair
-//! - Multiplexed logical channels (control / terminal / files / desktop)
+//! - Multiplexed logical channels (control / terminal / files / desktop / tcp)
 //! - Length-prefixed bincode frames (max 16 MiB per frame)
 
 mod channel;

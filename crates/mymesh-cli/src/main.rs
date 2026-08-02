@@ -1,5 +1,6 @@
 //! MyMesh CLI + TUI entrypoint.
 mod install;
+mod magic_cmd;
 mod probe;
 mod tui_app;
 mod term_pane;
@@ -172,6 +173,53 @@ enum Commands {
         yes_i_am_sure: bool,
     },
     InstallNotes,
+    /// List mesh hostnames, IPs, aliases, groups
+    Hosts {
+        #[arg(long)]
+        group: Option<String>,
+    },
+    /// Rename a device label
+    Label {
+        device: String,
+        name: String,
+    },
+    /// Add or remove an alias
+    Alias {
+        device: String,
+        name: String,
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Add or remove a group tag
+    Group {
+        device: String,
+        name: String,
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Resolve a name / alias / id
+    Resolve { name: String },
+    /// Print OpenSSH config for *.mym
+    SshConfig {
+        #[arg(long)]
+        domain: Option<String>,
+    },
+    /// ProxyCommand helper: bridge stdio to peer:22
+    ProxySsh { host: String },
+    /// Listen locally and tunnel TCP to peer:port
+    Expose {
+        device: String,
+        port: u16,
+        #[arg(long)]
+        local: Option<u16>,
+    },
+    /// Connect-by-carrier (phone QR page, no phone mesh node)
+    Carrier {
+        #[arg(long, default_value_t = 17878)]
+        port: u16,
+    },
+    /// Magic plane help
+    Magic,
 }
 
 #[derive(Subcommand, Debug)]
@@ -365,6 +413,22 @@ async fn main() -> Result<()> {
             yes_i_am_sure,
         } => cmd_kick(&paths, &device, force, yes_kick_from_mesh, yes_i_am_sure).await?,
         Commands::InstallNotes => print_install_notes(),
+        Commands::Hosts { group } => magic_cmd::cmd_hosts(&paths, group).await?,
+        Commands::Label { device, name } => magic_cmd::cmd_label(&paths, &device, &name).await?,
+        Commands::Alias { device, name, remove } => {
+            magic_cmd::cmd_alias(&paths, &device, &name, remove).await?
+        }
+        Commands::Group { device, name, remove } => {
+            magic_cmd::cmd_group(&paths, &device, &name, remove).await?
+        }
+        Commands::Resolve { name } => magic_cmd::cmd_resolve(&paths, &name).await?,
+        Commands::SshConfig { domain } => magic_cmd::cmd_ssh_config(&paths, domain)?,
+        Commands::ProxySsh { host } => magic_cmd::cmd_proxy_ssh(&paths, &host).await?,
+        Commands::Expose { device, port, local } => {
+            magic_cmd::cmd_expose(&paths, &device, port, local).await?
+        }
+        Commands::Carrier { port } => magic_cmd::cmd_carrier(&paths, port).await?,
+        Commands::Magic => magic_cmd::print_magic_help(),
     }
     Ok(())
 }
@@ -758,19 +822,16 @@ async fn cmd_unlink(paths: &Paths, device: &str) -> Result<()> {
 }
 
 pub(crate) fn resolve_device(store: &DeviceStore, q: &str) -> Result<mymesh_core::DeviceId> {
+    resolve_device_pub(store, q)
+}
+
+pub(crate) fn resolve_device_pub(store: &DeviceStore, q: &str) -> Result<mymesh_core::DeviceId> {
     if let Ok(id) = parse_device_id(q) {
         return Ok(id);
     }
-    let matches: Vec<_> = store
-        .list()
-        .into_iter()
-        .filter(|d| d.label.as_str().starts_with(q) || d.id.short().starts_with(q))
-        .collect();
-    match matches.as_slice() {
-        [one] => Ok(one.id),
-        [] => bail!("no device matched '{q}'"),
-        _ => bail!("ambiguous device '{q}'"),
-    }
+    store
+        .resolve_query(q)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 async fn cmd_serve(paths: &Paths) -> Result<()> {
@@ -793,8 +854,20 @@ async fn cmd_serve(paths: &Paths) -> Result<()> {
         paths.kick_notice_file(),
         paths.pending_kicks_file(),
         paths.mesh_dirty_file(),
-        cfg,
+        cfg.clone(),
     )?;
+    // Magic plane: DNS, SOCKS5, mesh-IP auto ports, reconnect probes
+    mymesh_session::MagicPlane::new(paths.clone(), &identity, cfg.device_label.clone(), &cfg)
+        .spawn()
+        .await;
+    if cfg.magic.enabled {
+        println!(
+            "  magic DNS {}  SOCKS5 {}  domain *.{}",
+            cfg.magic.dns_bind,
+            cfg.magic.socks_bind,
+            cfg.magic.domain
+        );
+    }
     agent.run(&transport).await?;
     Ok(())
 }
@@ -1066,7 +1139,10 @@ async fn demo_session() -> Result<()> {
         last_seen: Some(now),
         endpoint_hint: None,
         mesh_id: None,
-    })?;
+    
+                aliases: Vec::new(),
+                groups: Vec::new(),
+            })?;
     guest_store.upsert(mymesh_core::DeviceRecord {
         id: host_id.device_id(),
         label: mymesh_core::DeviceLabel::new("host"),
@@ -1079,7 +1155,10 @@ async fn demo_session() -> Result<()> {
         last_seen: Some(now),
         endpoint_hint: None,
         mesh_id: None,
-    })?;
+    
+                aliases: Vec::new(),
+                groups: Vec::new(),
+            })?;
     let host_ep = fabric.endpoint(host_id.device_id());
     let guest_ep = fabric.endpoint(guest_id.device_id());
     let accept = tokio::spawn(async move { host_ep.accept().await });
