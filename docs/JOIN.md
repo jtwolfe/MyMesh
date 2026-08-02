@@ -97,3 +97,28 @@ Also: `--mailbox-dir /path`, `MYMESH_MAILBOX=http://host:port` with `mymesh mail
 
 - [SECURITY.md](SECURITY.md) — trust and arming model  
 - [ROADMAP.md](ROADMAP.md) — alpha.2 install/TUI  
+
+## Mesh membership (gossip)
+
+After a join is accepted, the host sends a **membership snapshot** of all trusted
+devices. The joiner merges them into its allowlist, so peers that only linked to
+the hub also learn about each other.
+
+- `mymesh mesh status` — mesh id + roster  
+- `mymesh mesh sync` — pull/push membership with each trusted peer (agents must run)  
+- Session gossip: agents also push snapshots on connect  
+
+## Kick from mesh
+
+```bash
+mymesh kick <label-or-id>
+# Type: KICK FROM MESH
+# Type: I AM SURE
+```
+
+Effects:
+
+1. Direct `KickNotice` to the target: *you were kicked from the mesh by X host*
+2. `KickAnnounce` gossip to other members (they drop the target)
+3. Local remove of the target
+4. Kicked node clears its mesh roster and writes `kick-notice.txt`

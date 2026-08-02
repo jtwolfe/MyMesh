@@ -110,6 +110,7 @@ pub async fn run_host_pair(
                 linked_at: Utc::now(),
                 last_seen: Some(Utc::now()),
                 endpoint_hint: None,
+                mesh_id: None,
             }
         }
         PairingMessage::Reject { reason } => {
@@ -219,6 +220,7 @@ pub async fn run_host_pair_code(
                 linked_at: Utc::now(),
                 last_seen: Some(Utc::now()),
                 endpoint_hint: None,
+                mesh_id: None,
             }
         }
         PairingMessage::Reject { reason } => {
@@ -301,6 +303,7 @@ pub async fn run_guest_pair(
                 linked_at: Utc::now(),
                 last_seen: Some(Utc::now()),
                 endpoint_hint: None,
+                mesh_id: None,
             }
         }
         other => {

@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use console::style;
 use mymesh_core::{
-    ArmState, Capability, Config, DeviceStore, JoinDecision, JoinStore, Paths,
+    ArmState, Capability, Config, DeviceStore, JoinDecision, JoinStore, MeshState, Paths,
 };
 use mymesh_crypto::{
     device_id_to_words, device_join_uri, parse_device_id, Identity,
@@ -20,7 +20,8 @@ use mymesh_protocol::{
     decode_msg, encode_msg, ChannelId, FileMessage, Frame, TerminalMessage,
 };
 use mymesh_session::{
-    run_guest_pair, run_host_pair_code, run_join_as_guest, Agent, Session,
+    apply_kick_target, apply_membership, build_announce, run_guest_pair, run_host_pair_code,
+    run_join_as_guest, sign_kick, Agent, Session,
 };
 use mymesh_terminal::TerminalClient;
 use std::net::SocketAddr;
@@ -152,8 +153,31 @@ enum Commands {
         #[command(subcommand)]
         scenario: DemoCmd,
     },
+    /// Show mesh id + roster
+    Mesh {
+        #[command(subcommand)]
+        action: MeshCmd,
+    },
+    /// Kick a device from the mesh (double confirmation required)
+    Kick {
+        device: String,
+        /// Skip interactive prompts (must pass both confirm flags)
+        #[arg(long)]
+        yes_kick_from_mesh: bool,
+        #[arg(long)]
+        yes_i_am_sure: bool,
+    },
     InstallNotes,
 }
+
+#[derive(Subcommand, Debug)]
+enum MeshCmd {
+    /// Show mesh id and trusted roster
+    Status,
+    /// Pull/push membership with all trusted peers (gossip sync)
+    Sync,
+}
+
 
 #[derive(Subcommand, Debug)]
 enum ConnectRequestCmd {
@@ -326,6 +350,15 @@ async fn main() -> Result<()> {
             DemoCmd::Pair => demo_pair().await?,
             DemoCmd::Session => demo_session().await?,
         },
+        Commands::Mesh { action } => match action {
+            MeshCmd::Status => cmd_mesh_status(&paths).await?,
+            MeshCmd::Sync => cmd_mesh_sync(&paths).await?,
+        },
+        Commands::Kick {
+            device,
+            yes_kick_from_mesh,
+            yes_i_am_sure,
+        } => cmd_kick(&paths, &device, yes_kick_from_mesh, yes_i_am_sure).await?,
         Commands::InstallNotes => print_install_notes(),
     }
     Ok(())
@@ -558,6 +591,7 @@ async fn cmd_link_join(paths: &Paths, target: &str) -> Result<()> {
         &identity,
         &cfg.device_label,
         &mut store,
+        &paths.mesh_file(),
         Capability::all(),
     )
     .await?;
@@ -750,6 +784,8 @@ async fn cmd_serve(paths: &Paths) -> Result<()> {
         paths.devices_file(),
         paths.arm_file(),
         paths.join_dir(),
+        paths.mesh_file(),
+        paths.kick_notice_file(),
         cfg,
     )?;
     agent.run(&transport).await?;
@@ -1022,6 +1058,7 @@ async fn demo_session() -> Result<()> {
         linked_at: now,
         last_seen: Some(now),
         endpoint_hint: None,
+        mesh_id: None,
     })?;
     guest_store.upsert(mymesh_core::DeviceRecord {
         id: host_id.device_id(),
@@ -1034,6 +1071,7 @@ async fn demo_session() -> Result<()> {
         linked_at: now,
         last_seen: Some(now),
         endpoint_hint: None,
+        mesh_id: None,
     })?;
     let host_ep = fabric.endpoint(host_id.device_id());
     let guest_ep = fabric.endpoint(guest_id.device_id());
@@ -1074,6 +1112,314 @@ fn sub_paths(root: &Path, name: &str) -> Result<Paths> {
     };
     p.ensure()?;
     Ok(p)
+}
+
+async fn cmd_mesh_status(paths: &Paths) -> Result<()> {
+    let mesh = MeshState::load(paths.mesh_file())?;
+    let store = DeviceStore::open(paths.devices_file())?;
+    let id = Identity::load_or_create(paths.identity_file())?;
+    println!("{}", style("Mesh").bold());
+    println!("  mesh id   {}", mesh.mesh_id);
+    println!("  self      {} ({})", id.device_id().short(), Config::load(paths.config_file())?.device_label);
+    if let Some(k) = &mesh.last_kick_notice {
+        println!(
+            "  last kick notice: you were kicked by {} — {}",
+            k.by_label, k.message
+        );
+    }
+    println!("  members:");
+    let trusted: Vec<_> = store
+        .list()
+        .into_iter()
+        .filter(|d| matches!(d.trust, mymesh_core::TrustState::Trusted))
+        .collect();
+    if trusted.is_empty() {
+        println!("    (none yet — link devices to form a mesh)");
+    } else {
+        for d in trusted {
+            println!("    {}  {}  {:?}", d.id.short(), d.label, d.mesh_id);
+            println!("      {}", d.id);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_mesh_sync(paths: &Paths) -> Result<()> {
+    let identity = Identity::load_or_create(paths.identity_file())?;
+    let cfg = Config::load(paths.config_file())?;
+    let store = DeviceStore::open(paths.devices_file())?;
+    let mesh = MeshState::load(paths.mesh_file())?;
+    let peers: Vec<_> = store
+        .list()
+        .into_iter()
+        .filter(|d| matches!(d.trust, mymesh_core::TrustState::Trusted))
+        .map(|d| d.id)
+        .collect();
+    if peers.is_empty() {
+        println!("no trusted peers to sync with");
+        return Ok(());
+    }
+    let transport = IrohTransport::bind(&identity).await?;
+    let mut total_added = 0usize;
+    for peer in peers {
+        println!("sync {}…", peer.short());
+        match sync_with_peer(paths, &identity, &cfg, &mesh, &transport, peer).await {
+            Ok(n) => {
+                total_added += n;
+                println!("  ok (+{n} members)");
+            }
+            Err(e) => println!("  err: {e}"),
+        }
+    }
+    transport.shutdown().await;
+    println!(
+        "{} mesh sync complete (learned {total_added} new members)",
+        style("ok").green().bold()
+    );
+    Ok(())
+}
+
+async fn sync_with_peer(
+    paths: &Paths,
+    identity: &Identity,
+    cfg: &Config,
+    mesh: &MeshState,
+    transport: &IrohTransport,
+    peer: mymesh_core::DeviceId,
+) -> Result<usize> {
+    use mymesh_protocol::{decode_msg, encode_msg, ChannelId, ControlMessage, Frame};
+    let store = DeviceStore::open(paths.devices_file())?;
+    let conn = transport.connect(peer).await?;
+    let session = Session::handshake_dialer(
+        conn,
+        identity,
+        &cfg.device_label,
+        &store,
+        Capability::all(),
+    )
+    .await?;
+    let conn = session.into_conn();
+    // request their roster
+    conn.send_frame(Frame {
+        channel: ChannelId::control(),
+        payload: encode_msg(&ControlMessage::MembershipRequest { nonce: 1 })?,
+    })
+    .await?;
+    // also push ours
+    let announce = build_announce(identity, &cfg.device_label, &store, mesh);
+    conn.send_frame(Frame {
+        channel: ChannelId::control(),
+        payload: encode_msg(&announce)?,
+    })
+    .await?;
+
+    let mut added = 0usize;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), conn.recv_frame()).await {
+            Ok(Ok(frame)) => {
+                if frame.channel.kind != mymesh_protocol::ChannelKind::Control {
+                    continue;
+                }
+                let msg: ControlMessage = decode_msg(&frame.payload)?;
+                match msg {
+                    ControlMessage::MembershipSnapshot {
+                        mesh_id,
+                        from_id,
+                        members,
+                        ts,
+                        signature,
+                        ..
+                    }
+                    | ControlMessage::MembershipAnnounce {
+                        mesh_id,
+                        from_id,
+                        members,
+                        ts,
+                        signature,
+                        ..
+                    } => {
+                        mymesh_session::verify_membership(
+                            &from_id, &mesh_id, ts, &members, &signature,
+                        )?;
+                        let mut store = DeviceStore::open(paths.devices_file())?;
+                        added += apply_membership(
+                            &mut store,
+                            &paths.mesh_file(),
+                            &from_id,
+                            &mesh_id,
+                            &members,
+                            identity.device_id(),
+                        )?;
+                        break;
+                    }
+                    ControlMessage::Ping { nonce } => {
+                        conn.send_frame(Frame {
+                            channel: ChannelId::control(),
+                            payload: encode_msg(&ControlMessage::Pong { nonce })?,
+                        })
+                        .await?;
+                    }
+                    _ => {}
+                }
+            }
+            _ => break,
+        }
+    }
+    let _ = conn.close().await;
+    Ok(added)
+}
+
+async fn cmd_kick(
+    paths: &Paths,
+    device: &str,
+    yes_kick: bool,
+    yes_sure: bool,
+) -> Result<()> {
+    use mymesh_protocol::ControlMessage;
+    use std::io::{self, Write};
+
+    let identity = Identity::load_or_create(paths.identity_file())?;
+    let cfg = Config::load(paths.config_file())?;
+    let mut store = DeviceStore::open(paths.devices_file())?;
+    let target = resolve_device(&store, device)?;
+    let rec = store
+        .get(&target)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("device not found"))?;
+    if !matches!(rec.trust, mymesh_core::TrustState::Trusted) {
+        bail!("device is not trusted");
+    }
+
+    let label = rec.label.as_str().to_string();
+    if !(yes_kick && yes_sure) {
+        print!(
+            "Type {} to kick {} ({}): ",
+            style("KICK FROM MESH").red().bold(),
+            style(&label).cyan(),
+            target.short()
+        );
+        io::stdout().flush()?;
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        if line.trim() != "KICK FROM MESH" {
+            bail!("aborted — first confirmation failed");
+        }
+        print!(
+            "Type {} if you are sure you want to kick the device: ",
+            style("I AM SURE").red().bold()
+        );
+        io::stdout().flush()?;
+        line.clear();
+        io::stdin().read_line(&mut line)?;
+        if line.trim() != "I AM SURE" {
+            bail!("aborted — second confirmation failed");
+        }
+    } else if !(yes_kick && yes_sure) {
+        bail!("both --yes-kick-from-mesh and --yes-i-am-sure required for non-interactive kick");
+    }
+
+    let mesh = MeshState::load(paths.mesh_file())?;
+    let ts = chrono::Utc::now().timestamp();
+    let by_id = identity.device_id();
+    let by_label = cfg.device_label.clone();
+    let message = format!("you were kicked from the mesh by {by_label} host");
+    let signature = sign_kick(&identity, &mesh.mesh_id, &target, ts);
+
+    let transport = IrohTransport::bind(&identity).await?;
+
+    // Notify kicked device WHILE still trusted locally (required for session dial)
+    let notice = ControlMessage::KickNotice {
+        mesh_id: mesh.mesh_id.clone(),
+        by_id,
+        by_label: by_label.clone(),
+        message: message.clone(),
+        ts,
+        signature,
+    };
+    println!("notifying kicked device {}…", target.short());
+    match notify_peer(paths, &identity, &cfg, &transport, target, notice).await {
+        Ok(()) => println!("  notice delivered"),
+        Err(e) => println!("  notice not delivered (offline?): {e}"),
+    }
+
+    // Gossip kick to other members (before local remove so store still has them)
+    let announce = ControlMessage::KickAnnounce {
+        mesh_id: mesh.mesh_id.clone(),
+        target_id: target,
+        by_id,
+        by_label: by_label.clone(),
+        message: message.clone(),
+        ts,
+        signature: sign_kick(&identity, &mesh.mesh_id, &target, ts),
+    };
+    let others: Vec<_> = store
+        .list()
+        .into_iter()
+        .filter(|d| matches!(d.trust, mymesh_core::TrustState::Trusted) && d.id != target)
+        .map(|d| d.id)
+        .collect();
+    for peer in others {
+        print!("announcing kick to {}… ", peer.short());
+        match notify_peer(paths, &identity, &cfg, &transport, peer, announce.clone()).await {
+            Ok(()) => println!("ok"),
+            Err(e) => println!("err {e}"),
+        }
+    }
+
+    // Local remove last
+    apply_kick_target(&mut store, &target)?;
+    transport.shutdown().await;
+    println!(
+        "{} kicked {} ({}) from mesh {}",
+        style("ok").green().bold(),
+        label,
+        target.short(),
+        mesh.mesh_id
+    );
+    println!("  message: {message}");
+    Ok(())
+}
+
+async fn notify_peer(
+    paths: &Paths,
+    identity: &Identity,
+    cfg: &Config,
+    transport: &IrohTransport,
+    peer: mymesh_core::DeviceId,
+    msg: mymesh_protocol::ControlMessage,
+) -> Result<()> {
+    use mymesh_protocol::{encode_msg, ChannelId, Frame};
+    let store = DeviceStore::open(paths.devices_file())?;
+    // kicked peer may no longer be in store — still dial by id
+    let conn = transport.connect(peer).await?;
+    // handshake: if not trusted on remote, may fail — for KickNotice target still has us trusted until applied
+    let session = Session::handshake_dialer(
+        conn,
+        identity,
+        &cfg.device_label,
+        &store,
+        Capability::all(),
+    )
+    .await;
+    let session = match session {
+        Ok(s) => s,
+        Err(_) => {
+            // raw frames without full trust path not supported — rethrow
+            // Try connect-only send for kick notice: not available; surface error
+            bail!("session handshake failed (peer offline or already revoked us)");
+        }
+    };
+    let conn = session.into_conn();
+    conn.send_frame(Frame {
+        channel: ChannelId::control(),
+        payload: encode_msg(&msg)?,
+    })
+    .await?;
+    // brief wait for ack
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), conn.recv_frame()).await;
+    let _ = conn.close().await;
+    Ok(())
 }
 
 fn print_install_notes() {

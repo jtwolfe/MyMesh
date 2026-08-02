@@ -1,16 +1,21 @@
-//! Background agent: join requests + authenticated sessions.
-use mymesh_core::{ArmState, Capability, Config, DeviceStore, Result};
+//! Background agent: join requests + authenticated sessions + mesh gossip/kick.
+use mymesh_core::{ArmState, Capability, Config, DeviceStore, MeshState, Result};
 use mymesh_crypto::Identity;
 use mymesh_files::{apply_host_message, FileTransferEngine, PathSandbox};
 use mymesh_net::Transport;
 use mymesh_protocol::{
-    decode_msg, encode_msg, ChannelId, ChannelKind, FileMessage, Frame, TerminalMessage,
+    decode_msg, encode_msg, ChannelId, ChannelKind, ControlMessage, FileMessage, Frame,
+    TerminalMessage,
 };
 use mymesh_terminal::TerminalHost;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
 use crate::join::handle_join_as_host;
+use crate::mesh_sync::{
+    apply_kick_notice_local, apply_kick_target, apply_membership, build_snapshot, verify_kick,
+    verify_membership,
+};
 use crate::session::Session;
 
 #[derive(Clone)]
@@ -20,6 +25,8 @@ pub struct Agent {
     devices_path: PathBuf,
     arm_path: PathBuf,
     join_dir: PathBuf,
+    mesh_path: PathBuf,
+    kick_notice_path: PathBuf,
     config: Config,
     files: std::sync::Arc<FileTransferEngine>,
 }
@@ -31,6 +38,8 @@ impl Agent {
         devices_path: PathBuf,
         arm_path: PathBuf,
         join_dir: PathBuf,
+        mesh_path: PathBuf,
+        kick_notice_path: PathBuf,
         config: Config,
     ) -> Result<Self> {
         let sandbox = PathSandbox::new(config.effective_sandbox_root())?;
@@ -40,6 +49,8 @@ impl Agent {
             devices_path,
             arm_path,
             join_dir,
+            mesh_path,
+            kick_notice_path,
             config,
             files: std::sync::Arc::new(FileTransferEngine::new(sandbox)),
         })
@@ -103,6 +114,7 @@ impl Agent {
             &self.devices_path,
             &self.arm_path,
             &self.join_dir,
+            &self.mesh_path,
             self.config.limits.arm_timeout_secs,
         )
         .await
@@ -135,12 +147,26 @@ impl Agent {
         let mut active_put: Option<String> = None;
         let conn = session.into_conn();
 
+        // best-effort initial gossip
+        if let Ok(mesh) = MeshState::load(&self.mesh_path) {
+            if let Ok(store) = self.store() {
+                let snap = build_snapshot(&identity, &self.label, &store, &mesh, 0);
+                let _ = conn
+                    .send_frame(Frame {
+                        channel: ChannelId::control(),
+                        payload: encode_msg(&snap)?,
+                    })
+                    .await;
+            }
+        }
+
         loop {
             tokio::select! {
                 frame = conn.recv_frame() => {
                     let frame = frame?;
                     match frame.channel.kind {
                         ChannelKind::Terminal => {
+                            let store = self.store()?;
                             if !store.allows(&peer, &Capability::Terminal) {
                                 warn!("terminal denied for peer");
                                 continue;
@@ -164,6 +190,7 @@ impl Agent {
                             }
                         }
                         ChannelKind::Files => {
+                            let store = self.store()?;
                             if !store.allows(&peer, &Capability::Files) {
                                 warn!("files denied for peer");
                                 continue;
@@ -209,25 +236,161 @@ impl Agent {
                             }
                         }
                         ChannelKind::Control => {
-                            let msg: mymesh_protocol::ControlMessage = decode_msg(&frame.payload)?;
+                            let msg: ControlMessage = decode_msg(&frame.payload)?;
                             match msg {
-                                mymesh_protocol::ControlMessage::Ping { nonce } => {
+                                ControlMessage::Ping { nonce } => {
                                     conn.send_frame(Frame {
                                         channel: ChannelId::control(),
-                                        payload: encode_msg(&mymesh_protocol::ControlMessage::Pong { nonce })?,
+                                        payload: encode_msg(&ControlMessage::Pong { nonce })?,
                                     }).await?;
                                 }
-                                mymesh_protocol::ControlMessage::HostMetricsRequest { nonce } => {
+                                ControlMessage::HostMetricsRequest { nonce } => {
                                     let report = crate::host_metrics::sample_metrics(nonce).await;
                                     conn.send_frame(Frame {
                                         channel: ChannelId::control(),
                                         payload: encode_msg(&report)?,
                                     }).await?;
                                 }
-                                mymesh_protocol::ControlMessage::MetricsPollEnable { .. }
-                                | mymesh_protocol::ControlMessage::MetricsPollDisable => {
-                                    // Streaming handled by client re-requesting; ack with ping
+                                ControlMessage::MembershipRequest { nonce } => {
+                                    let mesh = MeshState::load(&self.mesh_path)?;
+                                    let store = self.store()?;
+                                    let snap = build_snapshot(&identity, &self.label, &store, &mesh, nonce);
+                                    conn.send_frame(Frame {
+                                        channel: ChannelId::control(),
+                                        payload: encode_msg(&snap)?,
+                                    }).await?;
                                 }
+                                ControlMessage::MembershipSnapshot {
+                                    mesh_id,
+                                    from_id,
+                                    members,
+                                    ts,
+                                    signature,
+                                    ..
+                                }
+                                | ControlMessage::MembershipAnnounce {
+                                    mesh_id,
+                                    from_id,
+                                    members,
+                                    ts,
+                                    signature,
+                                    ..
+                                } => {
+                                    let store = self.store()?;
+                                    if !store.is_trusted(&from_id) && from_id != peer {
+                                        warn!(from = %from_id.short(), "ignore membership from untrusted");
+                                        continue;
+                                    }
+                                    // peer is trusted; from_id should match peer for safety
+                                    if from_id != peer {
+                                        warn!("membership from_id != session peer");
+                                        continue;
+                                    }
+                                    if let Err(e) = verify_membership(&from_id, &mesh_id, ts, &members, &signature) {
+                                        warn!(%e, "bad membership signature");
+                                        continue;
+                                    }
+                                    let mut store = self.store()?;
+                                    let n = apply_membership(
+                                        &mut store,
+                                        &self.mesh_path,
+                                        &from_id,
+                                        &mesh_id,
+                                        &members,
+                                        identity.device_id(),
+                                    )?;
+                                    if n > 0 {
+                                        info!(added = n, "mesh membership updated via gossip");
+                                    }
+                                }
+                                ControlMessage::KickAnnounce {
+                                    mesh_id,
+                                    target_id,
+                                    by_id,
+                                    by_label,
+                                    message,
+                                    ts,
+                                    signature,
+                                } => {
+                                    let store = self.store()?;
+                                    if !store.is_trusted(&by_id) || by_id != peer {
+                                        warn!("ignore kick announce from untrusted");
+                                        continue;
+                                    }
+                                    if let Err(e) = verify_kick(&mesh_id, &target_id, &by_id, ts, &signature) {
+                                        warn!(%e, "bad kick signature");
+                                        continue;
+                                    }
+                                    if target_id == identity.device_id() {
+                                        // we are the target
+                                        let mut store = self.store()?;
+                                        apply_kick_notice_local(
+                                            &mut store,
+                                            &self.mesh_path,
+                                            &self.kick_notice_path,
+                                            by_id,
+                                            &by_label,
+                                            &message,
+                                        )?;
+                                        info!("this node was kicked from the mesh by {by_label}");
+                                        conn.send_frame(Frame {
+                                            channel: ChannelId::control(),
+                                            payload: encode_msg(&ControlMessage::KickAck { accepted: true })?,
+                                        }).await?;
+                                        let _ = conn.close().await;
+                                        return Ok(());
+                                    } else {
+                                        let mut store = self.store()?;
+                                        apply_kick_target(&mut store, &target_id)?;
+                                        info!(target = %target_id.short(), by = %by_label, "applied kick announce");
+                                    }
+                                }
+                                ControlMessage::KickNotice {
+                                    mesh_id,
+                                    by_id,
+                                    by_label,
+                                    message,
+                                    ts,
+                                    signature,
+                                } => {
+                                    // Direct notice: verify by_id was trusted
+                                    let store = self.store()?;
+                                    if !store.is_trusted(&by_id) {
+                                        warn!("kick notice from untrusted — ignoring");
+                                        continue;
+                                    }
+                                    if let Err(e) = verify_kick(
+                                        &mesh_id,
+                                        &identity.device_id(),
+                                        &by_id,
+                                        ts,
+                                        &signature,
+                                    ) {
+                                        warn!(%e, "bad kick notice signature");
+                                        continue;
+                                    }
+                                    let mut store = self.store()?;
+                                    apply_kick_notice_local(
+                                        &mut store,
+                                        &self.mesh_path,
+                                        &self.kick_notice_path,
+                                        by_id,
+                                        &by_label,
+                                        &message,
+                                    )?;
+                                    println!(
+                                        "you were kicked from the mesh by {by_label} host"
+                                    );
+                                    conn.send_frame(Frame {
+                                        channel: ChannelId::control(),
+                                        payload: encode_msg(&ControlMessage::KickAck { accepted: true })?,
+                                    }).await?;
+                                    let _ = conn.close().await;
+                                    return Ok(());
+                                }
+                                ControlMessage::MetricsPollEnable { .. }
+                                | ControlMessage::MetricsPollDisable
+                                | ControlMessage::KickAck { .. } => {}
                                 _ => {}
                             }
                         }

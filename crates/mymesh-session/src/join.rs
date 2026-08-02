@@ -1,8 +1,8 @@
-//! Join request (joiner) and host-side pending approval.
+//! Join request (joiner) and host-side pending approval + membership handoff.
 use chrono::Utc;
 use mymesh_core::{
     ArmState, Capability, DeviceId, DeviceLabel, DeviceRecord, DeviceStore, JoinDecision,
-    JoinStore, NodeFingerprint, PendingJoin, Result, TrustState,
+    JoinStore, MeshState, NodeFingerprint, PendingJoin, Result, TrustState,
 };
 use mymesh_crypto::Identity;
 use mymesh_net::PeerConnection;
@@ -10,6 +10,8 @@ use mymesh_protocol::{decode_msg, encode_msg, ChannelId, ControlMessage, Frame};
 use std::path::Path;
 use std::time::Duration;
 use tracing::{info, warn};
+
+use crate::mesh_sync::{apply_membership, build_snapshot, verify_membership};
 
 fn sign_material(device_id: &DeviceId, label: &str, ts: i64) -> Vec<u8> {
     let mut v = Vec::new();
@@ -20,12 +22,13 @@ fn sign_material(device_id: &DeviceId, label: &str, ts: i64) -> Vec<u8> {
     v
 }
 
-/// Joiner: send JoinRequest and wait for Accept/Deny.
+/// Joiner: send JoinRequest and wait for Accept/Deny (+ membership snapshot).
 pub async fn run_join_as_guest(
     conn: Box<dyn PeerConnection>,
     identity: &Identity,
     label: &str,
     store: &mut DeviceStore,
+    mesh_path: &Path,
     requested_caps: Vec<Capability>,
 ) -> Result<DeviceRecord> {
     let device_id = identity.device_id();
@@ -46,8 +49,25 @@ pub async fn run_join_as_guest(
     })
     .await?;
 
+    let mut host_rec: Option<DeviceRecord> = None;
+
     loop {
-        let frame = conn.recv_frame().await?;
+        let frame = match tokio::time::timeout(Duration::from_secs(600), conn.recv_frame()).await {
+            Ok(Ok(f)) => f,
+            Ok(Err(e)) => {
+                if let Some(rec) = host_rec {
+                    return Ok(rec);
+                }
+                return Err(e);
+            }
+            Err(_) => {
+                if let Some(rec) = host_rec {
+                    let _ = conn.close().await;
+                    return Ok(rec);
+                }
+                return Err(mymesh_core::Error::Other("join timed out waiting for host".into()));
+            }
+        };
         let msg: ControlMessage = decode_msg(&frame.payload)?;
         match msg {
             ControlMessage::JoinPending {
@@ -64,11 +84,9 @@ pub async fn run_join_as_guest(
                 capabilities,
                 signature,
             } => {
-                // Host signs with ts=0 convention for accept
                 let pub_id = mymesh_crypto::IdentityPublic {
                     verifying_key: *host_id.as_bytes(),
                 };
-                // Accept signature covers device_id||label||"mymesh-join-accept-v1"
                 let mut mat = Vec::new();
                 mat.extend_from_slice(host_id.as_bytes());
                 mat.extend_from_slice(host_label.as_bytes());
@@ -83,16 +101,44 @@ pub async fn run_join_as_guest(
                     linked_at: Utc::now(),
                     last_seen: Some(Utc::now()),
                     endpoint_hint: None,
+                    mesh_id: None,
                 };
                 store.upsert(rec.clone())?;
-                let _ = conn.close().await;
-                return Ok(rec);
+                host_rec = Some(rec);
+            }
+            ControlMessage::MembershipSnapshot {
+                mesh_id,
+                from_id,
+                members,
+                ts,
+                signature,
+                ..
+            } => {
+                verify_membership(&from_id, &mesh_id, ts, &members, &signature)?;
+                let n = apply_membership(
+                    store,
+                    mesh_path,
+                    &from_id,
+                    &mesh_id,
+                    &members,
+                    identity.device_id(),
+                )?;
+                info!(added = n, "applied mesh membership from join host");
+                if let Some(rec) = host_rec {
+                    let _ = conn.close().await;
+                    return Ok(rec);
+                }
             }
             ControlMessage::JoinDeny { reason } => {
                 let _ = conn.close().await;
                 return Err(mymesh_core::Error::PermissionDenied(reason));
             }
             other => {
+                if let Some(rec) = host_rec {
+                    warn!("ignoring post-accept message: {other:?}");
+                    let _ = conn.close().await;
+                    return Ok(rec);
+                }
                 return Err(mymesh_core::Error::Protocol(format!(
                     "unexpected join response: {other:?}"
                 )));
@@ -109,6 +155,7 @@ pub async fn handle_join_as_host(
     devices_path: &Path,
     arm_path: &Path,
     join_dir: &Path,
+    mesh_path: &Path,
     arm_timeout_hint: u64,
 ) -> Result<()> {
     let peer = conn.peer_id();
@@ -193,7 +240,6 @@ pub async fn handle_join_as_host(
         return Ok(());
     }
 
-    // Freshness: allow ±1 hour skew
     let now = Utc::now().timestamp();
     if (now - ts).abs() > 3600 {
         let deny = ControlMessage::JoinDeny {
@@ -238,7 +284,6 @@ pub async fn handle_join_as_host(
     })
     .await?;
 
-    // Wait for operator decision
     let deadline = std::time::Instant::now() + Duration::from_secs(arm_timeout_hint.max(60));
     let decision = loop {
         if std::time::Instant::now() > deadline {
@@ -246,10 +291,8 @@ pub async fn handle_join_as_host(
                 reason: "approval timed out".into(),
             };
         }
-        // Also bail if disarmed without decision
         let arm = ArmState::load(arm_path)?;
         if !arm.is_effectively_armed() {
-            // still allow if decision file present
             if let Some(d) = joins.take_decision(&joiner_id)? {
                 break d;
             }
@@ -265,6 +308,7 @@ pub async fn handle_join_as_host(
 
     match decision {
         JoinDecision::Accept => {
+            let mesh = MeshState::load(mesh_path)?;
             let mut store = DeviceStore::open(devices_path)?;
             let rec = DeviceRecord {
                 id: joiner_id,
@@ -279,6 +323,7 @@ pub async fn handle_join_as_host(
                 linked_at: Utc::now(),
                 last_seen: Some(Utc::now()),
                 endpoint_hint: None,
+                mesh_id: Some(mesh.mesh_id.clone()),
             };
             store.upsert(rec)?;
 
@@ -299,10 +344,16 @@ pub async fn handle_join_as_host(
             })
             .await?;
 
-            // Auto-disarm after successful accept
+            // Full roster so joiner learns all existing members
+            let snap = build_snapshot(identity, label, &store, &mesh, 0);
+            conn.send_frame(Frame {
+                channel: ChannelId::control(),
+                payload: encode_msg(&snap)?,
+            })
+            .await?;
+
             ArmState::disarm(arm_path)?;
-            info!(peer = %joiner_id.short(), "join accepted; disarmed");
-            // Give the joiner time to read JoinAccept before tearing down QUIC.
+            info!(peer = %joiner_id.short(), "join accepted + membership shared; disarmed");
             tokio::time::sleep(Duration::from_millis(800)).await;
             let _ = conn.close().await;
             Ok(())

@@ -30,6 +30,7 @@ const C_ACCENT: Color = Color::Rgb(120, 180, 255);
 const C_ACCENT2: Color = Color::Rgb(160, 120, 255);
 const C_OK: Color = Color::Rgb(100, 220, 150);
 const C_WARN: Color = Color::Rgb(240, 190, 80);
+#[allow(dead_code)]
 const C_ERR: Color = Color::Rgb(240, 100, 110);
 const C_MUTED: Color = Color::Rgb(130, 130, 150);
 const C_TEXT: Color = Color::Rgb(230, 230, 240);

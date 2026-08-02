@@ -45,6 +45,9 @@ pub struct DeviceRecord {
     /// Optional iroh / transport endpoint tips (relay URLs, etc.) as opaque JSON.
     #[serde(default)]
     pub endpoint_hint: Option<serde_json::Value>,
+    /// Mesh this peer belongs to (gossip roster).
+    #[serde(default)]
+    pub mesh_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

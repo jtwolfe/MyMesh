@@ -59,4 +59,12 @@ impl Paths {
     pub fn install_marker(&self) -> PathBuf {
         self.data_dir.join("install.json")
     }
+
+    pub fn mesh_file(&self) -> PathBuf {
+        self.data_dir.join("mesh.json")
+    }
+
+    pub fn kick_notice_file(&self) -> PathBuf {
+        self.data_dir.join("kick-notice.txt")
+    }
 }

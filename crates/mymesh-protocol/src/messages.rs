@@ -96,6 +96,65 @@ pub enum ControlMessage {
         duration_secs: u32,
     },
     MetricsPollDisable,
+    /// Request current mesh roster from peer.
+    MembershipRequest {
+        nonce: u64,
+    },
+    /// Signed roster from a trusted peer.
+    MembershipSnapshot {
+        nonce: u64,
+        mesh_id: String,
+        from_id: DeviceId,
+        from_label: String,
+        members: Vec<MeshMemberWire>,
+        ts: i64,
+        #[serde(with = "crate::ser_fixed::array64")]
+        signature: [u8; 64],
+    },
+    /// Announce a new or updated member (delta-friendly full list ok).
+    MembershipAnnounce {
+        mesh_id: String,
+        from_id: DeviceId,
+        from_label: String,
+        members: Vec<MeshMemberWire>,
+        ts: i64,
+        #[serde(with = "crate::ser_fixed::array64")]
+        signature: [u8; 64],
+    },
+    /// Gossip: member X was kicked from the mesh by Y.
+    KickAnnounce {
+        mesh_id: String,
+        target_id: DeviceId,
+        by_id: DeviceId,
+        by_label: String,
+        message: String,
+        ts: i64,
+        #[serde(with = "crate::ser_fixed::array64")]
+        signature: [u8; 64],
+    },
+    /// Direct notice to the kicked device.
+    KickNotice {
+        mesh_id: String,
+        by_id: DeviceId,
+        by_label: String,
+        message: String,
+        ts: i64,
+        #[serde(with = "crate::ser_fixed::array64")]
+        signature: [u8; 64],
+    },
+    KickAck {
+        accepted: bool,
+    },
+}
+
+/// Wire form of a mesh member (protocol crate — mirrors core::MeshMember fields).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MeshMemberWire {
+    pub id: DeviceId,
+    pub label: String,
+    pub fingerprint: String,
+    pub capabilities: Vec<Capability>,
+    pub linked_at_unix: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
