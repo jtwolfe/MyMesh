@@ -1,46 +1,34 @@
 # Changelog
 
-All notable releases are documented here. Format inspired by [Keep a Changelog](https://keepachangelog.com/).
-
-## [0.1.0-alpha.1] — 2026-08-02
-
-First tagged alpha. Suitable for early self-host testing on Linux. **Not** production-hardened.
+## [0.1.0-alpha.2] — 2026-08-02
 
 ### Added
 
-- Request/accept device linking:
-  - `mymesh connect-request allow|deny|status`
-  - `mymesh link <device-id>`
-  - `mymesh requests list|accept|deny`
-  - Auto-disarm after successful accept
-- Device identity display:
-  - 64-char hex id
-  - 24-word BIP39 encoding (`mymesh id`, `--words`, `--uri`)
-  - URI scheme `mymesh:v1:join:<hex>` (QR-ready payload)
-- Agent: `mymesh serve` (trusted sessions + join handling when armed)
-- Remote terminal: `mymesh shell`
-- File transfer: `mymesh cp` (sandboxed)
-- iroh-based P2P transport (hole punch + relay)
-- Advanced SPAKE pairing (`--local`, `--mailbox-dir`, `--code`, HTTP mailbox)
-- Docs: README, JOIN, ROADMAP, SECURITY, INSTALL-POLICY
+- **Lifecycle:** `mymesh install` / `uninstall` / `reset`
+  - Default **user** systemd unit (`~/.config/systemd/user/mymesh.service`)
+  - Binary to `~/.local/bin/mymesh`
+  - **System** install (`--system`) requires root, prefers runtime user `mymesh`, refuses root agent without `--i-accept-root-agent`
+- **Service control:** `mymesh service status|start|stop|restart` (`systemctl [--user]`)
+- **Completions:** `mymesh completions bash|zsh|fish` (also installed by `install`)
+- **TUI (default):** bare `mymesh` opens dashboard (tabs: Dashboard, Peers, Link, Tools, Service)
+  - Arm/disarm, accept pending, peer list + RTT history, bandwidth test, service toggle, QR
+- **Peer metrics:** `mymesh ping`, `mymesh bw`, `mymesh probe-all`; ~60 sample history on disk
+- **Agent:** responds to control `Ping` with `Pong`
+- **Word-id paste:** numbered lists, commas, URI prefix, quotes tolerated
 
-### Known limitations
+### Changed
 
-- No systemd installer; `serve` is a foreground/manual process
-- No TUI (CLI only)
-- No desktop remote control
-- No `*.mym` DNS / stock OpenSSH integration
-- CI workflow present but disabled
-- CLI and on-disk formats may change before 0.1.0
+- Workspace version `0.1.0-alpha.2`
+- Bare `mymesh` prefers TUI when stdin is a TTY (`--no-tui` for help)
 
-### Security notes
+### Notes
 
-- Joins rejected unless host is armed
-- Agent privilege = OS user running `serve`
-- File access limited to sandbox root (default home)
+- System install needs a real systemd host; containers without systemctl will fail system mode (expected)
+- Shell/cp from TUI still guided to CLI for full sessions in this alpha
 
-## [Unreleased]
+## [0.1.0-alpha.1] — 2026-08-02
 
-Work targeting **v0.1.0-alpha.2**: install lifecycle, user systemd unit, TUI, peer metrics.
+First tagged alpha: request/accept join, shell, cp, iroh. See git history.
 
+[0.1.0-alpha.2]: https://github.com/jtwolfe/MyMesh/releases/tag/v0.1.0-alpha.2
 [0.1.0-alpha.1]: https://github.com/jtwolfe/MyMesh/releases/tag/v0.1.0-alpha.1

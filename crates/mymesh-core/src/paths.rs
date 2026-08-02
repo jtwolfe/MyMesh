@@ -51,4 +51,12 @@ impl Paths {
     pub fn join_dir(&self) -> PathBuf {
         self.data_dir.join("join")
     }
+
+    pub fn metrics_dir(&self) -> PathBuf {
+        self.data_dir.join("metrics")
+    }
+
+    pub fn install_marker(&self) -> PathBuf {
+        self.data_dir.join("install.json")
+    }
 }

@@ -20,19 +20,27 @@ Personal machine mesh: install → link with explicit approval → remote **term
 | Honest docs + changelog + tag | done |
 | Real multi-machine validation | done (maintainer) |
 
-### v0.1.0-alpha.2 — **planned** (next)
+### v0.1.0-alpha.2 — **done**
 
 | Item | Notes |
 |------|--------|
-| `install` / `uninstall` / `reset` | Full lifecycle |
-| User systemd unit (default) | `systemctl --user status mymesh`; unit name `mymesh` |
-| System install | Optional, root required, **big warning**, override flag; runtime non-root |
-| Shell completions | bash/zsh |
-| TUI default (`mymesh` with no args) | Dashboard, peers, link, shell, cp, service toggle |
-| Peer status | ~60s latency samples, bandwidth test |
-| Word-id paste polish | Multi-line / punctuation tolerant |
+| `install` / `uninstall` / `reset` | **done** |
+| User systemd unit (default) | **done** |
+| System install | **done** |
+| Shell completions | **done** (bash/zsh/fish) |
+| TUI default (`mymesh` with no args) | **done** (shell via CLI from TUI in this cut) |
+| Peer status | **done** |
+| Word-id paste polish | **done** |
 
 Install policy (user default, root override): [INSTALL-POLICY.md](INSTALL-POLICY.md).
+
+### v0.1.0-alpha.3+ — planned
+
+| Item | Notes |
+|------|--------|
+| TUI embedded shell/cp | Full session inside TUI |
+| Auto peer probe loop | Background 60s sampler while TUI/agent runs |
+| Packages / curl installer | deb rpm AUR |
 
 ### Later
 

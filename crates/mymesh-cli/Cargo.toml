@@ -20,12 +20,14 @@ mymesh-terminal = { workspace = true }
 mymesh-files = { workspace = true }
 mymesh-desktop = { workspace = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 console = { workspace = true }
 indicatif = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 rand = { workspace = true }
 chrono = { workspace = true }
@@ -34,3 +36,6 @@ sha2 = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 crossterm = { workspace = true }
+ratatui = { workspace = true }
+qrcode = { workspace = true }
+directories = { workspace = true }

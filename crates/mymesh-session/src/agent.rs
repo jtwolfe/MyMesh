@@ -209,7 +209,13 @@ impl Agent {
                             }
                         }
                         ChannelKind::Control => {
-                            let _msg: mymesh_protocol::ControlMessage = decode_msg(&frame.payload)?;
+                            let msg: mymesh_protocol::ControlMessage = decode_msg(&frame.payload)?;
+                            if let mymesh_protocol::ControlMessage::Ping { nonce } = msg {
+                                conn.send_frame(Frame {
+                                    channel: ChannelId::control(),
+                                    payload: encode_msg(&mymesh_protocol::ControlMessage::Pong { nonce })?,
+                                }).await?;
+                            }
                         }
                         ChannelKind::Desktop => {
                             warn!("desktop not enabled yet");

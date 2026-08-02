@@ -8,7 +8,7 @@ Inspired by **Signal linked devices** (explicit trust) and **Syncthing** (dial b
 
 | | |
 |--|--|
-| **Status** | **v0.1.0-alpha.1** — usable for early adopters; CLI and APIs may change |
+| **Status** | **v0.1.0-alpha.2** — usable for early adopters; CLI and APIs may change |
 | **License** | Apache-2.0 OR MIT |
 | **Repo** | https://github.com/jtwolfe/MyMesh |
 
@@ -23,6 +23,9 @@ Inspired by **Signal linked devices** (explicit trust) and **Syncthing** (dial b
 - **File copy** — `mymesh cp` push/pull with path sandbox (default: home)
 - **WAN path** — iroh dial-by-public-key; works across networks when both have outbound internet
 - **Advanced pairing** — SPAKE short codes + local/HTTP mailbox (optional)
+- **Install lifecycle** — `install` / `uninstall` / `reset`, user systemd unit, completions
+- **TUI** — default UI when run with no subcommand
+- **Peer ping / bandwidth** — RTT history + opt-in throughput test
 
 ## What does *not* work yet (honest)
 
@@ -60,7 +63,15 @@ cargo build --release -p mymesh-cli
 ./target/release/mymesh --version
 ```
 
-Optional helper: [`install.sh`](install.sh) (builds from source; not a full service installer yet).
+After building:
+
+```bash
+./target/release/mymesh install          # user systemd unit + PATH binary + completions
+systemctl --user status mymesh
+./target/release/mymesh                  # TUI
+```
+
+Source helper: [`install.sh`](install.sh). See [docs/INSTALL-POLICY.md](docs/INSTALL-POLICY.md).
 
 ---
 
@@ -167,7 +178,7 @@ crates/
 
 | Release | Focus |
 |---------|--------|
-| **v0.1.0-alpha.1** | Link + shell + cp (this release) |
+| **v0.1.0-alpha.2** | Link + shell + cp (this release) |
 | **v0.1.0-alpha.2** | install/uninstall/reset, user systemd unit, TUI default, peer metrics |
 | Later | `.mym` names, packages (deb/rpm/AUR), web/GUI, desktop |
 

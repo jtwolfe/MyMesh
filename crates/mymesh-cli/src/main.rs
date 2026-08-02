@@ -1,6 +1,10 @@
-//! MyMesh CLI — link devices, shells, files.
+//! MyMesh CLI + TUI entrypoint.
+mod install;
+mod probe;
+mod tui_app;
+
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use console::style;
 use mymesh_core::{
     ArmState, Capability, Config, DeviceStore, JoinDecision, JoinStore, Paths,
@@ -29,18 +33,23 @@ use tracing_subscriber::EnvFilter;
     version,
     about = "Peer-to-peer remote access — pair like Signal, connect like Syncthing"
 )]
-struct Cli {
+pub struct Cli {
     #[arg(long, global = true, env = "MYMESH_HOME")]
     home: Option<PathBuf>,
 
+    /// Force CLI help path even with no subcommand (default: open TUI)
+    #[arg(long, global = true)]
+    no_tui: bool,
+
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Open the TUI dashboard (default when no command is given)
+    Tui,
     Status,
-    /// Show this device id (hex + 24-word form)
     Id {
         #[arg(long)]
         qr: bool,
@@ -53,11 +62,8 @@ enum Commands {
         #[arg(long)]
         label: Option<String>,
     },
-    /// Link to another device (default: join by device id / words)
     Link {
-        /// Host device id (64-char hex or 24-word phrase). Omit to show your id.
         target: Option<String>,
-        /// SPAKE short-code path (advanced)
         #[arg(long)]
         code: Option<String>,
         #[arg(long)]
@@ -66,16 +72,13 @@ enum Commands {
         mailbox_dir: Option<PathBuf>,
         #[arg(long, env = "MYMESH_MAILBOX")]
         mailbox: Option<String>,
-        /// Local FS mailbox under XDG runtime (auto path)
         #[arg(long)]
         local: bool,
     },
-    /// Arm / disarm accepting join requests
     ConnectRequest {
         #[command(subcommand)]
         action: ConnectRequestCmd,
     },
-    /// List / accept / deny pending join requests
     Requests {
         #[command(subcommand)]
         action: RequestsCmd,
@@ -91,6 +94,16 @@ enum Commands {
         shell: Option<String>,
     },
     Cp { src: String, dst: String },
+    /// Ping a peer and record RTT history
+    Ping { device: String },
+    /// Bandwidth test (push) to a peer
+    Bw {
+        device: String,
+        #[arg(long, default_value_t = 1_048_576)]
+        bytes: u64,
+    },
+    /// Probe all trusted peers once
+    ProbeAll,
     Desktop {
         device: String,
         #[arg(long, default_value_t = 30)]
@@ -104,6 +117,37 @@ enum Commands {
         #[arg(long, default_value = "0.0.0.0:9876")]
         bind: String,
     },
+    /// Install agent + systemd unit + completions
+    Install {
+        /// System-wide unit (requires root). Prefer user install.
+        #[arg(long)]
+        system: bool,
+        /// Allow agent to run as root (dangerous)
+        #[arg(long)]
+        i_accept_root_agent: bool,
+        /// Runtime OS user for system install (default: mymesh)
+        #[arg(long)]
+        runtime_user: Option<String>,
+    },
+    Uninstall {
+        #[arg(long)]
+        purge: bool,
+    },
+    Reset {
+        #[arg(long)]
+        links: bool,
+        #[arg(long)]
+        identity: bool,
+    },
+    Service {
+        #[command(subcommand)]
+        action: ServiceCmd,
+    },
+    Completions {
+        shell: String,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     Demo {
         #[command(subcommand)]
         scenario: DemoCmd,
@@ -113,12 +157,10 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum ConnectRequestCmd {
-    /// Allow join requests until timeout (default 10m)
     Allow {
         #[arg(long)]
         secs: Option<u64>,
     },
-    /// Stop accepting join requests
     Deny,
     Status,
 }
@@ -135,6 +177,26 @@ enum RequestsCmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum ServiceCmd {
+    Status {
+        #[arg(long)]
+        system: bool,
+    },
+    Start {
+        #[arg(long)]
+        system: bool,
+    },
+    Stop {
+        #[arg(long)]
+        system: bool,
+    },
+    Restart {
+        #[arg(long)]
+        system: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum DemoCmd {
     Pair,
     Session,
@@ -142,15 +204,33 @@ enum DemoCmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("mymesh=info".parse()?))
-        .with_target(false)
-        .init();
-
     let cli = Cli::parse();
     let paths = resolve_paths(cli.home.as_ref())?;
 
-    match cli.command {
+    // Default: TUI when no subcommand
+    let command = match cli.command {
+        None if !cli.no_tui && std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
+            Some(Commands::Tui)
+        }
+        None => {
+            Cli::command().print_help()?;
+            println!();
+            return Ok(());
+        }
+        other => other,
+    };
+
+    // Reduce log noise in TUI
+    let is_tui = matches!(command, Some(Commands::Tui));
+    if !is_tui {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env().add_directive("mymesh=info".parse()?))
+            .with_target(false)
+            .init();
+    }
+
+    match command.expect("command") {
+        Commands::Tui => tui_app::run_tui(paths).await?,
         Commands::Init { label } => cmd_init(&paths, label).await?,
         Commands::Status => cmd_status(&paths).await?,
         Commands::Id { qr, words, uri } => cmd_id(&paths, qr, words, uri).await?,
@@ -162,14 +242,14 @@ async fn main() -> Result<()> {
             mailbox,
             local,
         } => {
-            if code.is_some() || mailbox_dir.is_some() || mailbox.is_some() || local || nameplate.is_some() {
-                // Advanced SPAKE path
+            if code.is_some() || mailbox_dir.is_some() || mailbox.is_some() || local || nameplate.is_some()
+            {
                 if let Some(c) = code {
                     cmd_link_spake_guest(&paths, &c, mailbox_dir, mailbox, local).await?;
                 } else if target.is_none() {
                     cmd_link_spake_host(&paths, nameplate, mailbox_dir, mailbox, local).await?;
                 } else {
-                    bail!("use `mymesh link <device-id>` for default join, or `mymesh link --code …` for SPAKE");
+                    bail!("use `mymesh link <device-id>` or SPAKE flags without a target id");
                 }
             } else if let Some(t) = target {
                 cmd_link_join(&paths, &t).await?;
@@ -181,13 +261,15 @@ async fn main() -> Result<()> {
             ConnectRequestCmd::Allow { secs } => cmd_arm(&paths, secs).await?,
             ConnectRequestCmd::Deny => {
                 ArmState::disarm(paths.arm_file())?;
-                println!("{} disarmed — join requests will be rejected", style("ok").green().bold());
+                println!("{} disarmed", style("ok").green().bold());
             }
             ConnectRequestCmd::Status => cmd_arm_status(&paths).await?,
         },
         Commands::Requests { action } => match action {
             RequestsCmd::List => cmd_requests_list(&paths).await?,
-            RequestsCmd::Accept { device } => cmd_requests_decide(&paths, &device, true, "").await?,
+            RequestsCmd::Accept { device } => {
+                cmd_requests_decide(&paths, &device, true, "").await?
+            }
             RequestsCmd::Deny { device, reason } => {
                 cmd_requests_decide(&paths, &device, false, &reason).await?
             }
@@ -196,14 +278,50 @@ async fn main() -> Result<()> {
         Commands::Unlink { device } => cmd_unlink(&paths, &device).await?,
         Commands::Shell { device, shell } => cmd_shell(&paths, &device, shell).await?,
         Commands::Cp { src, dst } => cmd_cp(&paths, &src, &dst).await?,
+        Commands::Ping { device } => {
+            let ms = probe::probe_ping(&paths, &device).await?;
+            println!("{} {} ms", style("pong").green().bold(), ms);
+        }
+        Commands::Bw { device, bytes } => {
+            let r = probe::probe_bandwidth(&paths, &device, bytes).await?;
+            println!(
+                "{} {:.2} Mbps ({} bytes in {} ms)",
+                style("ok").green().bold(),
+                r.mbps,
+                r.bytes,
+                r.elapsed_ms
+            );
+        }
+        Commands::ProbeAll => {
+            for (label, r) in probe::probe_all(&paths).await? {
+                match r {
+                    Ok(ms) => println!("{label}: {ms} ms"),
+                    Err(e) => println!("{label}: ERR {e}"),
+                }
+            }
+        }
         Commands::Desktop { .. } => {
-            println!("{}", style("desktop: deferred (M4)").yellow());
+            println!("{}", style("desktop: deferred").yellow());
         }
         Commands::Serve { .. } => cmd_serve(&paths).await?,
         Commands::Mailbox { bind } => {
             let addr: SocketAddr = bind.parse().context("invalid --bind")?;
             run_mailbox_server(addr).await?;
         }
+        Commands::Install {
+            system,
+            i_accept_root_agent,
+            runtime_user,
+        } => install::cmd_install(&paths, system, i_accept_root_agent, runtime_user)?,
+        Commands::Uninstall { purge } => install::cmd_uninstall(&paths, purge)?,
+        Commands::Reset { links, identity } => install::cmd_reset(&paths, links, identity)?,
+        Commands::Service { action } => match action {
+            ServiceCmd::Status { system } => install::cmd_service("status", system)?,
+            ServiceCmd::Start { system } => install::cmd_service("start", system)?,
+            ServiceCmd::Stop { system } => install::cmd_service("stop", system)?,
+            ServiceCmd::Restart { system } => install::cmd_service("restart", system)?,
+        },
+        Commands::Completions { shell, out } => install::cmd_completions(&shell, out)?,
         Commands::Demo { scenario } => match scenario {
             DemoCmd::Pair => demo_pair().await?,
             DemoCmd::Session => demo_session().await?,
@@ -244,19 +362,7 @@ async fn cmd_init(paths: &Paths, label: Option<String>) -> Result<()> {
         "  fingerprint  {}",
         mymesh_core::NodeFingerprint::from_device_id(&id.device_id())
     );
-    println!("  word id      (24 words)");
-    for (i, w) in words.split_whitespace().enumerate() {
-        if i % 6 == 0 {
-            print!("               ");
-        }
-        print!("{w} ");
-        if i % 6 == 5 {
-            println!();
-        }
-    }
-    if words.split_whitespace().count() % 6 != 0 {
-        println!();
-    }
+    println!("  words        {words}");
     println!("  config       {}", paths.config_file().display());
     Ok(())
 }
@@ -283,13 +389,10 @@ async fn cmd_id(paths: &Paths, qr: bool, words_only: bool, uri: bool) -> Result<
     println!("  words   {words}");
     println!("  uri     {}", device_join_uri(&did)?);
     if qr {
-        // Minimal QR-less placeholder: print URI for scanners / future --qr render
-        println!();
-        println!(
-            "{}",
-            style("(QR rendering: pipe uri into a qr tool, e.g. qrencode)").dim()
-        );
-        println!("  {}", device_join_uri(&did)?);
+        if let Ok(code) = qrcode::QrCode::new(device_join_uri(&did)?.as_bytes()) {
+            let qr = code.render::<char>().quiet_zone(false).module_dimensions(1, 1).build();
+            println!("\n{qr}");
+        }
     }
     Ok(())
 }
@@ -301,6 +404,7 @@ async fn cmd_status(paths: &Paths) -> Result<()> {
     let arm = ArmState::load(paths.arm_file())?;
     let words = device_id_to_words(&id.device_id())?;
     println!("{}", style("MyMesh").bold());
+    println!("  version      {}", env!("CARGO_PKG_VERSION"));
     println!("  label        {}", cfg.device_label);
     println!("  device id    {}", id.device_id());
     println!("  short        {}", id.device_id().short());
@@ -308,7 +412,14 @@ async fn cmd_status(paths: &Paths) -> Result<()> {
         "  fingerprint  {}",
         mymesh_core::NodeFingerprint::from_device_id(&id.device_id())
     );
-    println!("  words        {}…", words.split_whitespace().take(3).collect::<Vec<_>>().join(" "));
+    println!(
+        "  words        {}…",
+        words
+            .split_whitespace()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     println!("  linked       {}", store.list().len());
     if arm.is_effectively_armed() {
         println!(
@@ -320,8 +431,12 @@ async fn cmd_status(paths: &Paths) -> Result<()> {
         println!("  join arm     {}", style("disarmed").dim());
     }
     println!(
-        "  services     terminal={} files={} desktop={}",
-        cfg.daemon.enable_terminal, cfg.daemon.enable_files, cfg.daemon.enable_desktop
+        "  service      {}",
+        if install::service_is_active(false) {
+            "user unit active"
+        } else {
+            "user unit inactive"
+        }
     );
     Ok(())
 }
@@ -329,26 +444,13 @@ async fn cmd_status(paths: &Paths) -> Result<()> {
 async fn cmd_link_help(paths: &Paths) -> Result<()> {
     let id = Identity::load_or_create(paths.identity_file())?;
     let words = device_id_to_words(&id.device_id())?;
-    println!("{}", style("Link a device (default path)").bold());
+    println!("{}", style("Link a device").bold());
+    println!("Host:  mymesh serve  &&  mymesh connect-request allow");
+    println!("Join:  mymesh link <host-hex-or-24-words>");
+    println!("Host:  mymesh requests accept <id>");
     println!();
-    println!("On the HOST (existing machine):");
-    println!("  1. {}", style("mymesh serve --foreground").cyan());
-    println!("  2. {}", style("mymesh connect-request allow").cyan());
-    println!();
-    println!("On the JOINER (new machine):");
-    println!("  {}", style("mymesh link <host-hex-or-24-words>").cyan());
-    println!();
-    println!("Then on the HOST:");
-    println!("  {}", style("mymesh requests list").cyan());
-    println!("  {}", style("mymesh requests accept <id>").cyan());
-    println!();
-    println!("Your device id:");
-    println!("  hex   {}", id.device_id());
-    println!("  words {words}");
-    println!();
-    println!("{}", style("Advanced: SPAKE short code").dim());
-    println!("  mymesh link --local          # host, auto FS mailbox");
-    println!("  mymesh link --code CODE --local");
+    println!("Your hex:   {}", id.device_id());
+    println!("Your words: {words}");
     Ok(())
 }
 
@@ -359,16 +461,12 @@ async fn cmd_arm(paths: &Paths, secs: Option<u64>) -> Result<()> {
     let id = Identity::load_or_create(paths.identity_file())?;
     let words = device_id_to_words(&id.device_id())?;
     println!(
-        "{} accepting join requests until {:?}",
+        "{} until {:?}",
         style("ARMED").green().bold(),
         state.until
     );
-    println!("  ensure {} is running", style("mymesh serve").cyan());
-    println!("  your id (hex)   {}", id.device_id());
-    println!("  your id (words) {words}");
-    println!();
-    println!("On the other machine:");
-    println!("  mymesh link {}", id.device_id());
+    println!("  hex   {}", id.device_id());
+    println!("  words {words}");
     Ok(())
 }
 
@@ -391,28 +489,28 @@ async fn cmd_requests_list(paths: &Paths) -> Result<()> {
     }
     for p in list {
         println!(
-            "{}  {}  fp={}  caps={:?}",
+            "{}  {}  fp={}",
             p.device_id.short(),
             p.label,
-            p.fingerprint,
-            p.capabilities
+            p.fingerprint
         );
         println!("    {}", p.device_id);
     }
     Ok(())
 }
 
-async fn cmd_requests_decide(paths: &Paths, device: &str, accept: bool, reason: &str) -> Result<()> {
+async fn cmd_requests_decide(
+    paths: &Paths,
+    device: &str,
+    accept: bool,
+    reason: &str,
+) -> Result<()> {
     let joins = JoinStore::open(paths.join_dir())?;
     let pending = joins.list_pending()?;
     let id = resolve_pending(&pending, device)?;
     if accept {
         joins.write_decision(&id, JoinDecision::Accept)?;
-        println!(
-            "{} accept written for {} — agent will complete join",
-            style("ok").green().bold(),
-            id.short()
-        );
+        println!("{} accept {}", style("ok").green().bold(), id.short());
     } else {
         joins.write_decision(
             &id,
@@ -420,7 +518,7 @@ async fn cmd_requests_decide(paths: &Paths, device: &str, accept: bool, reason: 
                 reason: reason.to_string(),
             },
         )?;
-        println!("{} deny written for {}", style("ok").green().bold(), id.short());
+        println!("{} deny {}", style("ok").green().bold(), id.short());
     }
     Ok(())
 }
@@ -452,12 +550,7 @@ async fn cmd_link_join(paths: &Paths, target: &str) -> Result<()> {
     let cfg = Config::load(paths.config_file())?;
     let mut store = DeviceStore::open(paths.devices_file())?;
     let host_id = parse_device_id(target)?;
-    println!(
-        "requesting link to {}…",
-        style(host_id.short()).cyan()
-    );
-    println!("  (host must be running serve + connect-request allow)");
-
+    println!("requesting link to {}…", style(host_id.short()).cyan());
     let transport = IrohTransport::bind(&identity).await?;
     let conn = transport.connect(host_id).await?;
     let peer = run_join_as_guest(
@@ -477,8 +570,6 @@ async fn cmd_link_join(paths: &Paths, target: &str) -> Result<()> {
     transport.shutdown().await;
     Ok(())
 }
-
-// --- SPAKE advanced path ---
 
 enum BoxBackend {
     Fs(FsMailbox),
@@ -518,7 +609,6 @@ fn pick_mailbox(
 ) -> Result<BoxBackend> {
     let cfg = Config::load(paths.config_file())?;
     if let Some(url) = mailbox.or(cfg.rendezvous_url.clone()) {
-        println!("  SPAKE HTTP mailbox {}", style(&url).cyan());
         return Ok(BoxBackend::Http(HttpMailbox::new(url)));
     }
     let dir = if local {
@@ -528,7 +618,6 @@ fn pick_mailbox(
             .or(cfg.mailbox_dir.clone())
             .unwrap_or_else(mymesh_net::default_local_mailbox_dir)
     };
-    println!("  SPAKE FS mailbox {}", style(dir.display()).cyan());
     Ok(BoxBackend::Fs(FsMailbox::new(dir)?))
 }
 
@@ -545,9 +634,7 @@ async fn cmd_link_spake_host(
     let rendezvous = pick_mailbox(paths, mailbox_dir, mailbox, local)?;
     let np = nameplate.unwrap_or_else(|| rand::random::<u16>() % 900 + 100);
     let code = mymesh_crypto::code_from_entropy(np);
-    println!("{}", style("SPAKE host (advanced)").bold());
-    println!("  pairing code   {}", style(code.as_string()).cyan().bold());
-    println!("  peer runs:     mymesh link --code {} …", code.as_string());
+    println!("SPAKE code {}", style(code.as_string()).cyan().bold());
     let outcome = run_host_pair_code(
         &identity,
         &cfg.device_label,
@@ -602,14 +689,18 @@ async fn cmd_devices(paths: &Paths, json: bool) -> Result<()> {
         return Ok(());
     }
     if store.list().is_empty() {
-        println!("No linked devices. See `mymesh link`.");
+        println!("No linked devices.");
         return Ok(());
     }
     for d in store.list() {
-        let words = device_id_to_words(&d.id).unwrap_or_default();
-        let wshort: String = words.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+        let m = mymesh_core::PeerMetrics::load(paths.metrics_dir(), &d.id).ok();
+        let rtt = m
+            .as_ref()
+            .and_then(|x| x.latest_rtt())
+            .map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| "—".into());
         println!(
-            "{}  {}  {:?}  words={wshort}…",
+            "{}  {}  {:?}  rtt={rtt}",
             d.id.short(),
             d.label,
             d.trust
@@ -627,7 +718,7 @@ async fn cmd_unlink(paths: &Paths, device: &str) -> Result<()> {
     Ok(())
 }
 
-fn resolve_device(store: &DeviceStore, q: &str) -> Result<mymesh_core::DeviceId> {
+pub(crate) fn resolve_device(store: &DeviceStore, q: &str) -> Result<mymesh_core::DeviceId> {
     if let Ok(id) = parse_device_id(q) {
         return Ok(id);
     }
@@ -652,15 +743,6 @@ async fn cmd_serve(paths: &Paths) -> Result<()> {
         cfg.device_label,
         identity.device_id().short()
     );
-    let arm = ArmState::load(paths.arm_file())?;
-    if arm.is_effectively_armed() {
-        println!("  join         {}", style("ARMED").green());
-    } else {
-        println!(
-            "  join         disarmed ({} to allow)",
-            style("mymesh connect-request allow").cyan()
-        );
-    }
     let transport = IrohTransport::bind(&identity).await?;
     let agent = Agent::new(
         &identity,
@@ -686,11 +768,6 @@ async fn open_session_to(
         bail!("device not trusted — link first");
     }
     let transport = IrohTransport::bind(&identity).await?;
-    println!(
-        "connecting to {} ({})…",
-        store.get(&peer).map(|d| d.label.as_str()).unwrap_or("?"),
-        peer.short()
-    );
     let conn = transport.connect(peer).await?;
     let session = Session::handshake_dialer(
         conn,
@@ -832,11 +909,9 @@ async fn push_file(paths: &Paths, local: &Path, device: &str, remote: &str) -> R
     match msg {
         FileMessage::Done { bytes, .. } => {
             println!(
-                "{} pushed {} → {}:{} ({bytes} bytes)",
+                "{} pushed {} → {device}:{remote} ({bytes} bytes)",
                 style("ok").green().bold(),
-                local.display(),
-                device,
-                remote
+                local.display()
             );
         }
         FileMessage::Error { message } => bail!("{message}"),
@@ -873,10 +948,8 @@ async fn pull_file(paths: &Paths, device: &str, remote: &str, local: &Path) -> R
             }
             FileMessage::Done { bytes, .. } => {
                 println!(
-                    "{} pulled {}:{} → {} ({bytes} bytes)",
+                    "{} pulled {device}:{remote} → {} ({bytes} bytes)",
                     style("ok").green().bold(),
-                    device,
-                    remote,
                     local.display()
                 );
                 break;
@@ -890,10 +963,7 @@ async fn pull_file(paths: &Paths, device: &str, remote: &str, local: &Path) -> R
     Ok(())
 }
 
-// --- demos ---
-
 async fn demo_pair() -> Result<()> {
-    use mymesh_session::run_guest_pair;
     let dir = tempfile_dir()?;
     let host_paths = sub_paths(&dir, "host")?;
     let guest_paths = sub_paths(&dir, "guest")?;
@@ -1008,31 +1078,15 @@ fn sub_paths(root: &Path, name: &str) -> Result<Paths> {
 
 fn print_install_notes() {
     println!(
-        r#"# MyMesh — default link flow
+        r#"MyMesh alpha.2 install
 
-## Both machines
-mymesh init --label <name>
-mymesh serve --foreground   # keep running (systemd later)
-
-## Host (existing)
-mymesh connect-request allow
-mymesh id                   # share hex or 24 words with joiner
-
-## Joiner (new)
-mymesh link <host-id-or-words>
-
-## Host
-mymesh requests list
-mymesh requests accept <short-id>
-# arm auto-disables after accept
-
-## Then
-mymesh shell <label>
-mymesh cp ./file peer:~/file
-
-## Advanced SPAKE / local
-mymesh link --local
-mymesh link --code 123-word-word --local
+  mymesh install                 # user systemd unit (default)
+  mymesh uninstall [--purge]
+  mymesh reset --links|--identity
+  mymesh service status|start|stop|restart
+  mymesh completions bash
+  mymesh                         # TUI
+  mymesh install --system        # root + warning; --i-accept-root-agent if needed
 "#
     );
 }
