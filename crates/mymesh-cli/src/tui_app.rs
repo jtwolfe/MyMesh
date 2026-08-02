@@ -1730,12 +1730,14 @@ fn ui(f: &mut TuiFrame, app: &mut App) {
     );
 
     // Adaptive chrome: collapse action bar on short terminals.
+    // Header/status need height >= 3 for a full border box + 1 text row.
+    // Undersized status was a common cause of "half missing" bottom bars on resize.
     let (header_h, action_h, status_h) = if root.height < 12 {
-        (3u16, 0u16, 1u16)
+        (3u16, 0u16, 3u16)
     } else if root.height < 18 {
-        (3, 3, 1)
+        (3, 3, 3)
     } else {
-        (3, 3, 2)
+        (3, 3, 3)
     };
 
     let mut constraints = vec![Constraint::Length(header_h)];
@@ -1791,55 +1793,71 @@ fn panel(title: &str) -> Block<'_> {
 }
 
 fn draw_header(f: &mut TuiFrame, area: Rect, app: &mut App) {
-    if area.width < 10 || area.height == 0 {
+    if area.width == 0 || area.height == 0 {
         return;
     }
+    // One continuous frame across the full terminal width.
+    // Separate brand/tabs/version boxes left broken top borders on wide displays.
     f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_BORDER))
+        .style(Style::default().bg(C_PANEL).fg(C_TEXT));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
-    let brand_w = 12u16.min(area.width / 4);
-    let ver_w = 14u16.min(area.width / 5);
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(brand_w),
-            Constraint::Min(8),
-            Constraint::Length(ver_w),
-        ])
-        .split(area);
-
-    let brand = Paragraph::new(Line::from(vec![
-        Span::styled(" * ", Style::default().fg(C_ACCENT2)),
-        Span::styled(
-            "MyMesh",
-            Style::default()
-                .fg(C_ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(C_BORDER))
-            .style(Style::default().bg(C_PANEL)),
-    );
-    f.render_widget(brand, cols[0]);
-
-    let tab_area = cols[1];
+    // Fill inner solid so no gaps under wide terminals.
     f.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(C_BORDER))
-            .style(Style::default().bg(C_PANEL)),
-        tab_area,
+        Block::default().style(Style::default().bg(C_PANEL)),
+        inner,
     );
+
+    let brand_w = 11u16.min(inner.width);
+    let ver_w = 12u16.min(inner.width.saturating_sub(brand_w));
+    let tabs_w = inner.width.saturating_sub(brand_w).saturating_sub(ver_w);
+
+    let brand_rect = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: brand_w,
+        height: inner.height,
+    };
+    let tabs_rect = Rect {
+        x: inner.x.saturating_add(brand_w),
+        y: inner.y,
+        width: tabs_w,
+        height: inner.height,
+    };
+    let ver_rect = Rect {
+        x: inner.x.saturating_add(brand_w).saturating_add(tabs_w),
+        y: inner.y,
+        width: ver_w,
+        height: inner.height,
+    };
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" * ", Style::default().fg(C_ACCENT2)),
+            Span::styled(
+                "MyMesh",
+                Style::default()
+                    .fg(C_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .style(Style::default().bg(C_PANEL)),
+        brand_rect,
+    );
+
+    // Tabs fill remaining middle — equal slots, full height, no nested borders.
     let n = Tab::ALL.len() as u16;
-    let inner_w = tab_area.width.saturating_sub(2);
-    let inner_h = tab_area.height.saturating_sub(2).max(1);
-    if n > 0 && inner_w > 0 {
-        let base = inner_w / n;
-        let rem = inner_w % n;
-        let mut x = tab_area.x.saturating_add(1);
-        let y = tab_area.y.saturating_add(1);
+    if n > 0 && tabs_rect.width > 0 {
+        let base = tabs_rect.width / n;
+        let rem = tabs_rect.width % n;
+        let mut x = tabs_rect.x;
         for (i, tab) in Tab::ALL.iter().enumerate() {
             let w = base + if (i as u16) < rem { 1 } else { 0 };
             if w == 0 {
@@ -1847,9 +1865,9 @@ fn draw_header(f: &mut TuiFrame, area: Rect, app: &mut App) {
             }
             let r = Rect {
                 x,
-                y,
+                y: tabs_rect.y,
                 width: w,
-                height: inner_h.min(1),
+                height: tabs_rect.height,
             };
             app.tab_rects.push((*tab, r));
             let selected = app.tab == *tab;
@@ -1862,7 +1880,6 @@ fn draw_header(f: &mut TuiFrame, area: Rect, app: &mut App) {
             } else {
                 Style::default().fg(C_MUTED).bg(C_PANEL)
             };
-            // Pad label visually by filling whole slot
             f.render_widget(
                 Paragraph::new(label)
                     .style(style)
@@ -1873,18 +1890,12 @@ fn draw_header(f: &mut TuiFrame, area: Rect, app: &mut App) {
         }
     }
 
-    let ver = Paragraph::new(Line::from(Span::styled(
-        format!("v{}", env!("CARGO_PKG_VERSION")),
-        Style::default().fg(C_MUTED),
-    )))
-    .alignment(Alignment::Center)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(C_BORDER))
-            .style(Style::default().bg(C_PANEL)),
+    f.render_widget(
+        Paragraph::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+            .style(Style::default().fg(C_MUTED).bg(C_PANEL))
+            .alignment(Alignment::Right),
+        ver_rect,
     );
-    f.render_widget(ver, cols[2]);
 }
 
 fn push_btn(app: &mut App, f: &mut TuiFrame, id: &'static str, label: &str, rect: Rect, hot: bool) {
@@ -1921,9 +1932,16 @@ fn draw_action_bar(f: &mut TuiFrame, area: Rect, app: &mut App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(C_BORDER))
         .title(Span::styled(" actions ", Style::default().fg(C_MUTED)))
-        .style(Style::default().bg(C_PANEL));
+        .style(Style::default().bg(C_PANEL).fg(C_TEXT));
     let inner = block.inner(area);
     f.render_widget(block, area);
+    // Solid fill entire inner (ultrawide gap prevention)
+    if inner.width > 0 && inner.height > 0 {
+        f.render_widget(
+            Block::default().style(Style::default().bg(C_PANEL)),
+            inner,
+        );
+    }
 
     let specs: Vec<(&str, &str)> = match app.tab {
         Tab::Home => vec![
@@ -2576,19 +2594,29 @@ fn draw_status_line(f: &mut TuiFrame, area: Rect, app: &App) {
     if area.height == 0 || area.width == 0 {
         return;
     }
+    // Single full-width bar — no partial borders / gaps on ultrawide.
     f.render_widget(Clear, area);
-    let p = Paragraph::new(Line::from(vec![
-        Span::styled(" ", Style::default().fg(C_BORDER)),
-        Span::styled(&app.status, Style::default().fg(C_TEXT)),
-    ]))
-    .style(Style::default().bg(C_PANEL).fg(C_TEXT))
-    .block(
-        Block::default()
-            .borders(if area.height > 1 { Borders::TOP } else { Borders::NONE })
-            .border_style(Style::default().fg(C_BORDER))
-            .style(Style::default().bg(C_PANEL)),
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_BORDER))
+        .style(Style::default().bg(C_PANEL).fg(C_TEXT));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    // Explicit full-width fill then text (avoids trailing empty cells looking "cut off")
+    f.render_widget(
+        Block::default().style(Style::default().bg(C_PANEL)),
+        inner,
     );
-    f.render_widget(p, area);
+    let msg = format!(" {}", app.status);
+    f.render_widget(
+        Paragraph::new(msg)
+            .style(Style::default().fg(C_TEXT).bg(C_PANEL))
+            .alignment(Alignment::Left),
+        inner,
+    );
 }
 
 
