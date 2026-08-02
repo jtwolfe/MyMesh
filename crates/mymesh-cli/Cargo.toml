@@ -39,3 +39,4 @@ crossterm = { workspace = true }
 ratatui = { workspace = true }
 qrcode = { workspace = true }
 directories = { workspace = true }
+vt100 = { workspace = true }

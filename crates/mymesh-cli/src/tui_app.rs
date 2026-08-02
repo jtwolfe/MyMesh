@@ -20,6 +20,7 @@ use ratatui::{Frame as TuiFrame, Terminal};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use crate::term_pane::{self, TermPane};
 use tokio::sync::mpsc;
 
 // ─── theme ───────────────────────────────────────────────────────────
@@ -168,19 +169,6 @@ struct FileBrowser {
     dst_node_rect: Rect,
 }
 
-struct TermPane {
-    peer: Option<String>,
-    lines: Vec<String>,
-    input: String,
-    scroll: usize,
-    /// When active, stdin bytes go to remote
-    active: bool,
-    tx_out: Option<mpsc::UnboundedSender<Vec<u8>>>,
-    rx_in: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
-    // keep session alive via task
-    _shutdown: Option<mpsc::Sender<()>>,
-}
-
 struct PeerPoll {
     enabled: bool,
     started: Instant,
@@ -263,16 +251,7 @@ pub async fn run_tui(paths: Paths) -> Result<()> {
                 dst_node_rect: Rect::default(),
             }
         },
-        term: TermPane {
-            peer: None,
-            lines: vec!["Select a peer on Peers, then open Term · Enter connects.".into()],
-            input: String::new(),
-            scroll: 0,
-            active: false,
-            tx_out: None,
-            rx_in: None,
-            _shutdown: None,
-        },
+        term: TermPane::new(),
         poll: PeerPoll {
             enabled: false,
             started: Instant::now(),
@@ -285,9 +264,10 @@ pub async fn run_tui(paths: Paths) -> Result<()> {
 
     let res = run_loop(&mut terminal, &mut app).await;
 
-    // teardown terminal session
     app.term.active = false;
+    app.term.connected = false;
     app.term.tx_out = None;
+    app.term.rx_in = None;
 
     disable_raw_mode()?;
     execute!(
@@ -463,29 +443,11 @@ async fn run_loop(
     app: &mut App,
 ) -> Result<()> {
     loop {
-        // drain terminal output
-        if let Some(rx) = app.term.rx_in.as_mut() {
-            while let Ok(chunk) = rx.try_recv() {
-                let s = String::from_utf8_lossy(&chunk);
-                for part in s.split_inclusive('\n') {
-                    if let Some(last) = app.term.lines.last_mut() {
-                        if !last.ends_with('\n') && !part.contains('\n') {
-                            last.push_str(part);
-                            continue;
-                        }
-                    }
-                    for line in part.lines() {
-                        app.term.lines.push(line.to_string());
-                    }
-                    if part.ends_with('\n') {
-                        app.term.lines.push(String::new());
-                    }
-                }
-                if app.term.lines.len() > 2000 {
-                    let n = app.term.lines.len() - 1500;
-                    app.term.lines.drain(0..n);
-                }
-            }
+        // drain terminal VT output (non-blocking)
+        term_pane::drain_output(&mut app.term);
+        if app.tab == Tab::Term {
+            term_pane::refresh_peers(&app.paths, &mut app.term);
+            term_pane::maybe_resize(&mut app.term);
         }
 
         if app.poll.enabled && app.poll.started.elapsed() > app.poll.max_duration {
@@ -549,9 +511,9 @@ async fn run_loop(
                             handle_files_scroll(app, m.column, m.row, up);
                         } else if app.tab == Tab::Term {
                             if up {
-                                app.term.scroll = app.term.scroll.saturating_sub(3);
-                            } else {
                                 app.term.scroll = app.term.scroll.saturating_add(3);
+                            } else {
+                                app.term.scroll = app.term.scroll.saturating_sub(3);
                             }
                         }
                     }
@@ -608,35 +570,61 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         _ => {}
     }
 
-    // terminal input mode
-    if app.tab == Tab::Term && app.term.active {
+    // terminal input mode — ANSI to remote PTY
+    if app.tab == Tab::Term && app.term.active && !app.term.pick_peer {
+        use crossterm::event::KeyModifiers as KM;
+        if mods.contains(KM::CONTROL) {
+            match code {
+                KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    app.term.active = false;
+                    app.term.pick_peer = true;
+                    app.status = "detached shell (Ctrl+Q)".into();
+                    return;
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    app.term.send(&[0x03]);
+                    return;
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') => {
+                    app.term.send(&[0x04]);
+                    return;
+                }
+                KeyCode::Char('z') | KeyCode::Char('Z') => {
+                    app.term.send(&[0x1a]);
+                    return;
+                }
+                KeyCode::Char(c) => {
+                    let b = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a').wrapping_add(1);
+                    if (1..=26).contains(&b) {
+                        app.term.send(&[b]);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
         match code {
-            KeyCode::Char(c) => {
-                app.term.input.push(c);
-                if let Some(tx) = &app.term.tx_out {
-                    let _ = tx.send(c.to_string().into_bytes());
-                }
-            }
-            KeyCode::Enter => {
-                if let Some(tx) = &app.term.tx_out {
-                    let _ = tx.send(b"\r".to_vec());
-                }
-                app.term.input.clear();
-            }
-            KeyCode::Backspace => {
-                app.term.input.pop();
-                if let Some(tx) = &app.term.tx_out {
-                    let _ = tx.send(vec![0x7f]);
-                }
-            }
             KeyCode::Esc => {
                 app.term.active = false;
-                app.status = "left terminal input mode (Esc)".into();
+                app.term.pick_peer = true;
+                app.status = "left shell input".into();
             }
-            _ => {}
+            KeyCode::PageUp => {
+                app.term.scroll = app.term.scroll.saturating_add(app.term.rows / 2);
+            }
+            KeyCode::PageDown => {
+                app.term.scroll = app.term.scroll.saturating_sub(app.term.rows / 2);
+            }
+            other => {
+                if let Some(bytes) = term_pane::key_to_bytes(other) {
+                    app.term.send(&bytes);
+                    app.term.scroll = 0;
+                }
+            }
         }
         return;
     }
+
 
     match app.tab {
         Tab::Home => match code {
@@ -695,15 +683,17 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             }
             KeyCode::Enter | KeyCode::Char('o') => {
                 if let Some(id) = selected_peer_id(app) {
-                    app.term.peer = Some(id.clone());
-                    // set as file destination node if present
+                    term_pane::refresh_peers(&app.paths, &mut app.term);
+                    if let Some(i) = app.term.peers.iter().position(|p| p.id == id) {
+                        app.term.peer_idx = i;
+                    }
                     if let Some(idx) = app.files.nodes.iter().position(|n| match n {
                         BrowserNode::Peer { id: pid, .. } => pid == &id,
                         _ => false,
                     }) {
                         app.files.dst_node = idx;
                     }
-                    app.status = format!("peer {id} ready · Term / Files dst");
+                    app.status = format!("peer {id} · use Term tab for shell");
                 }
             }
             KeyCode::Char('p') => ping_sel(app).await,
@@ -719,13 +709,6 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                             .into();
                 } else {
                     app.status = "metrics poll OFF".into();
-                }
-            }
-            KeyCode::Char('s') => {
-                if let Some(id) = selected_peer_id(app) {
-                    app.term.peer = Some(id);
-                    app.tab = Tab::Term;
-                    app.status = "Term — press Enter to connect".into();
                 }
             }
             KeyCode::Char('g') => {
@@ -797,20 +780,47 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             _ => {}
         },
         Tab::Term => match code {
-            KeyCode::Enter => connect_term(app).await,
-            KeyCode::Char('i') => {
-                if app.term.tx_out.is_some() {
-                    app.term.active = true;
-                    app.status = "terminal input mode · Esc to leave · Ctrl+C quit app".into();
+            KeyCode::Char('n') | KeyCode::Char('[') => {
+                term_pane::cycle_peer(&app.paths, &mut app.term, -1);
+                app.status = app.term.status_msg.clone();
+            }
+            KeyCode::Char('N') | KeyCode::Char(']') => {
+                term_pane::cycle_peer(&app.paths, &mut app.term, 1);
+                app.status = app.term.status_msg.clone();
+            }
+            KeyCode::Left | KeyCode::Char('h') if app.term.pick_peer => {
+                term_pane::cycle_peer(&app.paths, &mut app.term, -1);
+                app.status = app.term.status_msg.clone();
+            }
+            KeyCode::Right | KeyCode::Char('l') if app.term.pick_peer => {
+                term_pane::cycle_peer(&app.paths, &mut app.term, 1);
+                app.status = app.term.status_msg.clone();
+            }
+            KeyCode::Enter => {
+                if !app.term.connected {
+                    let _ = term_pane::connect(&app.paths, &mut app.term).await;
+                    app.status = app.term.status_msg.clone();
                 } else {
-                    app.status = "connect first (Enter)".into();
+                    app.term.pick_peer = false;
+                    app.term.active = true;
+                    app.term.scroll = 0;
+                    app.status = "shell focus · Ctrl+Q detach".into();
+                }
+            }
+            KeyCode::Char('i') | KeyCode::Char('c') => {
+                if app.term.connected {
+                    app.term.pick_peer = false;
+                    app.term.active = true;
+                    app.term.scroll = 0;
+                    app.status = "shell focus".into();
+                } else {
+                    let _ = term_pane::connect(&app.paths, &mut app.term).await;
+                    app.status = app.term.status_msg.clone();
                 }
             }
             KeyCode::Char('x') => {
-                app.term.active = false;
-                app.term.tx_out = None;
-                app.term.rx_in = None;
-                app.term.lines.push("--- disconnected ---".into());
+                term_pane::disconnect(&mut app.term);
+                app.status = "shell disconnected".into();
             }
             _ => {}
         },
@@ -854,6 +864,16 @@ async fn handle_click(app: &mut App, col: u16, row: u16) {
     if app.tab == Tab::Files {
         handle_files_click(app, col, row).await;
     }
+    if app.tab == Tab::Term {
+        if rect_contains(app.term.peer_rect, col, row) {
+            term_pane::cycle_peer(&app.paths, &mut app.term, 1);
+            app.status = app.term.status_msg.clone();
+        } else if rect_contains(app.term.screen_rect, col, row) && app.term.connected {
+            app.term.pick_peer = false;
+            app.term.active = true;
+            app.term.scroll = 0;
+        }
+    }
 }
 
 fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
@@ -881,12 +901,6 @@ async fn click_button(app: &mut App, id: &str) {
                 "metrics poll OFF".into()
             };
         }
-        "open_term" => {
-            if let Some(id) = selected_peer_id(app) {
-                app.term.peer = Some(id);
-                app.tab = Tab::Term;
-            }
-        }
         "mesh_sync" => {
             app.status = "mesh sync…".into();
             match mesh_sync_all(&app.paths).await {
@@ -911,10 +925,27 @@ async fn click_button(app: &mut App, id: &str) {
             cycle_node(app, false, 1);
             kick_file_refresh(app, true);
         }
-        "term_connect" => connect_term(app).await,
+        "term_peer" => {
+            term_pane::cycle_peer(&app.paths, &mut app.term, 1);
+            app.status = app.term.status_msg.clone();
+        }
+        "term_connect" => {
+            let _ = term_pane::connect(&app.paths, &mut app.term).await;
+            app.status = app.term.status_msg.clone();
+        }
         "term_input" => {
-            app.term.active = true;
-            app.status = "terminal input mode".into();
+            if app.term.connected {
+                app.term.pick_peer = false;
+                app.term.active = true;
+                app.term.scroll = 0;
+            } else {
+                let _ = term_pane::connect(&app.paths, &mut app.term).await;
+            }
+            app.status = app.term.status_msg.clone();
+        }
+        "term_disc" => {
+            term_pane::disconnect(&mut app.term);
+            app.status = "shell disconnected".into();
         }
         "svc_start" => {
             let _ = crate::install::cmd_service("start", false);
@@ -1611,111 +1642,6 @@ async fn pull_file_helper(
     Ok(())
 }
 
-async fn connect_term(app: &mut App) {
-    let Some(peer) = app.term.peer.clone().or_else(|| selected_peer_id(app)) else {
-        app.status = "no peer — open from Peers".into();
-        return;
-    };
-    app.term.peer = Some(peer.clone());
-    app.term.lines.push(format!("connecting to {peer}…"));
-    // Spawn session task
-    let paths = app.paths.clone();
-    let (tx_out, mut rx_out) = mpsc::unbounded_channel::<Vec<u8>>();
-    let (tx_in, rx_in) = mpsc::unbounded_channel::<Vec<u8>>();
-    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-
-    tokio::spawn(async move {
-        let err_tx = tx_in.clone();
-        if let Err(e) = term_session_task(paths, peer, tx_in, &mut rx_out, &mut shutdown_rx).await {
-            let _ = err_tx.send(format!("\r\n[session error: {e}]\r\n").into_bytes());
-        }
-    });
-
-    app.term.tx_out = Some(tx_out);
-    app.term.rx_in = Some(rx_in);
-    app.term._shutdown = Some(shutdown_tx);
-    app.term.active = true;
-    app.status = "terminal connected · typing goes remote · Esc detach · Ctrl+C quit".into();
-}
-
-async fn term_session_task(
-    paths: Paths,
-    device: String,
-    tx_in: mpsc::UnboundedSender<Vec<u8>>,
-    rx_out: &mut mpsc::UnboundedReceiver<Vec<u8>>,
-    shutdown: &mut mpsc::Receiver<()>,
-) -> anyhow::Result<()> {
-    use mymesh_core::{Capability, Config, DeviceStore};
-    use mymesh_crypto::Identity;
-    use mymesh_net::{IrohTransport, Transport};
-    use mymesh_protocol::{decode_msg, encode_msg, ChannelId, Frame, TerminalMessage};
-    use mymesh_session::Session;
-
-    let identity = Identity::load_or_create(paths.identity_file())?;
-    let cfg = Config::load(paths.config_file())?;
-    let store = DeviceStore::open(paths.devices_file())?;
-    let peer = crate::resolve_device(&store, &device)?;
-    let transport = IrohTransport::bind(&identity).await?;
-    let conn = transport.connect(peer).await?;
-    let session = Session::handshake_dialer(
-        conn,
-        &identity,
-        &cfg.device_label,
-        &store,
-        Capability::all(),
-    )
-    .await?;
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    session
-        .send_raw(
-            ChannelId::terminal(1),
-            encode_msg(&TerminalMessage::Open {
-                cols,
-                rows: rows.saturating_sub(8),
-                shell: None,
-                env: vec![],
-            })?,
-        )
-        .await?;
-    let conn = session.into_conn();
-    loop {
-        tokio::select! {
-            _ = shutdown.recv() => break,
-            frame = conn.recv_frame() => {
-                let frame = frame?;
-                if frame.channel.kind != mymesh_protocol::ChannelKind::Terminal {
-                    continue;
-                }
-                let msg: TerminalMessage = decode_msg(&frame.payload)?;
-                match msg {
-                    TerminalMessage::Output(data) => {
-                        let _ = tx_in.send(data);
-                    }
-                    TerminalMessage::Exit { code } => {
-                        let _ = tx_in.send(format!("\r\n[exit {code}]\r\n").into_bytes());
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            inp = rx_out.recv() => {
-                match inp {
-                    Some(data) => {
-                        conn.send_frame(Frame {
-                            channel: ChannelId::terminal(1),
-                            payload: encode_msg(&TerminalMessage::Input(data))?,
-                        }).await?;
-                    }
-                    None => break,
-                }
-            }
-        }
-    }
-    let _ = conn.close().await;
-    transport.shutdown().await;
-    Ok(())
-}
-
 // ─── UI ──────────────────────────────────────────────────────────────
 fn ui(f: &mut TuiFrame, app: &mut App) {
     app.buttons.clear();
@@ -1745,7 +1671,7 @@ fn ui(f: &mut TuiFrame, app: &mut App) {
         Tab::Home => draw_home(f, chunks[2], app),
         Tab::Peers => draw_peers(f, chunks[2], app),
         Tab::Files => draw_files(f, chunks[2], app),
-        Tab::Term => draw_term(f, chunks[2], app),
+        Tab::Term => term_pane::draw(f, chunks[2], &mut app.term),
         Tab::Status => draw_status(f, chunks[2], app),
     }
     draw_status_line(f, chunks[3], app);
@@ -1894,7 +1820,6 @@ fn draw_action_bar(f: &mut TuiFrame, area: Rect, app: &mut App) {
             ("mesh_sync", "[g] Sync"),
             ("kick", "[K] Kick"),
             ("force_kick", "[F] Force"),
-            ("open_term", "[s] Shell"),
             ("quit", "[q] Quit"),
         ],
         Tab::Files => vec![
@@ -1905,8 +1830,10 @@ fn draw_action_bar(f: &mut TuiFrame, area: Rect, app: &mut App) {
             ("quit", "[q] Quit"),
         ],
         Tab::Term => vec![
-            ("term_connect", "[Enter] Connect"),
-            ("term_input", "[i] Type"),
+            ("term_peer", "[n] Peer"),
+            ("term_connect", "[c/Enter] Connect"),
+            ("term_input", "[i] Focus"),
+            ("term_disc", "[x] Disconnect"),
             ("quit", "[q] Quit"),
         ],
         Tab::Status => vec![
@@ -2473,40 +2400,6 @@ fn file_list_items(
             )))
         })
         .collect()
-}
-
-fn draw_term(f: &mut TuiFrame, area: Rect, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(3)])
-        .split(area);
-
-    let peer = app.term.peer.as_deref().unwrap_or("(no peer)");
-    let h = chunks[0].height.saturating_sub(2) as usize;
-    let total = app.term.lines.len();
-    let start = total.saturating_sub(h + app.term.scroll);
-    let end = (start + h).min(total);
-    let body: Vec<Line> = app.term.lines[start..end]
-        .iter()
-        .map(|l| Line::from(l.clone()))
-        .collect();
-    f.render_widget(
-        Paragraph::new(body)
-            .block(panel(&format!(
-                "Terminal · {peer} · {}",
-                if app.term.active {
-                    "INPUT"
-                } else {
-                    "view"
-                }
-            )))
-            .wrap(Wrap { trim: false }),
-        chunks[0],
-    );
-
-    let input = Paragraph::new(format!("❯ {}", app.term.input))
-        .block(panel("Input (i = type, Esc = leave input)"));
-    f.render_widget(input, chunks[1]);
 }
 
 fn draw_status(f: &mut TuiFrame, area: Rect, app: &App) {

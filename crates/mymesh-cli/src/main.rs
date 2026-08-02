@@ -2,6 +2,7 @@
 mod install;
 mod probe;
 mod tui_app;
+mod term_pane;
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
