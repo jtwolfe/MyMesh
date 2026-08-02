@@ -82,3 +82,14 @@ Each `DeviceRecord` stores:
 | M5 | Packaging: deb/rpm/pkgbuild, `curl | sh`, signed releases | planned |
 
 See [ROADMAP.md](ROADMAP.md) and [M1-M3.md](M1-M3.md) for detail.
+
+## Endpoint ownership (alpha.3+)
+
+Only **`mymesh serve`** may bind the iroh endpoint for a given identity.
+
+- Dial proxy: Unix socket (`daemon.control_socket`, default `$XDG_RUNTIME_DIR/mymesh.sock`)
+- CLI/TUI/OpenSSH `proxy-ssh` connect through the proxy (`mymesh_net::connect_mesh`)
+- Magic plane TCP/SOCKS/probes use `Arc` shared transport — never a second `bind` of the same secret
+
+See [USAGE.md](USAGE.md) and [ALPHA-3.md](ALPHA-3.md).
+

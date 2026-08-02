@@ -2,158 +2,164 @@
 
 **Peer-to-peer remote access without port forwards.**
 
-Link your own machines with a one-time approval, then open a remote shell or copy files over an encrypted P2P path ([iroh](https://iroh.computer): QUIC, NAT hole punching, relay fallback).
+Link your own machines with a one-time approval, then open a remote shell, copy files, SSH, or reach local web services over an encrypted P2P path ([iroh](https://iroh.computer): QUIC, NAT hole punching, relay fallback).
 
 Inspired by **Signal linked devices** (explicit trust) and **Syncthing** (dial by device id, not IP).
 
 | | |
 |--|--|
-| **Status** | **v0.1.0-alpha.2** — usable for early adopters; CLI and APIs may change |
+| **Status** | **v0.1.0-alpha.3** — early adopters; CLI may still change |
 | **License** | Apache-2.0 OR MIT |
 | **Repo** | https://github.com/jtwolfe/MyMesh |
 
 ---
 
-## What works today (alpha.1)
+## What works (alpha.3)
 
-- **Request / accept linking** — host arms joins, joiner dials by device id, host accepts once; arm auto-disarms
-- **Device ids** — 64-char hex **or** 24 BIP39 English words (full key material)
-- **Agent** — `mymesh serve` accepts sessions from trusted peers only
-- **Remote terminal** — `mymesh shell <label|id>` (real PTY)
-- **File copy** — `mymesh cp` push/pull with path sandbox (default: home)
-- **WAN path** — iroh dial-by-public-key; works across networks when both have outbound internet
-- **Advanced pairing** — SPAKE short codes + local/HTTP mailbox (optional)
-- **Install lifecycle** — `install` / `uninstall` / `reset`, user systemd unit, completions
-- **TUI** — default UI when run with no subcommand
-- **Peer ping / bandwidth** — RTT history + opt-in throughput test
+| Capability | How |
+|------------|-----|
+| **Link machines** | Arm host → join by id/words → accept once (default). SPAKE local mailbox optional |
+| **Device ids** | 64-char hex **or** 24 BIP39 words; QR / join URI |
+| **Always-up agent** | `mymesh install` → user systemd unit + dial proxy |
+| **Remote shell** | `mymesh shell <peer>` or TUI **Term** |
+| **File copy** | `mymesh cp` + TUI dual-pane browser |
+| **Mesh roster** | Gossip membership; kick with double confirm + pending delivery |
+| **Labels / aliases / groups** | `label`, `alias`, `group`, `hosts`, `resolve` |
+| **SSH over mesh** | `ssh-config` + `proxy-ssh` → peer `127.0.0.1:22` |
+| **TCP tunnels** | `expose`, magic auto-ports, SOCKS5 for browsers |
+| **Userspace DNS** | `127.0.0.1:5353` answers `*.mym` (not system-wide by default) |
+| **Connect-by-carrier** | Phone scans QR; phone is **not** a mesh node |
+| **Firewall helpers** | Explicit `mymesh firewall …` for ufw/firewalld (never auto-open) |
+| **TUI** | Default when you run `mymesh` with no args |
 
 ## What does *not* work yet (honest)
 
 | Area | Status |
 |------|--------|
-| Desktop / remote GUI | Deferred |
-| Systemd install / `systemctl status mymesh` | Planned (alpha.2) |
-| Default TUI | Planned (alpha.2) |
-| Magic names (`ssh host.mym`) | Planned later |
-| Polished one-line installer + deb/rpm/AUR | Planned later |
-| QR scan / native GUI / web UI | Not built (URI ready for QR tools) |
-| Multi-user “run shell as other account” | Not built |
+| System-wide `ping laptop.mym` | Needs you to wire OS DNS to MyMesh; ICMP not tunneled |
+| Full L3 VPN / TUN | Not a goal for alpha.3 |
+| Desktop / remote GUI control | Stub only |
+| Native GUI / web admin | Not built (TUI is the UI) |
+| Android “carrier as mesh node” app | Future |
+| Packages (deb/rpm/AUR) + one-line curl installer | Planned |
 | CI (Linux) | Workflow present, **disabled** |
 | Stable API / CLI freeze | **No** — alpha |
 
-MyMesh is **not** a full VPN, not Tailscale, and not a replacement for OpenSSH on the public internet without care. It is a **personal mesh** for machines you explicitly link.
+MyMesh is **not** Tailscale/WireGuard and **not** a drop-in public OpenSSH replacement. It is a **personal mesh** for machines you explicitly link.
 
 ---
 
 ## Requirements
 
-- Linux (primary target; other OSes untested in alpha)
-- Rust toolchain to build from source (`rustc` 1.91+ per workspace)
-- Outbound internet on both peers for the default path (iroh public relays)
+- **Linux** (primary; other OSes untested)
+- Rust **1.91+** to build from source
+- Outbound internet on both peers for the default path (iroh relays)
+- For SSH: **sshd** listening on the remote (`127.0.0.1:22` is enough)
+- For browser paths: agent running + SOCKS (or magic ports + DNS)
 
 ---
 
-## Build
+## Build & install
 
 ```bash
 git clone https://github.com/jtwolfe/MyMesh.git
 cd MyMesh
-git checkout v0.1.0-alpha.1   # or main
+git checkout v0.1.0-alpha.3   # or main
 cargo build --release -p mymesh-cli
-./target/release/mymesh --version
-```
 
-After building:
-
-```bash
-./target/release/mymesh install          # user systemd unit + PATH binary + completions
+./target/release/mymesh init --label laptop
+./target/release/mymesh install          # ~/.local/bin + user unit + completions
+systemctl --user enable --now mymesh.service
 systemctl --user status mymesh
-./target/release/mymesh                  # TUI
+mymesh --version
 ```
 
-Source helper: [`install.sh`](install.sh). See [docs/INSTALL-POLICY.md](docs/INSTALL-POLICY.md).
+Prefer **user install** (no root). Root install prints a strong warning and needs override — see [docs/INSTALL-POLICY.md](docs/INSTALL-POLICY.md).
+
+After install, the agent owns the **single iroh endpoint** and exposes a **local dial proxy** (`$XDG_RUNTIME_DIR/mymesh.sock`). CLI/TUI dial *through* that proxy — do not run a second long-lived `serve` as another user with the same identity.
 
 ---
 
-## Quick start (default link path)
+## Quick start
 
-Run **`serve` on both machines** and keep it running while you work.
-
-```bash
-# both machines
-./target/release/mymesh init --label desktop    # or laptop
-./target/release/mymesh serve --foreground
-```
-
-**On the host** (machine that already “owns” the mesh / will approve):
+### 1. Init + agent (both machines)
 
 ```bash
-./target/release/mymesh connect-request allow
-./target/release/mymesh id          # share hex or 24-word id with the joiner
+mymesh init --label desktop   # once per machine
+mymesh install
+systemctl --user enable --now mymesh
+mymesh status
 ```
 
-**On the joiner:**
+### 2. Link (request / accept)
+
+**Host** (already in the mesh / will approve):
 
 ```bash
-./target/release/mymesh link '<host-hex-or-24-words>'
-# waits until the host accepts
+mymesh connect-request allow          # arms joins briefly
+mymesh id                             # share hex or 24 words
 ```
 
-**On the host:**
+**Joiner:**
 
 ```bash
-./target/release/mymesh requests list
-./target/release/mymesh requests accept <short-id>
-# arm turns off automatically after accept
+mymesh link '<host-hex-or-24-words>'
 ```
 
-**Either side (after link):**
+**Host:**
 
 ```bash
-./target/release/mymesh devices
-./target/release/mymesh shell <label-or-id>
-./target/release/mymesh cp ./file peer:~/file
-./target/release/mymesh cp peer:~/file ./file
+mymesh requests list
+mymesh requests accept <short-id>
 ```
 
-Details: [docs/JOIN.md](docs/JOIN.md).
+### 3. Use the mesh
 
-### Security notes (alpha)
+```bash
+mymesh devices
+mymesh ping desktop
+mymesh shell desktop
+mymesh cp ./file desktop:~/file
+mymesh                          # TUI
+```
 
-- **Default closed:** join requests fail unless the host is **armed** (`connect-request allow`).
-- **Trust is the allowlist:** only `Trusted` devices get shell/files.
-- **Agent runs as the OS user that starts `serve`** (today: manual process; no root service yet).
-- **Files** are limited to the configured sandbox (default: your home directory).
-- **Do not** treat a linked device as harmless: a compromised peer with Terminal+Files is powerful on your account.
+### 4. SSH (alpha.3)
+
+```bash
+# remote must run sshd; mesh path must work (ping first)
+mymesh ssh-config >> ~/.ssh/config
+ssh desktop.mym
+```
+
+### 5. Web services via SOCKS
+
+```bash
+# agent running on this machine
+export ALL_PROXY=socks5h://127.0.0.1:18080   # socks5h = resolve *.mym via proxy
+curl -v http://laptop.mym:7878/
+# or configure browser: SOCKS5 127.0.0.1:18080 + proxy DNS
+```
+
+Full command reference: **[docs/USAGE.md](docs/USAGE.md)**  
+Magic plane details: **[docs/ALPHA-3.md](docs/ALPHA-3.md)**  
+Linking model: **[docs/JOIN.md](docs/JOIN.md)**
 
 ---
 
-## Advanced pairing (optional)
-
-Shared-folder or SPAKE short codes (labs / airgap experiments):
-
-```bash
-./target/release/mymesh link --local              # host side SPAKE + auto local mailbox
-./target/release/mymesh link --code CODE --local  # guest
-# or --mailbox-dir /path or MYMESH_MAILBOX=http://...
-```
-
-This is **not** the recommended default for two machines on the internet.
-
----
-
-## Documentation
+## Documentation map
 
 | Doc | Contents |
 |-----|----------|
-| [docs/JOIN.md](docs/JOIN.md) | Linking model, arming, ids |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | Milestones, alpha.2 plan |
-| [CHANGELOG.md](CHANGELOG.md) | Release notes |
-| [docs/M1-M3.md](docs/M1-M3.md) | Transport / shell / files design notes |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crate layout |
+| **[docs/USAGE.md](docs/USAGE.md)** | Comprehensive CLI + TUI + SSH + SOCKS + ops |
+| [docs/ALPHA-3.md](docs/ALPHA-3.md) | Magic plane design & limits |
+| [docs/JOIN.md](docs/JOIN.md) | Arming, ids, carrier, SPAKE |
 | [docs/SECURITY.md](docs/SECURITY.md) | Threat model (alpha) |
-| [docs/INSTALL-POLICY.md](docs/INSTALL-POLICY.md) | Future install defaults (user vs system) |
-| [docs/RELEASE-HANDOFF.md](docs/RELEASE-HANDOFF.md) | If tag/release needs a local follow-up |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crate layout, endpoint ownership |
+| [docs/INSTALL-POLICY.md](docs/INSTALL-POLICY.md) | User vs root install |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | What’s next |
+| [CHANGELOG.md](CHANGELOG.md) | Release notes |
+| [docs/PROTOCOL.md](docs/PROTOCOL.md) | Frame notes |
+| [docs/M1-M3.md](docs/M1-M3.md) | Early milestone design |
 
 ---
 
@@ -161,12 +167,12 @@ This is **not** the recommended default for two machines on the internet.
 
 ```text
 crates/
-  mymesh-cli       CLI binary
-  mymesh-core      config, devices, join arming
+  mymesh-cli       CLI + TUI binary (`mymesh`)
+  mymesh-core      config, devices, mesh state, paths
   mymesh-crypto    identity, SPAKE2, 24-word ids
   mymesh-protocol  frames + messages
-  mymesh-net       iroh transport, mailboxes
-  mymesh-session   pair, join, session, agent
+  mymesh-net       iroh transport, dial proxy, mailboxes
+  mymesh-session   join, agent, mesh sync, magic, carrier, TCP tunnel
   mymesh-terminal  PTY host/client
   mymesh-files     sandboxed transfer
   mymesh-desktop   stub (deferred)
@@ -174,19 +180,31 @@ crates/
 
 ---
 
+## Security (alpha, short)
+
+- **Default closed:** joins fail unless the host is **armed**
+- **Trust = allowlist:** only `Trusted` peers get shell/files/TCP
+- **Agent runs as the installing user** (user unit default)
+- **Files** sandboxed (default: home)
+- A compromised linked peer with Terminal+Files is powerful — unlink / kick promptly
+- Firewall helper is **explicit only**; never opens ports by itself
+
+---
+
 ## Roadmap snapshot
 
 | Release | Focus |
 |---------|--------|
-| **v0.1.0-alpha.2** | Link + shell + cp (this release) |
-| **v0.1.0-alpha.2** | install/uninstall/reset, user systemd unit, TUI default, peer metrics |
-| Later | `.mym` names, packages (deb/rpm/AUR), web/GUI, desktop |
+| **v0.1.0-alpha.1** | Link + shell + cp |
+| **v0.1.0-alpha.2** | Install, TUI, mesh gossip, kick |
+| **v0.1.0-alpha.3** | Magic names, SSH, SOCKS, carrier, labels (**this**) |
+| Later | System DNS helper, packages, GUI, desktop, CI |
 
 ---
 
 ## Contributing / feedback
 
-Alpha: expect breakage. Issues and PRs welcome on GitHub.
+Alpha: expect breakage. Issues and PRs welcome.
 
 ## License
 

@@ -132,5 +132,14 @@ The kickee then sends **KickLeaveAck** to all known peers so the mesh converges.
 - `mymesh kick <id>` — double confirm; queues pending if offline  
 - `mymesh kick <id> --force` — force remove immediately; still queues notice  
 - Agent: mesh push on dirty roster + **validate every 60s**  
-- TUI Peers: `[K]` kick, `[F]` force, `[g]` sync, pending list  
+- TUI Peers: `[K]` kick, `[F]` force, `[g]` sync, pending list
+
+## Connect-by-carrier (alpha.3)
+
+Phone acts as a **scanner only**. See [USAGE.md](USAGE.md) and [ALPHA-3.md](ALPHA-3.md).
+
+```bash
+mymesh carrier          # machine A
+mymesh id --uri         # machine B → phone page
+```
 

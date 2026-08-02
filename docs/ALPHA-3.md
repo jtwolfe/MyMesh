@@ -1,10 +1,15 @@
 # MyMesh v0.1.0-alpha.3 — Magic plane
 
-Theme: **use your mesh like a LAN** (non-GUI).
+Theme: **use your mesh like a LAN** (without a full VPN).
 
-## Features
+This release ships non-GUI “magic” features: names, SSH, TCP tunnels, SOCKS, DNS, carrier join, labels. Operational guide: [USAGE.md](USAGE.md).
+
+---
+
+## Feature summary
 
 ### 1. Labels / aliases / groups
+
 ```bash
 mymesh label <device> homedesktop
 mymesh alias <device> desk
@@ -14,53 +19,70 @@ mymesh hosts --group home
 mymesh resolve desk
 ```
 
-### 2. Always-up agent + reconnect
-- `mymesh install` uses `Restart=always`
-- `mymesh serve` probes trusted peers on an interval (`magic.reconnect_probe_secs`, default 30s)
-- Updates `last_seen` when a probe succeeds
+Names feed SSH config, DNS answers, and SOCKS host resolution.
+
+### 2. Always-up agent + single endpoint
+
+- `mymesh install` → user systemd unit with `Restart=always`
+- **One iroh endpoint per identity**, owned by `serve`
+- **Dial proxy** on `$XDG_RUNTIME_DIR/mymesh.sock` so CLI/TUI never re-bind the same key
+- Reconnect probes use the **shared** transport (no second bind)
 
 ### 3. SSH `*.mym`
+
 ```bash
 mymesh ssh-config >> ~/.ssh/config
 ssh user@homedesktop.mym
-# uses: mymesh proxy-ssh %h  → TCP tunnel to peer:22
+# ProxyCommand: mymesh proxy-ssh %h  → TCP tunnel → peer 127.0.0.1:22
 ```
+
+Requires remote **sshd**. Mesh path must already work (`mymesh ping`).
 
 ### 4. TCP mesh-IP + port pipe
-- Each device gets a stable **127.64.x.y** address (loopback, no root)
-- `mymesh serve` auto-binds configured ports on each peer IP and tunnels to peer `127.0.0.1:port`
+
+- Each device: stable **127.64.x.y** (loopback-mapped, no root)
+- `serve` auto-binds configured ports on each peer IP → tunnel to peer `127.0.0.1:port`
 - Default auto ports: 22, 80, 443, 3000, 7878, 8000, 8080, 8443, 9090
-- Manual: `mymesh expose laptop 7878` → listen `127.0.0.1:7878` → peer:7878
+- Manual: `mymesh expose laptop 7878`
 
-Docker / k8s ingress: if it listens on the host (or hostPort/NodePort), mesh IP + port reaches it.
+Docker / k8s: publish the service on the **host** of a mesh node; clients use mesh IP/port or SOCKS.
 
-### 5. DNS for `*.mym`
-- Userspace DNS on `127.0.0.1:5353` (config: `magic.dns_bind`)
-- Resolves `label.mym` / aliases to mesh IPs
-- Point a stub resolver at it, **or** use SOCKS (below)
+### 5. DNS for `*.mym` (userspace)
 
-### 6. Browser without special DNS
+- UDP DNS on `127.0.0.1:5353` (`magic.dns_bind`)
+- Resolves `label.mym` / aliases → mesh IPs
+- **Not** installed into systemd-resolved by default
+- Test: `dig @127.0.0.1 -p 5353 laptop.mym +short`
+- System `ping laptop.mym` fails until you wire OS DNS (ICMP also not a mesh feature)
+
+### 6. Browser / HTTP without system DNS
+
 ```bash
-export ALL_PROXY=socks5://127.0.0.1:18080
-# then: http://laptop.mym:7878
+export ALL_PROXY=socks5h://127.0.0.1:18080
+curl -v http://laptop.mym:7878/
 ```
-SOCKS5 is started by `mymesh serve` (`magic.socks_bind`).
 
-### 7. Connect by carrier (phone = scanner only)
+SOCKS5 from `serve` (`magic.socks_bind`). Prefer **`socks5h`** / “proxy DNS” so names resolve inside MyMesh.
+
+### 7. Connect-by-carrier
+
+Phone is a **scanner only** (no mesh node, no Android app).
+
 ```bash
-# machine A (phone on same LAN as A)
+# A (phone on a network that can reach A's :17878)
 mymesh carrier
-# scan QR → phone opens page
 
-# machine B
-mymesh id --uri
-# paste/scan that URI into the phone page
+# B
+mymesh id --uri   # scan/paste into phone page
 
 # A dials B over iroh and completes join
 ```
-No Android app. Phone never joins the mesh.
 
-## Config (`~/.config/mymesh/config.toml`)
+Symmetric: either side can host the page. Firewall may block LAN access to `:17878` — use `mymesh firewall explain`.
+
+---
+
+## Config
 
 ```toml
 [magic]
@@ -72,9 +94,55 @@ auto_ports = [22, 80, 443, 3000, 7878, 8000, 8080, 8443, 9090]
 reconnect_probe_secs = 30
 ```
 
+---
+
+## Architecture notes (alpha.3)
+
+```text
+┌─────────────┐   dial proxy    ┌──────────────────┐   iroh/QUIC   ┌─────────────┐
+│ CLI / TUI   │ ──────────────► │ mymesh serve     │ ◄──────────► │ peer serve  │
+│ proxy-ssh   │  Unix socket    │ endpoint + agent │              │ sshd :22    │
+└─────────────┘                 │ magic DNS/SOCKS  │              │ :7878 …     │
+                                └──────────────────┘              └─────────────┘
+```
+
+**Do not** run two processes that `IrohTransport::bind` the same identity. That caused `connection lost` / timeouts before the dial-proxy fix.
+
+---
+
+## Related fixes in the alpha.3 window
+
+- Bandwidth probe channel filter (ignore control gossip)
+- Firewall helper (ufw / firewalld, explicit)
+- Ctrl+D safe shell detach in TUI
+- Shell/completions coverage
+- TCP/SSH full-duplex deadlock fix (`proxy-ssh` hang)
+- OpenSSH missing `XDG_RUNTIME_DIR` → control socket discovery
+
+---
+
 ## Honest limits
-- Not a full TUN VPN — mesh IPs live in 127.64/16 on the local host only
-- Auto-ports only cover the configured list (extend in config)
-- System-wide DNS needs you to wire `dns_bind` into your resolver
-- Hyprland fullscreen TUI chrome issues remain parked
-- UDP not tunneled yet
+
+| Limit | Detail |
+|-------|--------|
+| Not a TUN VPN | No system-wide capture; mesh IPs are local loopback maps |
+| Auto-ports finite | Extend `magic.auto_ports` |
+| System DNS | Manual stub resolver / future install helper |
+| ICMP | Use `mymesh ping`, not `ping(8)` |
+| UDP | Not tunneled |
+| Desktop GUI control | Deferred |
+| Hyprland fullscreen TUI chrome | Known imperfect; parked |
+| Carrier port | Often needs explicit host firewall allow |
+
+---
+
+## Validation checklist (maintainer)
+
+- [ ] Link two machines (id join) both ways  
+- [ ] `mymesh ping` / `bw` / TUI metrics  
+- [ ] `shell` + `cp` both directions  
+- [ ] `ssh host.mym` both directions  
+- [ ] SOCKS `curl` to a peer HTTP port  
+- [ ] Carrier join once on LAN  
+- [ ] Kick + pending kick when offline  
+- [ ] Restart agents; dial proxy still works  
