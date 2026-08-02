@@ -6,7 +6,6 @@ use mymesh_protocol::{decode_msg, encode_msg, ChannelId, Frame, TerminalMessage}
 use mymesh_session::Session;
 use mymesh_core::{Capability, Config};
 use mymesh_crypto::Identity;
-use mymesh_net::{IrohTransport, Transport};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
@@ -264,8 +263,8 @@ async fn session_task(
     let cfg = Config::load(paths.config_file())?;
     let store = DeviceStore::open(paths.devices_file())?;
     let peer = crate::resolve_device(&store, &device)?;
-    let transport = IrohTransport::bind(&identity).await?;
-    let conn = transport.connect(peer).await?;
+    let sock = std::path::PathBuf::from(&cfg.daemon.control_socket);
+    let (conn, transport) = mymesh_net::connect_mesh(&identity, peer, &sock).await?;
     let session = Session::handshake_dialer(
         conn,
         &identity,
@@ -360,7 +359,9 @@ async fn session_task(
     let note = exit_note.unwrap_or_else(|| "session ended".into());
     let _ = tx_in.send(format!("__SESSION_END__{note}").into_bytes());
     let _ = conn.close().await;
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), transport.shutdown()).await;
+    if let Some(tr) = transport {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tr.shutdown()).await;
+    }
     Ok(())
 }
 

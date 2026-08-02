@@ -2084,26 +2084,16 @@ async fn push_file_helper(
     remote: &str,
 ) -> anyhow::Result<()> {
     // reuse main's approach via shelling to same binary functions - call probe bandwidth path style
-    use mymesh_core::{Capability, Config, DeviceStore};
+    use mymesh_core::{Config, DeviceStore};
     use mymesh_crypto::Identity;
-    use mymesh_net::{IrohTransport, Transport};
     use mymesh_protocol::{decode_msg, encode_msg, ChannelId, FileMessage, Frame};
-    use mymesh_session::Session;
     let data = std::fs::read(local)?;
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file())?;
     let store = DeviceStore::open(paths.devices_file())?;
     let peer = crate::resolve_device(&store, device)?;
-    let transport = IrohTransport::bind(&identity).await?;
-    let conn = transport.connect(peer).await?;
-    let session = Session::handshake_dialer(
-        conn,
-        &identity,
-        &cfg.device_label,
-        &store,
-        Capability::all(),
-    )
-    .await?;
+    let (session, transport, _) =
+        crate::mesh_conn::open_to_peer(paths, &identity, &cfg, &store, peer).await?;
     let conn = session.into_conn();
     let size = data.len() as u64;
     conn.send_frame(Frame {
@@ -2142,7 +2132,7 @@ async fn push_file_helper(
         anyhow::bail!(message);
     }
     let _ = conn.close().await;
-    transport.shutdown().await;
+    crate::mesh_conn::shutdown_opt(transport).await;
     Ok(())
 }
 
@@ -2152,26 +2142,16 @@ async fn pull_file_helper(
     remote: &str,
     local: &Path,
 ) -> anyhow::Result<()> {
-    use mymesh_core::{Capability, Config, DeviceStore};
+    use mymesh_core::{Config, DeviceStore};
     use mymesh_crypto::Identity;
-    use mymesh_net::{IrohTransport, Transport};
     use mymesh_protocol::{decode_msg, encode_msg, ChannelId, FileMessage, Frame};
-    use mymesh_session::Session;
     use std::io::Write;
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file())?;
     let store = DeviceStore::open(paths.devices_file())?;
     let peer = crate::resolve_device(&store, device)?;
-    let transport = IrohTransport::bind(&identity).await?;
-    let conn = transport.connect(peer).await?;
-    let session = Session::handshake_dialer(
-        conn,
-        &identity,
-        &cfg.device_label,
-        &store,
-        Capability::all(),
-    )
-    .await?;
+    let (session, transport, _) =
+        crate::mesh_conn::open_to_peer(paths, &identity, &cfg, &store, peer).await?;
     let conn = session.into_conn();
     conn.send_frame(Frame {
         channel: ChannelId::files(1),
@@ -2197,7 +2177,7 @@ async fn pull_file_helper(
         }
     }
     let _ = conn.close().await;
-    transport.shutdown().await;
+    crate::mesh_conn::shutdown_opt(transport).await;
     Ok(())
 }
 
@@ -3227,11 +3207,10 @@ async fn run_kick(_paths: &Paths, device: &str, force: bool) -> anyhow::Result<S
 }
 
 async fn mesh_sync_all(paths: &Paths) -> anyhow::Result<usize> {
-    use mymesh_core::{Capability, Config, DeviceStore, MeshState};
+    use mymesh_core::{Config, DeviceStore, MeshState};
     use mymesh_crypto::Identity;
-    use mymesh_net::{IrohTransport, Transport};
     use mymesh_protocol::{decode_msg, encode_msg, ChannelId, ControlMessage, Frame};
-    use mymesh_session::{apply_membership, build_announce, Session};
+    use mymesh_session::{apply_membership, build_announce};
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file())?;
     let store = DeviceStore::open(paths.devices_file())?;
@@ -3242,24 +3221,11 @@ async fn mesh_sync_all(paths: &Paths) -> anyhow::Result<usize> {
         .filter(|d| matches!(d.trust, mymesh_core::TrustState::Trusted))
         .map(|d| d.id)
         .collect();
-    let transport = IrohTransport::bind(&identity).await?;
     let mut added = 0usize;
     for peer in peers {
         let store = DeviceStore::open(paths.devices_file())?;
-        let conn = match transport.connect(peer).await {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let session = match Session::handshake_dialer(
-            conn,
-            &identity,
-            &cfg.device_label,
-            &store,
-            Capability::all(),
-        )
-        .await
-        {
-            Ok(s) => s,
+        let (session, transport, _) = match crate::mesh_conn::open_to_peer(paths, &identity, &cfg, &store, peer).await {
+            Ok(v) => v,
             Err(_) => continue,
         };
         let conn = session.into_conn();
@@ -3304,7 +3270,7 @@ async fn mesh_sync_all(paths: &Paths) -> anyhow::Result<usize> {
             }
         }
         let _ = conn.close().await;
+        crate::mesh_conn::shutdown_opt(transport).await;
     }
-    transport.shutdown().await;
     Ok(added)
 }

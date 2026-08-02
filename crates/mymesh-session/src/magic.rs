@@ -23,10 +23,18 @@ pub struct MagicPlane {
     magic: MagicConfig,
     local_id: DeviceId,
     active_binds: Arc<Mutex<HashSet<SocketAddr>>>,
+    /// Shared agent endpoint — never bind a second iroh identity.
+    transport: Option<Arc<IrohTransport>>,
 }
 
 impl MagicPlane {
-    pub fn new(paths: Paths, identity: &Identity, label: String, cfg: &Config) -> Self {
+    pub fn new(
+        paths: Paths,
+        identity: &Identity,
+        label: String,
+        cfg: &Config,
+        transport: Option<Arc<IrohTransport>>,
+    ) -> Self {
         Self {
             paths,
             secret: identity.to_secret_bytes(),
@@ -34,6 +42,7 @@ impl MagicPlane {
             magic: cfg.magic.clone(),
             local_id: identity.device_id(),
             active_binds: Arc::new(Mutex::new(HashSet::new())),
+            transport,
         }
     }
 
@@ -248,7 +257,9 @@ impl MagicPlane {
         }
         let identity = self.identity();
         let store = self.store()?;
-        let transport = IrohTransport::bind(&identity).await?;
+        let Some(transport) = self.transport.clone() else {
+            anyhow::bail!("magic tunnel: no shared transport (agent not wired)");
+        };
         let conn = transport.connect(peer).await?;
         let session = Session::handshake_dialer(
             conn,
@@ -259,7 +270,7 @@ impl MagicPlane {
         )
         .await?;
         tcp_tunnel::client_bridge(session.into_conn(), local, port, None).await?;
-        let _ = transport.shutdown().await;
+        // do NOT shutdown shared transport
         Ok(())
     }
 
@@ -337,7 +348,10 @@ impl MagicPlane {
     async fn probe(&self, peer: DeviceId) -> anyhow::Result<()> {
         let identity = self.identity();
         let store = self.store()?;
-        let transport = IrohTransport::bind(&identity).await?;
+        let Some(transport) = self.transport.clone() else {
+            debug!("probe skipped — no shared transport");
+            return Ok(());
+        };
         let conn = transport.connect(peer).await?;
         let _ = Session::handshake_dialer(
             conn,
@@ -353,7 +367,6 @@ impl MagicPlane {
                 let _ = store.upsert(rec);
             }
         }
-        let _ = transport.shutdown().await;
         Ok(())
     }
 }

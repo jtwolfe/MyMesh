@@ -1,6 +1,7 @@
 //! MyMesh CLI + TUI entrypoint.
 mod install;
 mod firewall;
+mod mesh_conn;
 mod magic_cmd;
 mod probe;
 mod tui_app;
@@ -828,8 +829,7 @@ pub(crate) async fn cmd_link_join(paths: &Paths, target: &str) -> Result<()> {
     let mut store = DeviceStore::open(paths.devices_file())?;
     let host_id = parse_device_id(target)?;
     println!("requesting link to {}…", style(host_id.short()).cyan());
-    let transport = IrohTransport::bind(&identity).await?;
-    let conn = transport.connect(host_id).await?;
+    let (conn, transport) = mesh_conn::connect_raw(&identity, &cfg, host_id).await?;
     let peer = run_join_as_guest(
         conn,
         &identity,
@@ -845,7 +845,7 @@ pub(crate) async fn cmd_link_join(paths: &Paths, target: &str) -> Result<()> {
         peer.label,
         peer.id.short()
     );
-    transport.shutdown().await;
+    mesh_conn::shutdown_opt(transport).await;
     Ok(())
 }
 
@@ -1018,7 +1018,7 @@ async fn cmd_serve(paths: &Paths) -> Result<()> {
         cfg.device_label,
         identity.device_id().short()
     );
-    let transport = IrohTransport::bind(&identity).await?;
+    let transport = std::sync::Arc::new(IrohTransport::bind(&identity).await?);
     let agent = Agent::new(
         &identity,
         cfg.device_label.clone(),
@@ -1031,10 +1031,28 @@ async fn cmd_serve(paths: &Paths) -> Result<()> {
         paths.mesh_dirty_file(),
         cfg.clone(),
     )?;
-    // Magic plane: DNS, SOCKS5, mesh-IP auto ports, reconnect probes
-    mymesh_session::MagicPlane::new(paths.clone(), &identity, cfg.device_label.clone(), &cfg)
-        .spawn()
-        .await;
+    // Single iroh endpoint: dial proxy so CLI/TUI never re-bind the same identity.
+    let sock = std::path::PathBuf::from(&cfg.daemon.control_socket);
+    {
+        let t = transport.clone();
+        let sock = sock.clone();
+        tokio::spawn(async move {
+            if let Err(e) = mymesh_net::serve_dial_proxy(sock, t).await {
+                tracing::error!(%e, "dial proxy exited");
+            }
+        });
+    }
+    println!("  dial proxy  {}", sock.display());
+    // Magic plane: DNS, SOCKS5, mesh-IP auto ports, reconnect probes (shared transport)
+    mymesh_session::MagicPlane::new(
+        paths.clone(),
+        &identity,
+        cfg.device_label.clone(),
+        &cfg,
+        Some(transport.clone()),
+    )
+    .spawn()
+    .await;
     if cfg.magic.enabled {
         println!(
             "  magic DNS {}  SOCKS5 {}  domain *.{}",
@@ -1043,14 +1061,14 @@ async fn cmd_serve(paths: &Paths) -> Result<()> {
             cfg.magic.domain
         );
     }
-    agent.run(&transport).await?;
+    agent.run(transport.as_ref()).await?;
     Ok(())
 }
 
 async fn open_session_to(
     paths: &Paths,
     device: &str,
-) -> Result<(Session, IrohTransport, mymesh_core::DeviceId)> {
+) -> Result<(Session, Option<IrohTransport>, mymesh_core::DeviceId)> {
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file())?;
     let store = DeviceStore::open(paths.devices_file())?;
@@ -1058,8 +1076,8 @@ async fn open_session_to(
     if !store.is_trusted(&peer) {
         bail!("device not trusted — link first");
     }
-    let transport = IrohTransport::bind(&identity).await?;
-    let conn = transport.connect(peer).await?;
+    let sock = std::path::PathBuf::from(&cfg.daemon.control_socket);
+    let (conn, transport) = mymesh_net::connect_mesh(&identity, peer, &sock).await?;
     let session = Session::handshake_dialer(
         conn,
         &identity,
@@ -1147,7 +1165,7 @@ async fn cmd_shell(paths: &Paths, device: &str, shell: Option<String>) -> Result
     }
     drop(client); // restore raw mode before further prints
     let _ = conn.close().await;
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), transport.shutdown()).await;
+    mesh_conn::shutdown_opt(transport).await;
     if remote_exit {
         eprintln!("[mymesh] shell session ended cleanly");
     }
@@ -1233,7 +1251,7 @@ async fn push_file(paths: &Paths, local: &Path, device: &str, remote: &str) -> R
         other => bail!("unexpected {other:?}"),
     }
     let _ = conn.close().await;
-    transport.shutdown().await;
+    mesh_conn::shutdown_opt(transport).await;
     Ok(())
 }
 
@@ -1274,7 +1292,7 @@ async fn pull_file(paths: &Paths, device: &str, remote: &str, local: &Path) -> R
         }
     }
     let _ = conn.close().await;
-    transport.shutdown().await;
+    mesh_conn::shutdown_opt(transport).await;
     Ok(())
 }
 
@@ -1460,11 +1478,10 @@ async fn cmd_mesh_sync(paths: &Paths) -> Result<()> {
         println!("no trusted peers to sync with");
         return Ok(());
     }
-    let transport = IrohTransport::bind(&identity).await?;
     let mut total_added = 0usize;
     for peer in peers {
         println!("sync {}…", peer.short());
-        match sync_with_peer(paths, &identity, &cfg, &mesh, &transport, peer).await {
+        match sync_with_peer(paths, &identity, &cfg, &mesh, peer).await {
             Ok(n) => {
                 total_added += n;
                 println!("  ok (+{n} members)");
@@ -1472,7 +1489,6 @@ async fn cmd_mesh_sync(paths: &Paths) -> Result<()> {
             Err(e) => println!("  err: {e}"),
         }
     }
-    transport.shutdown().await;
     println!(
         "{} mesh sync complete (learned {total_added} new members)",
         style("ok").green().bold()
@@ -1485,12 +1501,11 @@ async fn sync_with_peer(
     identity: &Identity,
     cfg: &Config,
     mesh: &MeshState,
-    transport: &IrohTransport,
     peer: mymesh_core::DeviceId,
 ) -> Result<usize> {
     use mymesh_protocol::{decode_msg, encode_msg, ChannelId, ControlMessage, Frame};
     let store = DeviceStore::open(paths.devices_file())?;
-    let conn = transport.connect(peer).await?;
+    let (conn, transport) = mesh_conn::connect_raw(identity, cfg, peer).await?;
     let session = Session::handshake_dialer(
         conn,
         identity,
@@ -1568,6 +1583,7 @@ async fn sync_with_peer(
         }
     }
     let _ = conn.close().await;
+    mesh_conn::shutdown_opt(transport).await;
     Ok(added)
 }
 
@@ -1660,8 +1676,6 @@ async fn cmd_kick(
         expected: expected.clone(),
     })?;
 
-    let transport = IrohTransport::bind(&identity).await?;
-
     let notice = ControlMessage::KickNotice {
         mesh_id: mesh.mesh_id.clone(),
         by_id,
@@ -1672,7 +1686,7 @@ async fn cmd_kick(
         signature,
     };
     println!("notifying kicked device {}…", target.short());
-    match notify_peer(paths, &identity, &cfg, &transport, target, notice).await {
+    match notify_peer(paths, &identity, &cfg, target, notice).await {
         Ok(()) => {
             println!("  notice delivered");
             pending.mark_delivered(&target)?;
@@ -1694,7 +1708,7 @@ async fn cmd_kick(
     };
     for peer in &expected {
         print!("announcing kick to {}… ", peer.short());
-        match notify_peer(paths, &identity, &cfg, &transport, *peer, announce.clone()).await {
+        match notify_peer(paths, &identity, &cfg, *peer, announce.clone()).await {
             Ok(()) => println!("ok"),
             Err(e) => println!("err {e}"),
         }
@@ -1703,7 +1717,6 @@ async fn cmd_kick(
     // Local remove (force and normal both remove locally)
     apply_kick_target(&mut store, &target)?;
     bump_mesh_dirty(&paths.mesh_file(), &paths.mesh_dirty_file())?;
-    transport.shutdown().await;
     println!(
         "{} {}kicked {} ({}) from mesh {}",
         style("ok").green().bold(),
@@ -1721,13 +1734,12 @@ async fn notify_peer(
     paths: &Paths,
     identity: &Identity,
     cfg: &Config,
-    transport: &IrohTransport,
     peer: mymesh_core::DeviceId,
     msg: mymesh_protocol::ControlMessage,
 ) -> Result<()> {
     use mymesh_protocol::{encode_msg, ChannelId, Frame};
     let store = DeviceStore::open(paths.devices_file())?;
-    let conn = transport.connect(peer).await?;
+    let (conn, transport) = mesh_conn::connect_raw(identity, cfg, peer).await?;
     let session = Session::handshake_dialer(
         conn,
         identity,
@@ -1745,8 +1757,10 @@ async fn notify_peer(
     .await?;
     let _ = tokio::time::timeout(std::time::Duration::from_secs(3), conn.recv_frame()).await;
     let _ = conn.close().await;
+    mesh_conn::shutdown_opt(transport).await;
     Ok(())
 }
+
 
 fn print_install_notes() {
     println!(

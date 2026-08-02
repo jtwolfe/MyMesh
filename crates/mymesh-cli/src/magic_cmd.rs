@@ -5,7 +5,6 @@ use mymesh_core::{
     mesh_ip_string, Config, DeviceLabel, DeviceStore, Paths, TrustState,
 };
 use mymesh_crypto::{parse_device_id, Identity};
-use mymesh_net::{IrohTransport, Transport};
 use mymesh_session::{
     carrier_pending_path, client_bridge, run_join_as_guest, start_carrier, Session,
 };
@@ -175,13 +174,10 @@ pub async fn cmd_proxy_ssh(paths: &Paths, host: &str) -> Result<()> {
     }
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file())?;
-    let transport = IrohTransport::bind(&identity).await.map_err(|e| {
-        anyhow::anyhow!("proxy-ssh: bind transport: {e}")
-    })?;
-    let conn = transport.connect(peer).await.map_err(|e| {
+    let (conn, transport) = crate::mesh_conn::connect_raw(&identity, &cfg, peer).await.map_err(|e| {
         anyhow::anyhow!(
             "proxy-ssh: mesh connect to {}: {e}
-  (peer mymesh serve running? network/relay ok? UFW rarely blocks this path)",
+  (is local `mymesh serve` up? dial proxy required when agent owns the endpoint)",
             peer.short()
         )
     })?;
@@ -196,7 +192,7 @@ pub async fn cmd_proxy_ssh(paths: &Paths, host: &str) -> Result<()> {
     .map_err(|e| anyhow::anyhow!("proxy-ssh: handshake: {e}"))?;
     // Tunnel to peer localhost:22 — requires peer agent alpha.3+ (Tcp channel) + sshd on 127.0.0.1
     ssh_stdio_bridge(session.into_conn(), 22).await?;
-    let _ = transport.shutdown().await;
+    crate::mesh_conn::shutdown_opt(transport).await;
     Ok(())
 }
 
@@ -327,16 +323,10 @@ pub async fn cmd_expose(paths: &Paths, device: &str, port: u16, local_port: Opti
         let identity = Identity::from_secret_bytes(identity.to_secret_bytes());
         let store = DeviceStore::open(paths.devices_file())?;
         let label = cfg.device_label.clone();
+        let sock_path = std::path::PathBuf::from(&cfg.daemon.control_socket);
         tokio::spawn(async move {
-            let transport = match IrohTransport::bind(&identity).await {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("bind: {e}");
-                    return;
-                }
-            };
-            let conn = match transport.connect(peer).await {
-                Ok(c) => c,
+            let (conn, transport) = match mymesh_net::connect_mesh(&identity, peer, &sock_path).await {
+                Ok(v) => v,
                 Err(e) => {
                     eprintln!("connect: {e}");
                     return;
@@ -358,7 +348,9 @@ pub async fn cmd_expose(paths: &Paths, device: &str, port: u16, local_port: Opti
                 }
             };
             let _ = client_bridge(session.into_conn(), sock, port, None).await;
-            let _ = transport.shutdown().await;
+            if let Some(tr) = transport {
+                tr.shutdown().await;
+            }
         });
     }
 }
@@ -406,10 +398,10 @@ pub async fn cmd_carrier(paths: &Paths, port: u16) -> Result<()> {
             }
             println!("{} got peer from phone — dialing join…", style("ok").green().bold());
             let host_id = parse_join_target(&uri)?;
-            let transport = IrohTransport::bind(&identity).await?;
             let mut store = DeviceStore::open(paths.devices_file())?;
-            match transport.connect(host_id).await {
-                Ok(conn) => {
+            let sock = std::path::PathBuf::from(&cfg.daemon.control_socket);
+            match mymesh_net::connect_mesh(&identity, host_id, &sock).await {
+                Ok((conn, transport)) => {
                     match run_join_as_guest(
                         conn,
                         &identity,
@@ -427,18 +419,21 @@ pub async fn cmd_carrier(paths: &Paths, port: u16) -> Result<()> {
                                 peer.label,
                                 peer.id.short()
                             );
-                            let _ = transport.shutdown().await;
+                            if let Some(tr) = transport {
+                                tr.shutdown().await;
+                            }
                             return Ok(());
                         }
                         Err(e) => {
                             eprintln!("join failed: {e}");
-                            let _ = transport.shutdown().await;
+                            if let Some(tr) = transport {
+                                tr.shutdown().await;
+                            }
                         }
                     }
                 }
                 Err(e) => {
                     eprintln!("connect failed: {e}");
-                    let _ = transport.shutdown().await;
                 }
             }
         }
@@ -604,10 +599,10 @@ pub async fn poll_carrier_join(paths: &Paths) -> Result<Option<String>> {
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file())?;
     let host_id = parse_join_target(&uri)?;
-    let transport = IrohTransport::bind(&identity).await?;
     let mut store = DeviceStore::open(paths.devices_file())?;
-    match transport.connect(host_id).await {
-        Ok(conn) => {
+    let sock = std::path::PathBuf::from(&cfg.daemon.control_socket);
+    match mymesh_net::connect_mesh(&identity, host_id, &sock).await {
+        Ok((conn, transport)) => {
             match run_join_as_guest(
                 conn,
                 &identity,
@@ -619,7 +614,9 @@ pub async fn poll_carrier_join(paths: &Paths) -> Result<Option<String>> {
             .await
             {
                 Ok(peer) => {
-                    let _ = transport.shutdown().await;
+                    if let Some(tr) = transport {
+                        tr.shutdown().await;
+                    }
                     Ok(Some(format!(
                         "carrier linked → {} ({})",
                         peer.label,
@@ -627,14 +624,14 @@ pub async fn poll_carrier_join(paths: &Paths) -> Result<Option<String>> {
                     )))
                 }
                 Err(e) => {
-                    let _ = transport.shutdown().await;
+                    if let Some(tr) = transport {
+                        tr.shutdown().await;
+                    }
                     Ok(Some(format!("carrier join failed: {e}")))
                 }
             }
         }
-        Err(e) => {
-            let _ = transport.shutdown().await;
-            Ok(Some(format!("carrier connect failed: {e}")))
-        }
+        Err(e) => Ok(Some(format!("carrier connect failed: {e}"))),
     }
 }
+
