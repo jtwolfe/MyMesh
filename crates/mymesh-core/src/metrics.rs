@@ -20,6 +20,22 @@ pub struct PeerMetrics {
     pub device_id: Option<DeviceId>,
     pub samples: VecDeque<LatencySample>,
     pub last_bandwidth: Option<BandwidthResult>,
+    pub last_host: Option<HostStatsSnap>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HostStatsSnap {
+    pub at: DateTime<Utc>,
+    pub cpu_pct: f32,
+    pub mem_used_bytes: u64,
+    pub mem_total_bytes: u64,
+    pub disk_used_bytes: u64,
+    pub disk_total_bytes: u64,
+    pub net_rx_bytes: u64,
+    pub net_tx_bytes: u64,
+    pub load_1: f32,
+    pub uptime_secs: u64,
+    pub hostname: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

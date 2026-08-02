@@ -71,6 +71,31 @@ pub enum ControlMessage {
     JoinDeny {
         reason: String,
     },
+    /// Client → host: request one-shot host resource snapshot
+    HostMetricsRequest {
+        nonce: u64,
+    },
+    /// Host → client
+    HostMetrics {
+        nonce: u64,
+        cpu_pct: f32,
+        mem_used_bytes: u64,
+        mem_total_bytes: u64,
+        disk_used_bytes: u64,
+        disk_total_bytes: u64,
+        net_rx_bytes: u64,
+        net_tx_bytes: u64,
+        load_1: f32,
+        uptime_secs: u64,
+        hostname: String,
+        ts_unix: i64,
+    },
+    /// Client enables remote metrics streaming on this session
+    MetricsPollEnable {
+        interval_secs: u32,
+        duration_secs: u32,
+    },
+    MetricsPollDisable,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

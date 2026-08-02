@@ -2,7 +2,8 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use mymesh_core::{
-    BandwidthResult, Capability, Config, DeviceStore, LatencySample, Paths, PeerMetrics,
+    BandwidthResult, Capability, Config, DeviceStore, HostStatsSnap, LatencySample, Paths,
+    PeerMetrics,
 };
 use mymesh_crypto::Identity;
 use mymesh_net::{IrohTransport, Transport};
@@ -182,4 +183,119 @@ pub async fn probe_all(paths: &Paths) -> Result<Vec<(String, Result<u64, String>
         out.push((label, r));
     }
     Ok(out)
+}
+
+
+pub async fn probe_host_metrics(paths: &Paths, device: &str) -> Result<HostStatsSnap> {
+    let (session, transport, peer) = open_session(paths, device).await?;
+    let conn = session.into_conn();
+    let nonce = rand::random::<u64>();
+    conn.send_frame(Frame {
+        channel: ChannelId::control(),
+        payload: encode_msg(&ControlMessage::HostMetricsRequest { nonce })?,
+    })
+    .await?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let snap = loop {
+        if Instant::now() > deadline {
+            let _ = conn.close().await;
+            transport.shutdown().await;
+            bail!("metrics timeout");
+        }
+        let frame = tokio::time::timeout(Duration::from_secs(10), conn.recv_frame())
+            .await
+            .context("metrics recv")??;
+        if frame.channel.kind != mymesh_protocol::ChannelKind::Control {
+            continue;
+        }
+        let msg: ControlMessage = decode_msg(&frame.payload)?;
+        match msg {
+            ControlMessage::HostMetrics {
+                nonce: n,
+                cpu_pct,
+                mem_used_bytes,
+                mem_total_bytes,
+                disk_used_bytes,
+                disk_total_bytes,
+                net_rx_bytes,
+                net_tx_bytes,
+                load_1,
+                uptime_secs,
+                hostname,
+                ..
+            } if n == nonce => {
+                break HostStatsSnap {
+                    at: Utc::now(),
+                    cpu_pct,
+                    mem_used_bytes,
+                    mem_total_bytes,
+                    disk_used_bytes,
+                    disk_total_bytes,
+                    net_rx_bytes,
+                    net_tx_bytes,
+                    load_1,
+                    uptime_secs,
+                    hostname,
+                };
+            }
+            ControlMessage::Ping { nonce: n } => {
+                conn.send_frame(Frame {
+                    channel: ChannelId::control(),
+                    payload: encode_msg(&ControlMessage::Pong { nonce: n })?,
+                })
+                .await?;
+            }
+            _ => {}
+        }
+    };
+    let mut m = PeerMetrics::load(paths.metrics_dir(), &peer)?;
+    m.last_host = Some(snap.clone());
+    m.save(paths.metrics_dir())?;
+    let _ = conn.close().await;
+    transport.shutdown().await;
+    Ok(snap)
+}
+
+pub async fn remote_list(
+    paths: &Paths,
+    device: &str,
+    path: &str,
+) -> Result<Vec<mymesh_protocol::FileEntry>> {
+    let (session, transport, _) = open_session(paths, device).await?;
+    let conn = session.into_conn();
+    conn.send_frame(Frame {
+        channel: ChannelId::files(1),
+        payload: encode_msg(&FileMessage::List {
+            path: path.to_string(),
+        })?,
+    })
+    .await?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if Instant::now() > deadline {
+            let _ = conn.close().await;
+            transport.shutdown().await;
+            bail!("list timeout");
+        }
+        let frame = tokio::time::timeout(Duration::from_secs(10), conn.recv_frame())
+            .await
+            .context("list recv")??;
+        if frame.channel.kind != mymesh_protocol::ChannelKind::Files {
+            continue;
+        }
+        let msg: FileMessage = decode_msg(&frame.payload)?;
+        match msg {
+            FileMessage::ListResult { entries } => {
+                let _ = conn.close().await;
+                transport.shutdown().await;
+                return Ok(entries);
+            }
+            FileMessage::Error { message } => {
+                let _ = conn.close().await;
+                transport.shutdown().await;
+                bail!("{message}");
+            }
+            _ => {}
+        }
+    }
 }

@@ -210,11 +210,25 @@ impl Agent {
                         }
                         ChannelKind::Control => {
                             let msg: mymesh_protocol::ControlMessage = decode_msg(&frame.payload)?;
-                            if let mymesh_protocol::ControlMessage::Ping { nonce } = msg {
-                                conn.send_frame(Frame {
-                                    channel: ChannelId::control(),
-                                    payload: encode_msg(&mymesh_protocol::ControlMessage::Pong { nonce })?,
-                                }).await?;
+                            match msg {
+                                mymesh_protocol::ControlMessage::Ping { nonce } => {
+                                    conn.send_frame(Frame {
+                                        channel: ChannelId::control(),
+                                        payload: encode_msg(&mymesh_protocol::ControlMessage::Pong { nonce })?,
+                                    }).await?;
+                                }
+                                mymesh_protocol::ControlMessage::HostMetricsRequest { nonce } => {
+                                    let report = crate::host_metrics::sample_metrics(nonce).await;
+                                    conn.send_frame(Frame {
+                                        channel: ChannelId::control(),
+                                        payload: encode_msg(&report)?,
+                                    }).await?;
+                                }
+                                mymesh_protocol::ControlMessage::MetricsPollEnable { .. }
+                                | mymesh_protocol::ControlMessage::MetricsPollDisable => {
+                                    // Streaming handled by client re-requesting; ack with ping
+                                }
+                                _ => {}
                             }
                         }
                         ChannelKind::Desktop => {
