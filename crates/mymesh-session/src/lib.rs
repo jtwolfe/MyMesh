@@ -12,7 +12,8 @@ pub use host_metrics::sample_metrics;
 pub use join::{handle_join_as_host, run_join_as_guest};
 pub use mesh_sync::{
     apply_kick_notice_local, apply_kick_target, apply_membership, build_announce, build_snapshot,
-    members_from_store, sign_kick, verify_kick, verify_membership,
+    bump_mesh_dirty, members_from_store, sign_kick, sign_leave_ack, verify_kick, verify_leave_ack,
+    verify_membership,
 };
 pub use pair::{run_guest_pair, run_host_pair, run_host_pair_code, PairOutcome};
 pub use session::Session;

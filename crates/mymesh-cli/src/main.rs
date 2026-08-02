@@ -20,8 +20,8 @@ use mymesh_protocol::{
     decode_msg, encode_msg, ChannelId, FileMessage, Frame, TerminalMessage,
 };
 use mymesh_session::{
-    apply_kick_target, apply_membership, build_announce, run_guest_pair, run_host_pair_code,
-    run_join_as_guest, sign_kick, Agent, Session,
+    apply_kick_target, apply_membership, build_announce, run_guest_pair,
+    run_host_pair_code, run_join_as_guest, sign_kick, Agent, Session,
 };
 use mymesh_terminal::TerminalClient;
 use std::net::SocketAddr;
@@ -161,6 +161,9 @@ enum Commands {
     /// Kick a device from the mesh (double confirmation required)
     Kick {
         device: String,
+        /// Force: remove immediately mesh-wide; still queues notice if offline
+        #[arg(long)]
+        force: bool,
         /// Skip interactive prompts (must pass both confirm flags)
         #[arg(long)]
         yes_kick_from_mesh: bool,
@@ -356,9 +359,10 @@ async fn main() -> Result<()> {
         },
         Commands::Kick {
             device,
+            force,
             yes_kick_from_mesh,
             yes_i_am_sure,
-        } => cmd_kick(&paths, &device, yes_kick_from_mesh, yes_i_am_sure).await?,
+        } => cmd_kick(&paths, &device, force, yes_kick_from_mesh, yes_i_am_sure).await?,
         Commands::InstallNotes => print_install_notes(),
     }
     Ok(())
@@ -786,6 +790,8 @@ async fn cmd_serve(paths: &Paths) -> Result<()> {
         paths.join_dir(),
         paths.mesh_file(),
         paths.kick_notice_file(),
+        paths.pending_kicks_file(),
+        paths.mesh_dirty_file(),
         cfg,
     )?;
     agent.run(&transport).await?;
@@ -1141,6 +1147,22 @@ async fn cmd_mesh_status(paths: &Paths) -> Result<()> {
             println!("      {}", d.id);
         }
     }
+    let pending = mymesh_core::PendingKickStore::open(paths.pending_kicks_file())?;
+    let kicks = pending.list();
+    if !kicks.is_empty() {
+        println!("  pending kicks:");
+        for k in kicks {
+            println!(
+                "    {}  {}  force={} delivered={} acks={}/{}",
+                k.target_id.short(),
+                k.target_label,
+                k.force,
+                k.delivered_to_target,
+                k.acks.len(),
+                k.expected.len()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1273,10 +1295,13 @@ async fn sync_with_peer(
 async fn cmd_kick(
     paths: &Paths,
     device: &str,
+    force: bool,
     yes_kick: bool,
     yes_sure: bool,
 ) -> Result<()> {
+    use mymesh_core::{PendingKick, PendingKickStore};
     use mymesh_protocol::ControlMessage;
+    use mymesh_session::bump_mesh_dirty;
     use std::io::{self, Write};
 
     let identity = Identity::load_or_create(paths.identity_file())?;
@@ -1292,6 +1317,14 @@ async fn cmd_kick(
     }
 
     let label = rec.label.as_str().to_string();
+    if force {
+        println!(
+            "{}",
+            style("FORCE KICK — immediate mesh removal; notice delivered when online")
+                .red()
+                .bold()
+        );
+    }
     if !(yes_kick && yes_sure) {
         print!(
             "Type {} to kick {} ({}): ",
@@ -1315,8 +1348,6 @@ async fn cmd_kick(
         if line.trim() != "I AM SURE" {
             bail!("aborted — second confirmation failed");
         }
-    } else if !(yes_kick && yes_sure) {
-        bail!("both --yes-kick-from-mesh and --yes-i-am-sure required for non-interactive kick");
     }
 
     let mesh = MeshState::load(paths.mesh_file())?;
@@ -1326,58 +1357,84 @@ async fn cmd_kick(
     let message = format!("you were kicked from the mesh by {by_label} host");
     let signature = sign_kick(&identity, &mesh.mesh_id, &target, ts);
 
+    let expected: Vec<_> = store
+        .list()
+        .into_iter()
+        .filter(|d| matches!(d.trust, mymesh_core::TrustState::Trusted) && d.id != target)
+        .map(|d| d.id)
+        .collect();
+
+    let mut pending = PendingKickStore::open(paths.pending_kicks_file())?;
+    pending.upsert(PendingKick {
+        target_id: target,
+        target_label: label.clone(),
+        by_id,
+        by_label: by_label.clone(),
+        mesh_id: mesh.mesh_id.clone(),
+        message: message.clone(),
+        ts,
+        signature,
+        force,
+        created_at: chrono::Utc::now(),
+        delivered_to_target: false,
+        acks: vec![],
+        expected: expected.clone(),
+    })?;
+
     let transport = IrohTransport::bind(&identity).await?;
 
-    // Notify kicked device WHILE still trusted locally (required for session dial)
     let notice = ControlMessage::KickNotice {
         mesh_id: mesh.mesh_id.clone(),
         by_id,
         by_label: by_label.clone(),
         message: message.clone(),
         ts,
+        force,
         signature,
     };
     println!("notifying kicked device {}…", target.short());
     match notify_peer(paths, &identity, &cfg, &transport, target, notice).await {
-        Ok(()) => println!("  notice delivered"),
-        Err(e) => println!("  notice not delivered (offline?): {e}"),
+        Ok(()) => {
+            println!("  notice delivered");
+            pending.mark_delivered(&target)?;
+        }
+        Err(e) => println!("  offline — queued as pending kick ({e})"),
     }
 
-    // Gossip kick to other members (before local remove so store still has them)
     let announce = ControlMessage::KickAnnounce {
         mesh_id: mesh.mesh_id.clone(),
         target_id: target,
+        target_label: label.clone(),
         by_id,
         by_label: by_label.clone(),
         message: message.clone(),
         ts,
+        force,
+        expected: expected.clone(),
         signature: sign_kick(&identity, &mesh.mesh_id, &target, ts),
     };
-    let others: Vec<_> = store
-        .list()
-        .into_iter()
-        .filter(|d| matches!(d.trust, mymesh_core::TrustState::Trusted) && d.id != target)
-        .map(|d| d.id)
-        .collect();
-    for peer in others {
+    for peer in &expected {
         print!("announcing kick to {}… ", peer.short());
-        match notify_peer(paths, &identity, &cfg, &transport, peer, announce.clone()).await {
+        match notify_peer(paths, &identity, &cfg, &transport, *peer, announce.clone()).await {
             Ok(()) => println!("ok"),
             Err(e) => println!("err {e}"),
         }
     }
 
-    // Local remove last
+    // Local remove (force and normal both remove locally)
     apply_kick_target(&mut store, &target)?;
+    bump_mesh_dirty(&paths.mesh_file(), &paths.mesh_dirty_file())?;
     transport.shutdown().await;
     println!(
-        "{} kicked {} ({}) from mesh {}",
+        "{} {}kicked {} ({}) from mesh {}",
         style("ok").green().bold(),
+        if force { "force-" } else { "" },
         label,
         target.short(),
         mesh.mesh_id
     );
     println!("  message: {message}");
+    println!("  pending kicks: mymesh mesh status  (agents deliver when online)");
     Ok(())
 }
 
@@ -1391,9 +1448,7 @@ async fn notify_peer(
 ) -> Result<()> {
     use mymesh_protocol::{encode_msg, ChannelId, Frame};
     let store = DeviceStore::open(paths.devices_file())?;
-    // kicked peer may no longer be in store — still dial by id
     let conn = transport.connect(peer).await?;
-    // handshake: if not trusted on remote, may fail — for KickNotice target still has us trusted until applied
     let session = Session::handshake_dialer(
         conn,
         identity,
@@ -1401,22 +1456,14 @@ async fn notify_peer(
         &store,
         Capability::all(),
     )
-    .await;
-    let session = match session {
-        Ok(s) => s,
-        Err(_) => {
-            // raw frames without full trust path not supported — rethrow
-            // Try connect-only send for kick notice: not available; surface error
-            bail!("session handshake failed (peer offline or already revoked us)");
-        }
-    };
+    .await
+    .map_err(|e| anyhow::anyhow!("session handshake failed: {e}"))?;
     let conn = session.into_conn();
     conn.send_frame(Frame {
         channel: ChannelId::control(),
         payload: encode_msg(&msg)?,
     })
     .await?;
-    // brief wait for ack
     let _ = tokio::time::timeout(std::time::Duration::from_secs(3), conn.recv_frame()).await;
     let _ = conn.close().await;
     Ok(())

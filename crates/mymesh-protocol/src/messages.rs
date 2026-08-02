@@ -125,10 +125,14 @@ pub enum ControlMessage {
     KickAnnounce {
         mesh_id: String,
         target_id: DeviceId,
+        target_label: String,
         by_id: DeviceId,
         by_label: String,
         message: String,
         ts: i64,
+        force: bool,
+        /// Other member ids expected to ack (hint).
+        expected: Vec<DeviceId>,
         #[serde(with = "crate::ser_fixed::array64")]
         signature: [u8; 64],
     },
@@ -139,8 +143,25 @@ pub enum ControlMessage {
         by_label: String,
         message: String,
         ts: i64,
+        force: bool,
         #[serde(with = "crate::ser_fixed::array64")]
         signature: [u8; 64],
+    },
+    /// Target -> members: I received the kick / am leaving the mesh.
+    KickLeaveAck {
+        mesh_id: String,
+        target_id: DeviceId,
+        by_id: DeviceId,
+        ts: i64,
+        #[serde(with = "crate::ser_fixed::array64")]
+        signature: [u8; 64],
+    },
+    /// Member -> initiator/mesh: I applied the kick locally.
+    KickMemberAck {
+        mesh_id: String,
+        target_id: DeviceId,
+        from_id: DeviceId,
+        ts: i64,
     },
     KickAck {
         accepted: bool,

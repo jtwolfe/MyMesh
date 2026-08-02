@@ -67,4 +67,12 @@ impl Paths {
     pub fn kick_notice_file(&self) -> PathBuf {
         self.data_dir.join("kick-notice.txt")
     }
+
+    pub fn pending_kicks_file(&self) -> PathBuf {
+        self.data_dir.join("pending-kicks.json")
+    }
+
+    pub fn mesh_dirty_file(&self) -> PathBuf {
+        self.data_dir.join("mesh.dirty")
+    }
 }

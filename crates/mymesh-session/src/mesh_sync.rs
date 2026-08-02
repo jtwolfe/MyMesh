@@ -224,6 +224,14 @@ pub fn apply_membership(
         r.mesh_id = Some(mesh.mesh_id.clone());
         store.upsert(r)?;
     }
+    if added > 0 {
+        mesh.bump_generation();
+        mesh.save(mesh_path)?;
+        // dirty file next to mesh.json
+        if let Some(parent) = mesh_path.parent() {
+            let _ = mymesh_core::mark_mesh_dirty(parent.join("mesh.dirty"));
+        }
+    }
     Ok(added)
 }
 
@@ -290,4 +298,50 @@ pub fn control_frame(msg: &ControlMessage) -> Result<Frame> {
         channel: ChannelId::control(),
         payload: encode_msg(msg)?,
     })
+}
+
+pub fn leave_ack_material(mesh_id: &str, target: &DeviceId, by: &DeviceId, ts: i64) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"mymesh-kick-leave-v1");
+    v.extend_from_slice(mesh_id.as_bytes());
+    v.extend_from_slice(target.as_bytes());
+    v.extend_from_slice(by.as_bytes());
+    v.extend_from_slice(&ts.to_le_bytes());
+    v
+}
+
+pub fn sign_leave_ack(
+    identity: &Identity,
+    mesh_id: &str,
+    by: &DeviceId,
+    ts: i64,
+) -> [u8; 64] {
+    identity.sign(&leave_ack_material(
+        mesh_id,
+        &identity.device_id(),
+        by,
+        ts,
+    ))
+}
+
+pub fn verify_leave_ack(
+    mesh_id: &str,
+    target: &DeviceId,
+    by: &DeviceId,
+    ts: i64,
+    signature: &[u8; 64],
+) -> Result<()> {
+    let pub_id = mymesh_crypto::IdentityPublic {
+        verifying_key: *target.as_bytes(),
+    };
+    pub_id.verify(&leave_ack_material(mesh_id, target, by, ts), signature)?;
+    Ok(())
+}
+
+pub fn bump_mesh_dirty(mesh_path: &Path, dirty_path: &Path) -> Result<()> {
+    let mut mesh = MeshState::load(mesh_path)?;
+    mesh.bump_generation();
+    mesh.save(mesh_path)?;
+    mymesh_core::mark_mesh_dirty(dirty_path)?;
+    Ok(())
 }

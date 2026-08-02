@@ -122,3 +122,15 @@ Effects:
 2. `KickAnnounce` gossip to other members (they drop the target)
 3. Local remove of the target
 4. Kicked node clears its mesh roster and writes `kick-notice.txt`
+
+## Pending kicks
+
+If the kickee is offline, every mesh member stores a **pending kick**. When the
+kickee next appears to any online member, that member delivers `KickNotice`.
+The kickee then sends **KickLeaveAck** to all known peers so the mesh converges.
+
+- `mymesh kick <id>` — double confirm; queues pending if offline  
+- `mymesh kick <id> --force` — force remove immediately; still queues notice  
+- Agent: mesh push on dirty roster + **validate every 60s**  
+- TUI Peers: `[K]` kick, `[F]` force, `[g]` sync, pending list  
+

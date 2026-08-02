@@ -8,7 +8,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use mymesh_core::{ArmState, Config, DeviceStore, JoinStore, Paths, PeerMetrics};
+use mymesh_core::{ArmState, Config, DeviceStore, JoinStore, MeshState, Paths, PeerMetrics, PendingKickStore};
 use mymesh_crypto::{device_id_to_words, device_join_uri, Identity};
 use mymesh_protocol::FileEntry;
 use qrcode::QrCode;
@@ -119,6 +119,16 @@ struct PeerPoll {
     max_duration: Duration,
 }
 
+#[derive(Clone, Default)]
+struct KickWizard {
+    active: bool,
+    force: bool,
+    step: u8, // 0 type KICK FROM MESH, 1 type I AM SURE
+    buf: String,
+    target: Option<String>,
+    target_label: String,
+}
+
 struct App {
     paths: Paths,
     tab: Tab,
@@ -132,6 +142,7 @@ struct App {
     term: TermPane,
     poll: PeerPoll,
     last_draw_size: (u16, u16),
+    kick: KickWizard,
 }
 
 pub async fn run_tui(paths: Paths) -> Result<()> {
@@ -181,6 +192,7 @@ pub async fn run_tui(paths: Paths) -> Result<()> {
             max_duration: Duration::from_secs(300),
         },
         last_draw_size: (0, 0),
+        kick: KickWizard::default(),
     };
 
     let res = run_loop(&mut terminal, &mut app).await;
@@ -479,7 +491,47 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             KeyCode::Char('c') => copy_id(app),
             _ => {}
         },
-        Tab::Peers => match code {
+        Tab::Peers => {
+          if app.kick.active {
+            match code {
+                KeyCode::Esc => {
+                    app.kick = KickWizard::default();
+                    app.status = "kick cancelled".into();
+                }
+                KeyCode::Char(c) => {
+                    app.kick.buf.push(c);
+                    app.status = format!("confirm: {}", app.kick.buf);
+                }
+                KeyCode::Backspace => { app.kick.buf.pop(); }
+                KeyCode::Enter => {
+                    let need = if app.kick.step == 0 { "KICK FROM MESH" } else { "I AM SURE" };
+                    if app.kick.buf.trim() == need {
+                        if app.kick.step == 0 {
+                            app.kick.step = 1;
+                            app.kick.buf.clear();
+                            app.status = "type I AM SURE then Enter".into();
+                        } else {
+                            let force = app.kick.force;
+                            let tgt = app.kick.target.clone();
+                            app.kick = KickWizard::default();
+                            if let Some(id) = tgt {
+                                app.status = "kicking…".into();
+                                match run_kick(&app.paths, &id, force).await {
+                                    Ok(msg) => app.status = msg,
+                                    Err(e) => app.status = format!("kick: {e}"),
+                                }
+                            }
+                        }
+                    } else {
+                        app.status = format!("expected exactly `{need}`");
+                        app.kick.buf.clear();
+                    }
+                }
+                _ => {}
+            }
+            return;
+          }
+          match code {
             KeyCode::Down | KeyCode::Char('j') => {
                 app.peer_sel = app.peer_sel.saturating_add(1);
             }
@@ -523,8 +575,18 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                     refresh_remote(app).await;
                 }
             }
+            KeyCode::Char('g') => {
+                app.status = "mesh sync…".into();
+                match mesh_sync_all(&app.paths).await {
+                    Ok(n) => app.status = format!("mesh sync ok (+{n})"),
+                    Err(e) => app.status = format!("sync: {e}"),
+                }
+            }
+            KeyCode::Char('K') => start_kick_wizard(app, false),
+            KeyCode::Char('F') => start_kick_wizard(app, true),
             _ => {}
-        },
+          }
+        }
         Tab::Files => match code {
             KeyCode::Down | KeyCode::Char('j') => {
                 if app.files.focus_remote {
@@ -657,6 +719,15 @@ async fn click_button(app: &mut App, id: &str) {
                 app.tab = Tab::Term;
             }
         }
+        "mesh_sync" => {
+            app.status = "mesh sync…".into();
+            match mesh_sync_all(&app.paths).await {
+                Ok(n) => app.status = format!("mesh sync ok (+{n} members)"),
+                Err(e) => app.status = format!("mesh sync: {e}"),
+            }
+        }
+        "kick" => start_kick_wizard(app, false),
+        "force_kick" => start_kick_wizard(app, true),
         "copy_lr" => copy_selected(app).await,
         "refresh_remote" => refresh_remote(app).await,
         "term_connect" => connect_term(app).await,
@@ -1253,9 +1324,12 @@ fn draw_action_bar(f: &mut TuiFrame, area: Rect, app: &mut App) {
         ],
         Tab::Peers => vec![
             ("ping", "[p] Ping"),
-            ("bw", "[b] Bandwidth"),
+            ("bw", "[b] BW"),
             ("metrics", "[m] Metrics"),
             ("poll", "[t] Poll"),
+            ("mesh_sync", "[g] Sync"),
+            ("kick", "[K] Kick"),
+            ("force_kick", "[F] Force"),
             ("open_files", "[f] Files"),
             ("open_term", "[s] Shell"),
             ("quit", "[q] Quit"),
@@ -1593,9 +1667,71 @@ fn draw_peers(f: &mut TuiFrame, area: Rect, app: &App) {
             Style::default().fg(if app.poll.enabled { C_OK } else { C_MUTED }),
         )));
     }
+
+    // mesh + pending kicks
+    lines.push(Line::from(""));
+    if let Ok(mesh) = MeshState::load(app.paths.mesh_file()) {
+        lines.push(Line::from(Span::styled(
+            format!("Mesh {}", mesh.mesh_id),
+            Style::default().fg(C_ACCENT2),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("gen {}  last_sync {:?}", mesh.roster_generation, mesh.last_sync),
+            Style::default().fg(C_MUTED),
+        )));
+    }
+    if let Ok(pk) = PendingKickStore::open(app.paths.pending_kicks_file()) {
+        let kicks = pk.list();
+        if !kicks.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "Pending kicks",
+                Style::default().fg(C_WARN).add_modifier(Modifier::BOLD),
+            )));
+            for k in kicks.iter().take(6) {
+                lines.push(Line::from(format!(
+                    "  {} {} force={} deliv={} acks={}/{}",
+                    k.target_id.short(),
+                    k.target_label,
+                    k.force,
+                    k.delivered_to_target,
+                    k.acks.len(),
+                    k.expected.len()
+                )));
+            }
+        }
+    }
+    if app.kick.active {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            if app.kick.force { "FORCE KICK CONFIRM" } else { "KICK CONFIRM" },
+            Style::default().fg(C_ERR).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(format!(
+            "target: {} ({})",
+            app.kick.target_label,
+            app.kick.target.as_deref().unwrap_or("?")
+        )));
+        let need = if app.kick.step == 0 {
+            "KICK FROM MESH"
+        } else {
+            "I AM SURE"
+        };
+        lines.push(Line::from(format!("type exactly: {need}")));
+        lines.push(Line::from(format!("> {}", app.kick.buf)));
+        lines.push(Line::from(Span::styled(
+            "Enter confirm · Esc cancel",
+            Style::default().fg(C_MUTED),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "[K] kick  [F] force kick  [g] mesh sync",
+            Style::default().fg(C_MUTED),
+        )));
+    }
+
     f.render_widget(
         Paragraph::new(lines)
-            .block(panel("Detail"))
+            .block(panel("Detail · mesh · kicks"))
             .wrap(Wrap { trim: false }),
         cols[1],
     );
@@ -1799,4 +1935,137 @@ fn draw_status_line(f: &mut TuiFrame, area: Rect, app: &App) {
             .style(Style::default().bg(C_BG)),
     );
     f.render_widget(p, area);
+}
+
+
+fn start_kick_wizard(app: &mut App, force: bool) {
+    let Some(id) = selected_peer_id(app) else {
+        app.status = "select a peer to kick".into();
+        return;
+    };
+    let label = DeviceStore::open(app.paths.devices_file())
+        .ok()
+        .and_then(|s| {
+            s.list()
+                .into_iter()
+                .find(|d| d.id.to_string() == id)
+                .map(|d| d.label.as_str().to_string())
+        })
+        .unwrap_or_else(|| id.clone());
+    app.kick = KickWizard {
+        active: true,
+        force,
+        step: 0,
+        buf: String::new(),
+        target: Some(id),
+        target_label: label,
+    };
+    app.status = if force {
+        "FORCE KICK — type KICK FROM MESH".into()
+    } else {
+        "KICK — type KICK FROM MESH".into()
+    };
+}
+
+async fn run_kick(paths: &Paths, device: &str, force: bool) -> anyhow::Result<String> {
+    // Non-interactive path using CLI flags
+    use std::process::Command;
+    let bin = std::env::current_exe()?;
+    let mut cmd = Command::new(bin);
+    cmd.arg("kick").arg(device);
+    if force {
+        cmd.arg("--force");
+    }
+    cmd.arg("--yes-kick-from-mesh").arg("--yes-i-am-sure");
+    if let Ok(home) = std::env::var("MYMESH_HOME") {
+        cmd.arg("--home").arg(home);
+    }
+    let out = cmd.output()?;
+    if !out.status.success() {
+        anyhow::bail!(String::from_utf8_lossy(&out.stderr).to_string() + &String::from_utf8_lossy(&out.stdout));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+async fn mesh_sync_all(paths: &Paths) -> anyhow::Result<usize> {
+    use mymesh_core::{Capability, Config, DeviceStore, MeshState};
+    use mymesh_crypto::Identity;
+    use mymesh_net::{IrohTransport, Transport};
+    use mymesh_protocol::{decode_msg, encode_msg, ChannelId, ControlMessage, Frame};
+    use mymesh_session::{apply_membership, build_announce, Session};
+    let identity = Identity::load_or_create(paths.identity_file())?;
+    let cfg = Config::load(paths.config_file())?;
+    let store = DeviceStore::open(paths.devices_file())?;
+    let mesh = MeshState::load(paths.mesh_file())?;
+    let peers: Vec<_> = store
+        .list()
+        .into_iter()
+        .filter(|d| matches!(d.trust, mymesh_core::TrustState::Trusted))
+        .map(|d| d.id)
+        .collect();
+    let transport = IrohTransport::bind(&identity).await?;
+    let mut added = 0usize;
+    for peer in peers {
+        let store = DeviceStore::open(paths.devices_file())?;
+        let conn = match transport.connect(peer).await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let session = match Session::handshake_dialer(
+            conn,
+            &identity,
+            &cfg.device_label,
+            &store,
+            Capability::all(),
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let conn = session.into_conn();
+        let ann = build_announce(&identity, &cfg.device_label, &store, &mesh);
+        let _ = conn
+            .send_frame(Frame {
+                channel: ChannelId::control(),
+                payload: encode_msg(&ann)?,
+            })
+            .await;
+        let _ = conn
+            .send_frame(Frame {
+                channel: ChannelId::control(),
+                payload: encode_msg(&ControlMessage::MembershipRequest { nonce: 1 })?,
+            })
+            .await;
+        if let Ok(Ok(frame)) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), conn.recv_frame()).await
+        {
+            if let Ok(ControlMessage::MembershipSnapshot {
+                mesh_id,
+                from_id,
+                members,
+                ts,
+                signature,
+                ..
+            }) = decode_msg(&frame.payload)
+            {
+                if mymesh_session::verify_membership(&from_id, &mesh_id, ts, &members, &signature)
+                    .is_ok()
+                {
+                    let mut store = DeviceStore::open(paths.devices_file())?;
+                    added += apply_membership(
+                        &mut store,
+                        &paths.mesh_file(),
+                        &from_id,
+                        &mesh_id,
+                        &members,
+                        identity.device_id(),
+                    )?;
+                }
+            }
+        }
+        let _ = conn.close().await;
+    }
+    transport.shutdown().await;
+    Ok(added)
 }
