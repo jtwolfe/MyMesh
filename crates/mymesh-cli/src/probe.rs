@@ -1,43 +1,13 @@
 //! Peer latency probe + bandwidth test over an established session path.
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use mymesh_core::{
-    BandwidthResult, Capability, Config, DeviceStore, HostStatsSnap, LatencySample, Paths,
-    PeerMetrics,
-};
-use mymesh_crypto::Identity;
-use mymesh_net::IrohTransport;
+use mymesh_core::{BandwidthResult, DeviceStore, HostStatsSnap, LatencySample, Paths, PeerMetrics};
 use mymesh_protocol::{decode_msg, encode_msg, ChannelId, ControlMessage, FileMessage, Frame};
-use mymesh_session::Session;
 use std::time::{Duration, Instant};
-
-async fn open_session(
-    paths: &Paths,
-    device: &str,
-) -> Result<(Session, Option<IrohTransport>, mymesh_core::DeviceId)> {
-    let identity = Identity::load_or_create(paths.identity_file())?;
-    let cfg = Config::load(paths.config_file())?;
-    let store = DeviceStore::open(paths.devices_file())?;
-    let peer = crate::resolve_device(&store, device)?;
-    if !store.is_trusted(&peer) {
-        bail!("device not trusted — link first");
-    }
-    let sock = std::path::PathBuf::from(&cfg.daemon.control_socket);
-    let (conn, transport) = mymesh_net::connect_mesh(&identity, peer, &sock).await?;
-    let session = Session::handshake_dialer(
-        conn,
-        &identity,
-        &cfg.device_label,
-        &store,
-        Capability::all(),
-    )
-    .await?;
-    Ok((session, transport, peer))
-}
 
 /// Single RTT probe via control Ping/Pong; records into metrics history.
 pub async fn probe_ping(paths: &Paths, device: &str) -> Result<u64> {
-    let (session, mut transport, peer) = open_session(paths, device).await?;
+    let (session, mut transport, peer) = crate::mesh_conn::open_trusted_session(paths, device).await?;
     let conn = session.into_conn();
     let nonce = rand::random::<u64>();
     let t0 = Instant::now();
@@ -103,7 +73,7 @@ pub async fn probe_ping(paths: &Paths, device: &str) -> Result<u64> {
 /// Push ~`bytes` of payload to peer via file channel temp path; measure throughput.
 pub async fn probe_bandwidth(paths: &Paths, device: &str, bytes: u64) -> Result<BandwidthResult> {
     let bytes = bytes.clamp(64 * 1024, 64 * 1024 * 1024);
-    let (session, mut transport, peer) = open_session(paths, device).await?;
+    let (session, mut transport, peer) = crate::mesh_conn::open_trusted_session(paths, device).await?;
     let conn = session.into_conn();
     let remote = format!(".mymesh-bw-probe-{}", std::process::id());
     let chunk = vec![0xA5u8; 64 * 1024];
@@ -200,7 +170,7 @@ pub async fn probe_all(paths: &Paths) -> Result<Vec<(String, Result<u64, String>
 
 
 pub async fn probe_host_metrics(paths: &Paths, device: &str) -> Result<HostStatsSnap> {
-    let (session, mut transport, peer) = open_session(paths, device).await?;
+    let (session, mut transport, peer) = crate::mesh_conn::open_trusted_session(paths, device).await?;
     let conn = session.into_conn();
     let nonce = rand::random::<u64>();
     conn.send_frame(Frame {
@@ -274,7 +244,7 @@ pub async fn remote_list(
     device: &str,
     path: &str,
 ) -> Result<Vec<mymesh_protocol::FileEntry>> {
-    let (session, mut transport, _) = open_session(paths, device).await?;
+    let (session, mut transport, _) = crate::mesh_conn::open_trusted_session(paths, device).await?;
     let conn = session.into_conn();
     conn.send_frame(Frame {
         channel: ChannelId::files(1),

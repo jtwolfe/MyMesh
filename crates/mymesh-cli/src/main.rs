@@ -1069,25 +1069,9 @@ async fn open_session_to(
     paths: &Paths,
     device: &str,
 ) -> Result<(Session, Option<IrohTransport>, mymesh_core::DeviceId)> {
-    let identity = Identity::load_or_create(paths.identity_file())?;
-    let cfg = Config::load(paths.config_file())?;
-    let store = DeviceStore::open(paths.devices_file())?;
-    let peer = resolve_device(&store, device)?;
-    if !store.is_trusted(&peer) {
-        bail!("device not trusted — link first");
-    }
-    let sock = std::path::PathBuf::from(&cfg.daemon.control_socket);
-    let (conn, transport) = mymesh_net::connect_mesh(&identity, peer, &sock).await?;
-    let session = Session::handshake_dialer(
-        conn,
-        &identity,
-        &cfg.device_label,
-        &store,
-        Capability::all(),
-    )
-    .await?;
-    Ok((session, transport, peer))
+    mesh_conn::open_trusted_session(paths, device).await
 }
+
 
 async fn cmd_shell(paths: &Paths, device: &str, shell: Option<String>) -> Result<()> {
     let (session, transport, _) = open_session_to(paths, device).await?;
