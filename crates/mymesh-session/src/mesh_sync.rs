@@ -5,9 +5,7 @@ use mymesh_core::{
     NodeFingerprint, Result, TrustState,
 };
 use mymesh_crypto::Identity;
-use mymesh_protocol::{
-    encode_msg, ChannelId, ControlMessage, Frame, MeshMemberWire,
-};
+use mymesh_protocol::{ControlMessage, MeshMemberWire};
 use std::path::Path;
 use tracing::info;
 
@@ -293,12 +291,6 @@ pub fn apply_kick_notice_local(
     Ok(())
 }
 
-pub fn control_frame(msg: &ControlMessage) -> Result<Frame> {
-    Ok(Frame {
-        channel: ChannelId::control(),
-        payload: encode_msg(msg)?,
-    })
-}
 
 pub fn leave_ack_material(mesh_id: &str, target: &DeviceId, by: &DeviceId, ts: i64) -> Vec<u8> {
     let mut v = Vec::new();
