@@ -142,14 +142,72 @@ pub fn cycle_peer(paths: &Paths, term: &mut TermPane, delta: i32) {
 }
 
 pub fn disconnect(term: &mut TermPane) {
+    // Signal worker first, then drop channels so the session task exits cleanly.
+    if let Some(tx) = term._shutdown.take() {
+        let _ = tx.try_send(());
+    }
+    term.tx_out = None;
+    term.rx_in = None;
     term.active = false;
     term.connected = false;
     term.pick_peer = true;
-    term.tx_out = None;
-    term.rx_in = None;
-    term._shutdown = None;
+    term.scroll = 0;
+    // Keep scrollback content for a moment is nice, but reset avoids a "dead" focus trap.
     term.parser = vt100::Parser::new(term.rows, term.cols, 5000);
     term.status_msg = "disconnected".into();
+}
+
+/// Call each UI tick: drain PTY output and auto-detach if the remote session ended.
+pub fn poll_session(term: &mut TermPane) {
+    let mut ended = false;
+    let mut chunks = Vec::new();
+    if let Some(rx) = term.rx_in.as_mut() {
+        loop {
+            match rx.try_recv() {
+                Ok(chunk) => {
+                    if chunk.starts_with(b"__SESSION_END__") {
+                        ended = true;
+                        let msg = String::from_utf8_lossy(&chunk[16..]).trim().to_string();
+                        if !msg.is_empty() {
+                            term.status_msg = msg;
+                        } else {
+                            term.status_msg = "session ended".into();
+                        }
+                    } else {
+                        chunks.push(chunk);
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    ended = true;
+                    if term.status_msg == "connected" || term.status_msg.is_empty() {
+                        term.status_msg = "session ended".into();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    for chunk in chunks {
+        term.process_output(&chunk);
+    }
+    if ended && term.connected {
+        // Soft end: leave last screen content visible by not wiping parser first
+        if let Some(tx) = term._shutdown.take() {
+            let _ = tx.try_send(());
+        }
+        term.tx_out = None;
+        term.rx_in = None;
+        term.active = false;
+        term.connected = false;
+        term.pick_peer = true;
+        term.scroll = 0;
+        if !term.status_msg.contains("exit") && !term.status_msg.contains("ended") {
+            term.status_msg = "session ended — pick a system to reconnect".into();
+        } else if !term.status_msg.contains("reconnect") {
+            term.status_msg = format!("{} · pick a system to reconnect", term.status_msg);
+        }
+    }
 }
 
 pub async fn connect(paths: &Paths, term: &mut TermPane) -> Result<()> {
@@ -173,9 +231,12 @@ pub async fn connect(paths: &Paths, term: &mut TermPane) -> Result<()> {
 
     tokio::spawn(async move {
         let err_tx = tx_in.clone();
-        if let Err(e) = session_task(paths, peer, cols, rows, tx_in, &mut rx_out, &mut shutdown_rx).await
-        {
-            let _ = err_tx.send(format!("\r\n[session error: {e}]\r\n").into_bytes());
+        match session_task(paths, peer, cols, rows, tx_in, &mut rx_out, &mut shutdown_rx).await {
+            Ok(()) => {}
+            Err(e) => {
+                let _ = err_tx.send(format!("\r\n[session error: {e}]\r\n").into_bytes());
+                let _ = err_tx.send(format!("__SESSION_END__error: {e}").into_bytes());
+            }
         }
     });
 
@@ -225,22 +286,43 @@ async fn session_task(
         )
         .await?;
     let conn = session.into_conn();
+    let mut exit_note: Option<String> = None;
     loop {
         tokio::select! {
-            _ = shutdown.recv() => break,
+            _ = shutdown.recv() => {
+                exit_note = Some("disconnected".into());
+                break;
+            }
             frame = conn.recv_frame() => {
-                let frame = frame?;
-                if frame.channel.kind != mymesh_protocol::ChannelKind::Terminal {
-                    continue;
-                }
-                let msg: TerminalMessage = decode_msg(&frame.payload)?;
-                match msg {
-                    TerminalMessage::Output(data) => { let _ = tx_in.send(data); }
-                    TerminalMessage::Exit { code } => {
-                        let _ = tx_in.send(format!("\r\n[exit {code}]\r\n").into_bytes());
+                match frame {
+                    Ok(frame) => {
+                        if frame.channel.kind != mymesh_protocol::ChannelKind::Terminal {
+                            continue;
+                        }
+                        let msg: TerminalMessage = match decode_msg(&frame.payload) {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        };
+                        match msg {
+                            TerminalMessage::Output(data) => { let _ = tx_in.send(data); }
+                            TerminalMessage::Exit { code } => {
+                                let line = format!("\r\n[remote shell exit {code}]\r\n");
+                                let _ = tx_in.send(line.into_bytes());
+                                exit_note = Some(format!("exit {code}"));
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(e) => {
+                        // Peer closed or transport drop after shell exit — normal, not a crash.
+                        let n = format!("connection closed ({e})");
+                        exit_note = Some(n.clone());
+                        let _ = tx_in.send(format!("
+[{n}]
+").into_bytes());
                         break;
                     }
-                    _ => {}
                 }
             }
             inp = rx_out.recv() => {
@@ -250,26 +332,34 @@ async fn session_task(
                             let s = String::from_utf8_lossy(&data[11..]);
                             if let Some((c, r)) = s.split_once('x') {
                                 if let (Ok(c), Ok(r)) = (c.parse::<u16>(), r.parse::<u16>()) {
-                                    conn.send_frame(Frame {
+                                    let _ = conn.send_frame(Frame {
                                         channel: ChannelId::terminal(1),
                                         payload: encode_msg(&TerminalMessage::Resize { cols: c, rows: r })?,
-                                    }).await?;
+                                    }).await;
                                 }
                             }
                             continue;
                         }
-                        conn.send_frame(Frame {
+                        if conn.send_frame(Frame {
                             channel: ChannelId::terminal(1),
                             payload: encode_msg(&TerminalMessage::Input(data))?,
-                        }).await?;
+                        }).await.is_err() {
+                            exit_note = Some("send failed".into());
+                            break;
+                        }
                     }
-                    None => break,
+                    None => {
+                        exit_note = Some("local closed".into());
+                        break;
+                    }
                 }
             }
         }
     }
+    let note = exit_note.unwrap_or_else(|| "session ended".into());
+    let _ = tx_in.send(format!("__SESSION_END__{note}").into_bytes());
     let _ = conn.close().await;
-    transport.shutdown().await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), transport.shutdown()).await;
     Ok(())
 }
 
@@ -291,15 +381,7 @@ pub fn maybe_resize(term: &mut TermPane) {
 }
 
 pub fn drain_output(term: &mut TermPane) {
-    let mut chunks = Vec::new();
-    if let Some(rx) = term.rx_in.as_mut() {
-        while let Ok(chunk) = rx.try_recv() {
-            chunks.push(chunk);
-        }
-    }
-    for chunk in chunks {
-        term.process_output(&chunk);
-    }
+    poll_session(term);
 }
 
 pub fn key_to_bytes(code: KeyCode, app_cursor: bool) -> Option<Vec<u8>> {

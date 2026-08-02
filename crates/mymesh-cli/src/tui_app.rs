@@ -273,10 +273,7 @@ pub async fn run_tui(paths: Paths) -> Result<()> {
 
     let res = run_loop(&mut terminal, &mut app).await;
 
-    app.term.active = false;
-    app.term.connected = false;
-    app.term.tx_out = None;
-    app.term.rx_in = None;
+    term_pane::disconnect(&mut app.term);
 
     disable_raw_mode()?;
     execute!(
@@ -650,9 +647,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         if mods.contains(KM::CONTROL) {
             match code {
                 KeyCode::Char('q') | KeyCode::Char('Q') => {
-                    app.term.active = false;
-                    app.term.pick_peer = true;
-                    app.status = "detached shell (Ctrl+Q)".into();
+                    // Detach + tear down mesh shell session (safe leave)
+                    term_pane::disconnect(&mut app.term);
+                    app.status = "shell closed (Ctrl+Q)".into();
                     return;
                 }
                 KeyCode::Char('c') | KeyCode::Char('C') => {
@@ -660,7 +657,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                     return;
                 }
                 KeyCode::Char('d') | KeyCode::Char('D') => {
+                    // EOF to remote shell (bash exits). Session end is handled in poll_session.
                     app.term.send(&[0x04]);
+                    app.status = "sent EOF (Ctrl+D) — waiting for remote exit…".into();
                     return;
                 }
                 KeyCode::Char('z') | KeyCode::Char('Z') => {
@@ -679,9 +678,10 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         }
         match code {
             KeyCode::Esc => {
+                // Leave input focus but keep session until Ctrl+Q / remote exit
                 app.term.active = false;
                 app.term.pick_peer = true;
-                app.status = "left shell input".into();
+                app.status = "left shell input (session still up — Ctrl+Q closes)".into();
             }
             KeyCode::PageUp => {
                 app.term.scroll = app.term.scroll.saturating_add(app.term.rows / 2);

@@ -968,11 +968,12 @@ async fn cmd_shell(paths: &Paths, device: &str, shell: Option<String>) -> Result
     let client = TerminalClient::attach()?;
     let conn = session.into_conn();
     let (tx_in, mut rx_in) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+    // stdin reader: exits when channel closes or stdin EOF
     std::thread::spawn(move || {
         let mut buf = [0u8; 1024];
         loop {
             match std::io::Read::read(&mut std::io::stdin(), &mut buf) {
-                Ok(0) => break,
+                Ok(0) => break, // real stdin EOF
                 Ok(n) => {
                     if tx_in.blocking_send(buf[..n].to_vec()).is_err() {
                         break;
@@ -982,31 +983,54 @@ async fn cmd_shell(paths: &Paths, device: &str, shell: Option<String>) -> Result
             }
         }
     });
+    let mut remote_exit = false;
     loop {
         tokio::select! {
             frame = conn.recv_frame() => {
-                let frame = frame?;
-                if frame.channel.kind != mymesh_protocol::ChannelKind::Terminal {
-                    continue;
+                match frame {
+                    Ok(frame) => {
+                        if frame.channel.kind != mymesh_protocol::ChannelKind::Terminal {
+                            continue;
+                        }
+                        let msg: TerminalMessage = decode_msg(&frame.payload)?;
+                        if !client.handle_host_msg(msg)? {
+                            remote_exit = true;
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        // Normal after remote shell Ctrl+D / hangup
+                        eprintln!("\r\n[mymesh] session closed ({e})\r");
+                        remote_exit = true;
+                        break;
+                    }
                 }
-                let msg: TerminalMessage = decode_msg(&frame.payload)?;
-                if !client.handle_host_msg(msg)? { break; }
             }
             input = rx_in.recv() => {
                 match input {
                     Some(data) => {
-                        conn.send_frame(Frame {
-                            channel: ChannelId::terminal(1),
-                            payload: encode_msg(&TerminalMessage::Input(data))?,
-                        }).await?;
+                        if conn
+                            .send_frame(Frame {
+                                channel: ChannelId::terminal(1),
+                                payload: encode_msg(&TerminalMessage::Input(data))?,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                     None => break,
                 }
             }
         }
     }
+    drop(client); // restore raw mode before further prints
     let _ = conn.close().await;
-    transport.shutdown().await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), transport.shutdown()).await;
+    if remote_exit {
+        eprintln!("[mymesh] shell session ended cleanly");
+    }
     Ok(())
 }
 
