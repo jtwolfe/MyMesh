@@ -1,20 +1,37 @@
 # Release handoff
 
-## Tag `v0.1.0-alpha.3`
+## Retag `v0.1.0-alpha.3`
 
 ```bash
 git checkout main
 git pull
-git tag -f v0.1.0-alpha.3
+git tag -f -a v0.1.0-alpha.3 -m "v0.1.0-alpha.3"
 git push -f origin v0.1.0-alpha.3
 ```
 
-Optional GitHub release asset:
+## Build binary (Linux)
 
 ```bash
+git checkout v0.1.0-alpha.3
 cargo build --release -p mymesh-cli
-cp target/release/mymesh /tmp/mymesh-linux-x86_64
-# gh release upload v0.1.0-alpha.3 /tmp/mymesh-linux-x86_64 --clobber
+strip target/release/mymesh   # optional
+cp target/release/mymesh ./mymesh-linux-x86_64
+# or: mymesh-linux-$(uname -m)
+sha256sum mymesh-linux-x86_64 > mymesh-linux-x86_64.sha256
 ```
 
-Docs entrypoints: [USAGE.md](USAGE.md), [ALPHA-3.md](ALPHA-3.md), root [README.md](../README.md), [CHANGELOG.md](../CHANGELOG.md).
+## Upload to GitHub Release
+
+```bash
+# create/update release notes, then upload assets
+gh release edit v0.1.0-alpha.3 --title "v0.1.0-alpha.3" --notes-file docs/RELEASE-NOTES-v0.1.0-alpha.3.md
+
+gh release upload v0.1.0-alpha.3 \
+  mymesh-linux-x86_64 \
+  mymesh-linux-x86_64.sha256 \
+  --clobber
+```
+
+Or in the GitHub UI: Releases → `v0.1.0-alpha.3` → Edit → attach binary.
+
+Docs: [USAGE.md](USAGE.md), root [README.md](../README.md), [CHANGELOG.md](../CHANGELOG.md).

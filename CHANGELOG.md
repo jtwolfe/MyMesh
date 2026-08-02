@@ -4,7 +4,7 @@ All notable changes to MyMesh are documented here. Versions follow `0.1.0-alpha.
 
 ## [0.1.0-alpha.3] — 2026-08-02
 
-Theme: **magic plane** — names, SSH, TCP, SOCKS, DNS, carrier.
+Focus: names, SSH, TCP tunnels, SOCKS, DNS, carrier join, dial proxy.
 
 ### Added
 - Labels, aliases, groups + `hosts` / `resolve`
