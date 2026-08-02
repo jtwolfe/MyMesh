@@ -164,14 +164,27 @@ pub fn cmd_ssh_config(paths: &Paths, domain: Option<String>) -> Result<()> {
 }
 
 pub async fn cmd_proxy_ssh(paths: &Paths, host: &str) -> Result<()> {
-    // Strip domain, connect to peer:22, bridge stdio as raw TCP via duplex... 
-    // SSH ProxyCommand expects stdio to be the TCP stream to sshd.
+    // OpenSSH ProxyCommand: stdout MUST be pure tunnel bytes.
+    // All diagnostics go to stderr (tracing is also stderr + quiet for this cmd).
     let store = DeviceStore::open(paths.devices_file())?;
-    let peer = resolve_device_pub(&store, host)?;
+    let peer = resolve_device_pub(&store, host).map_err(|e| {
+        anyhow::anyhow!("proxy-ssh: resolve '{host}': {e} (is the device linked? try: mymesh hosts)")
+    })?;
+    if !store.is_trusted(&peer) {
+        bail!("proxy-ssh: {host} is not trusted");
+    }
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file())?;
-    let transport = IrohTransport::bind(&identity).await?;
-    let conn = transport.connect(peer).await?;
+    let transport = IrohTransport::bind(&identity).await.map_err(|e| {
+        anyhow::anyhow!("proxy-ssh: bind transport: {e}")
+    })?;
+    let conn = transport.connect(peer).await.map_err(|e| {
+        anyhow::anyhow!(
+            "proxy-ssh: mesh connect to {}: {e}
+  (peer mymesh serve running? network/relay ok? UFW rarely blocks this path)",
+            peer.short()
+        )
+    })?;
     let session = Session::handshake_dialer(
         conn,
         &identity,
@@ -179,9 +192,9 @@ pub async fn cmd_proxy_ssh(paths: &Paths, host: &str) -> Result<()> {
         &store,
         mymesh_core::Capability::all(),
     )
-    .await?;
-    // Create a local TCP pair: connect to a temporary listener we own, bridge one side to peer:22, other is... 
-    // Better: pipe stdio directly in client_bridge-like with stdio.
+    .await
+    .map_err(|e| anyhow::anyhow!("proxy-ssh: handshake: {e}"))?;
+    // Tunnel to peer localhost:22 — requires peer agent alpha.3+ (Tcp channel) + sshd on 127.0.0.1
     ssh_stdio_bridge(session.into_conn(), 22).await?;
     let _ = transport.shutdown().await;
     Ok(())
@@ -204,15 +217,35 @@ async fn ssh_stdio_bridge(
         })?,
     })
     .await?;
+    let dial_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        let frame = conn.recv_frame().await?;
+        if std::time::Instant::now() > dial_deadline {
+            bail!(
+                "proxy-ssh: timeout waiting for TCP dial ok to peer:{}\n                   peer needs `mymesh serve` (alpha.3+) and sshd listening on 127.0.0.1:{}",
+                port, port
+            );
+        }
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), conn.recv_frame())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("proxy-ssh: recv timeout (connection stalled)")
+            })?
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "proxy-ssh: connection lost before dial: {e}\n                       usually mesh path drop, not UFW on local sshd"
+                )
+            })?;
         if frame.channel.kind != ChannelKind::Tcp {
+            // skip mesh gossip / control frames
             continue;
         }
         match decode_msg::<TcpMessage>(&frame.payload)? {
             TcpMessage::DialOk => break,
-            TcpMessage::DialErr { message } => bail!("dial: {message}"),
-            TcpMessage::Close { reason } => bail!("closed: {reason}"),
+            TcpMessage::DialErr { message } => bail!(
+                "proxy-ssh: peer could not dial 127.0.0.1:{}: {message}\n                   is sshd running on the peer? (UFW does not block localhost)",
+                port
+            ),
+            TcpMessage::Close { reason } => bail!("proxy-ssh: closed: {reason}"),
             _ => {}
         }
     }

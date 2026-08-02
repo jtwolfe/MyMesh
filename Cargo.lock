@@ -2349,6 +2349,7 @@ dependencies = [
  "directories",
  "hex",
  "indicatif",
+ "libc",
  "mymesh-core",
  "mymesh-crypto",
  "mymesh-desktop",

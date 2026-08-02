@@ -139,15 +139,26 @@ pub async fn probe_bandwidth(paths: &Paths, device: &str, bytes: u64) -> Result<
     })
     .await?;
 
-    // wait ack
-    let frame = tokio::time::timeout(Duration::from_secs(60), conn.recv_frame())
-        .await
-        .context("bw ack timeout")??;
-    let msg: FileMessage = decode_msg(&frame.payload)?;
-    match msg {
-        FileMessage::Done { .. } => {}
-        FileMessage::Error { message } => bail!("{message}"),
-        other => bail!("unexpected {other:?}"),
+    // Wait for files-channel ack. Agent may push control mesh gossip first
+    // (MembershipSnapshot = enum index 17) — never decode those as FileMessage.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if Instant::now() > deadline {
+            bail!("bw ack timeout");
+        }
+        let frame = tokio::time::timeout(Duration::from_secs(15), conn.recv_frame())
+            .await
+            .context("bw ack timeout")??;
+        if frame.channel.kind != mymesh_protocol::ChannelKind::Files {
+            continue;
+        }
+        let msg: FileMessage = decode_msg(&frame.payload)?;
+        match msg {
+            FileMessage::Done { .. } => break,
+            FileMessage::Error { message } => bail!("{message}"),
+            // Put/chunk echoes etc. — keep waiting for Done
+            _ => {}
+        }
     }
     let elapsed = t0.elapsed();
     let elapsed_ms = elapsed.as_millis() as u64;

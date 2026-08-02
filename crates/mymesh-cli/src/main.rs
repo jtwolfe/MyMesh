@@ -1,5 +1,6 @@
 //! MyMesh CLI + TUI entrypoint.
 mod install;
+mod firewall;
 mod magic_cmd;
 mod probe;
 mod tui_app;
@@ -220,6 +221,11 @@ enum Commands {
     },
     /// Magic plane help
     Magic,
+    /// Host firewall helpers (explicit only; never auto)
+    Firewall {
+        #[command(subcommand)]
+        action: FirewallCmd,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -228,6 +234,33 @@ enum MeshCmd {
     Status,
     /// Pull/push membership with all trusted peers (gossip sync)
     Sync,
+}
+
+#[derive(Subcommand, Debug)]
+enum FirewallCmd {
+    /// Explain ports and usage
+    Help,
+    /// Detect ufw/firewalld and show current state
+    Status,
+    /// Ubuntu/Debian UFW
+    Ufw {
+        #[command(subcommand)]
+        action: FirewallAction,
+    },
+    /// Fedora/RHEL firewalld
+    Firewalld {
+        #[command(subcommand)]
+        action: FirewallAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum FirewallAction {
+    Status,
+    /// Open MyMesh LAN ports (requires root)
+    Allow,
+    /// Remove MyMesh LAN rules (requires root)
+    Deny,
 }
 
 
@@ -296,12 +329,20 @@ async fn main() -> Result<()> {
         other => other,
     };
 
-    // Reduce log noise in TUI
+    // Reduce log noise in TUI. Never log to stdout: ProxyCommand / pipes need a clean stream.
     let is_tui = matches!(command, Some(Commands::Tui));
+    let is_proxy = matches!(command, Some(Commands::ProxySsh { .. }));
     if !is_tui {
+        let filter = if is_proxy {
+            // ssh ProxyCommand: keep stderr quiet unless user sets RUST_LOG
+            EnvFilter::from_default_env()
+        } else {
+            EnvFilter::from_default_env().add_directive("mymesh=info".parse()?)
+        };
         tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_default_env().add_directive("mymesh=info".parse()?))
+            .with_env_filter(filter)
             .with_target(false)
+            .with_writer(std::io::stderr)
             .init();
     }
 
@@ -429,6 +470,20 @@ async fn main() -> Result<()> {
         }
         Commands::Carrier { port } => magic_cmd::cmd_carrier(&paths, port).await?,
         Commands::Magic => magic_cmd::print_magic_help(),
+        Commands::Firewall { action } => match action {
+            FirewallCmd::Help => firewall::print_help(),
+            FirewallCmd::Status => firewall::cmd_status()?,
+            FirewallCmd::Ufw { action } => match action {
+                FirewallAction::Status => firewall::ufw_status()?,
+                FirewallAction::Allow => firewall::ufw_allow()?,
+                FirewallAction::Deny => firewall::ufw_deny()?,
+            },
+            FirewallCmd::Firewalld { action } => match action {
+                FirewallAction::Status => firewall::firewalld_status()?,
+                FirewallAction::Allow => firewall::firewalld_allow()?,
+                FirewallAction::Deny => firewall::firewalld_deny()?,
+            },
+        },
     }
     Ok(())
 }
