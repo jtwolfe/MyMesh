@@ -203,8 +203,9 @@ async fn ssh_stdio_bridge(
     use mymesh_protocol::{decode_msg, encode_msg, ChannelId, ChannelKind, Frame, TcpMessage};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use std::sync::Arc;
-    use tokio::sync::Mutex;
 
+    let conn: Arc<dyn mymesh_net::PeerConnection> = Arc::from(conn);
+    eprintln!("proxy-ssh: dialing peer localhost:{} via mesh…", port);
     conn.send_frame(Frame {
         channel: ChannelId::tcp(1),
         payload: encode_msg(&TcpMessage::Dial {
@@ -217,7 +218,8 @@ async fn ssh_stdio_bridge(
     loop {
         if std::time::Instant::now() > dial_deadline {
             bail!(
-                "proxy-ssh: timeout waiting for TCP dial ok to peer:{}\n                   peer needs `mymesh serve` (alpha.3+) and sshd listening on 127.0.0.1:{}",
+                "proxy-ssh: timeout waiting for TCP dial ok to peer:{}
+                   peer needs `mymesh serve` (alpha.3+) and sshd listening on 127.0.0.1:{}",
                 port, port
             );
         }
@@ -228,17 +230,22 @@ async fn ssh_stdio_bridge(
             })?
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "proxy-ssh: connection lost before dial: {e}\n                       usually mesh path drop, not UFW on local sshd"
+                    "proxy-ssh: connection lost before dial: {e}
+                       usually mesh path drop, not UFW on local sshd"
                 )
             })?;
         if frame.channel.kind != ChannelKind::Tcp {
-            // skip mesh gossip / control frames
+            // skip mesh gossip / control frames (membership, etc.)
             continue;
         }
         match decode_msg::<TcpMessage>(&frame.payload)? {
-            TcpMessage::DialOk => break,
+            TcpMessage::DialOk => {
+                eprintln!("proxy-ssh: dial ok — bridging stdio (OpenSSH traffic)");
+                break;
+            }
             TcpMessage::DialErr { message } => bail!(
-                "proxy-ssh: peer could not dial 127.0.0.1:{}: {message}\n                   is sshd running on the peer? (UFW does not block localhost)",
+                "proxy-ssh: peer could not dial 127.0.0.1:{}: {message}
+                   is sshd running on the peer? (UFW does not block localhost)",
                 port
             ),
             TcpMessage::Close { reason } => bail!("proxy-ssh: closed: {reason}"),
@@ -246,8 +253,8 @@ async fn ssh_stdio_bridge(
         }
     }
 
-    let conn = Arc::new(Mutex::new(conn));
-    let c1 = conn.clone();
+    // Full duplex: never hold a lock across both send and recv.
+    let c_up = conn.clone();
     let up = async move {
         let mut stdin = tokio::io::stdin();
         let mut buf = vec![0u8; 32 * 1024];
@@ -264,20 +271,16 @@ async fn ssh_stdio_bridge(
                 })
                 .unwrap_or_default(),
             };
-            if c1.lock().await.send_frame(fr).await.is_err() {
+            if c_up.send_frame(fr).await.is_err() {
                 break;
             }
         }
     };
-    let c2 = conn.clone();
+    let c_dn = conn.clone();
     let down = async move {
         let mut stdout = tokio::io::stdout();
         loop {
-            let frame = {
-                let g = c2.lock().await;
-                g.recv_frame().await
-            };
-            let frame = match frame {
+            let frame = match c_dn.recv_frame().await {
                 Ok(f) => f,
                 Err(_) => break,
             };
@@ -292,16 +295,20 @@ async fn ssh_stdio_bridge(
                     let _ = stdout.flush().await;
                 }
                 Ok(TcpMessage::Close { .. }) => break,
-                _ => {}
+                Ok(_) => {}
+                Err(_) => break,
             }
         }
     };
+
     tokio::select! {
         _ = up => {}
         _ = down => {}
     }
+    let _ = conn.close().await;
     Ok(())
 }
+
 
 pub async fn cmd_expose(paths: &Paths, device: &str, port: u16, local_port: Option<u16>) -> Result<()> {
     let local_port = local_port.unwrap_or(port);

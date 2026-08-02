@@ -223,6 +223,8 @@ impl Agent {
         if self.config.daemon.enable_desktop {
             offered.push(Capability::Desktop);
         }
+        // Always offer TCP tunnels when agent is up (magic / proxy-ssh / expose).
+        offered.push(Capability::Tcp);
 
         let session =
             Session::handshake_acceptor(conn, &identity, &self.label, &store, offered).await?;

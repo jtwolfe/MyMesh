@@ -12,6 +12,7 @@ use mymesh_protocol::{read_frame, write_frame, Frame};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -39,7 +40,6 @@ pub async fn serve_dial_proxy(path: PathBuf, transport: Arc<IrohTransport>) -> R
     let listener = UnixListener::bind(&path).map_err(|e| {
         Error::Session(format!("bind control socket {}: {e}", path.display()))
     })?;
-    // Best-effort private socket
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -97,10 +97,10 @@ async fn handle_proxy_client(mut stream: UnixStream, transport: Arc<IrohTranspor
 
 async fn relay_frames(stream: UnixStream, conn: Box<dyn PeerConnection>) -> Result<()> {
     let (rh, wh) = stream.into_split();
-    let read_half = Arc::new(Mutex::new(rh));
     let write_half = Arc::new(Mutex::new(wh));
     let conn: Arc<dyn PeerConnection> = Arc::from(conn);
 
+    // iroh → uds
     let c1 = conn.clone();
     let w1 = write_half.clone();
     let up = async move {
@@ -116,16 +116,14 @@ async fn relay_frames(stream: UnixStream, conn: Box<dyn PeerConnection>) -> Resu
         }
     };
 
+    // uds → iroh
     let c2 = conn.clone();
-    let r2 = read_half.clone();
     let down = async move {
+        let mut r = rh;
         loop {
-            let frame = {
-                let mut r = r2.lock().await;
-                match read_frame(&mut *r).await {
-                    Ok(f) => f,
-                    Err(_) => break,
-                }
+            let frame = match read_frame(&mut r).await {
+                Ok(f) => f,
+                Err(_) => break,
             };
             if c2.send_frame(frame).await.is_err() {
                 break;
@@ -181,15 +179,20 @@ pub async fn connect_via_agent(path: &Path, peer: DeviceId) -> Result<Box<dyn Pe
     if status[0] != OK {
         return Err(Error::Session("bad proxy status".into()));
     }
+
+    let (rh, wh) = stream.into_split();
     Ok(Box::new(UdsFrameConn {
         peer,
-        stream: Mutex::new(stream),
+        read: Mutex::new(rh),
+        write: Mutex::new(wh),
     }))
 }
 
+/// Full-duplex frame conn over a split UnixStream (send ∥ recv without deadlock).
 struct UdsFrameConn {
     peer: DeviceId,
-    stream: Mutex<UnixStream>,
+    read: Mutex<OwnedReadHalf>,
+    write: Mutex<OwnedWriteHalf>,
 }
 
 #[async_trait]
@@ -199,47 +202,76 @@ impl PeerConnection for UdsFrameConn {
     }
 
     async fn send_frame(&self, frame: Frame) -> Result<()> {
-        let mut s = self.stream.lock().await;
-        write_frame(&mut *s, &frame)
+        let mut w = self.write.lock().await;
+        write_frame(&mut *w, &frame)
             .await
             .map_err(|e| Error::Session(format!("proxy send: {e}")))
     }
 
     async fn recv_frame(&self) -> Result<Frame> {
-        let mut s = self.stream.lock().await;
-        read_frame(&mut *s)
+        let mut r = self.read.lock().await;
+        read_frame(&mut *r)
             .await
             .map_err(|e| Error::Session(format!("proxy recv: {e}")))
     }
 
     async fn close(&self) -> Result<()> {
-        // Dropping the stream is enough; optional shutdown
         Ok(())
     }
 }
 
 /// Prefer agent proxy; only direct-bind if no agent (with a clear log risk).
+fn control_sock_candidates(preferred: &Path) -> Vec<PathBuf> {
+    let mut out = vec![preferred.to_path_buf()];
+    out.push(default_control_socket());
+    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        out.push(PathBuf::from(runtime).join("mymesh.sock"));
+    }
+    // OpenSSH ProxyCommand often has no XDG_RUNTIME_DIR — probe common user runtimes.
+    if let Ok(uid) = std::env::var("UID") {
+        out.push(PathBuf::from(format!("/run/user/{uid}/mymesh.sock")));
+    }
+    #[cfg(unix)]
+    {
+        if let Ok(rd) = std::fs::read_dir("/run/user") {
+            for e in rd.flatten() {
+                out.push(e.path().join("mymesh.sock"));
+            }
+        }
+    }
+    out.push(PathBuf::from("/tmp/mymesh.sock"));
+    out.sort();
+    out.dedup();
+    // keep preferred first
+    let mut ordered = vec![preferred.to_path_buf()];
+    for p in out {
+        if p != preferred {
+            ordered.push(p);
+        }
+    }
+    ordered
+}
+
 pub async fn connect_mesh(
     identity: &mymesh_crypto::Identity,
     peer: DeviceId,
     control_sock: &Path,
 ) -> Result<(Box<dyn PeerConnection>, Option<IrohTransport>)> {
-    if agent_proxy_available(control_sock) {
-        match connect_via_agent(control_sock, peer).await {
+    for sock in control_sock_candidates(control_sock) {
+        if !agent_proxy_available(&sock) {
+            continue;
+        }
+        match connect_via_agent(&sock, peer).await {
             Ok(c) => return Ok((c, None)),
             Err(e) => {
-                warn!(
-                    %e,
-                    "agent dial proxy failed — falling back to direct bind (may conflict with serve)"
-                );
+                warn!(%e, path = %sock.display(), "agent dial proxy failed — try next");
             }
         }
-    } else {
-        warn!(
-            "no agent dial proxy at {} — direct iroh bind (start `mymesh serve` for stable mesh)",
-            control_sock.display()
-        );
     }
+    warn!(
+        "no working agent dial proxy (tried {}) — direct iroh bind (may conflict with serve)",
+        control_sock.display()
+    );
     let transport = IrohTransport::bind(identity).await?;
     let conn = transport.connect(peer).await?;
     Ok((conn, Some(transport)))

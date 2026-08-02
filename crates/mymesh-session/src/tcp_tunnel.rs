@@ -5,7 +5,6 @@ use mymesh_protocol::{decode_msg, encode_msg, ChannelId, ChannelKind, Frame, Tcp
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 use tracing::debug;
 
 const CH: u32 = 1;
@@ -24,6 +23,7 @@ pub async fn client_bridge(
     port: u16,
     host: Option<String>,
 ) -> Result<()> {
+    let conn: Arc<dyn PeerConnection> = Arc::from(conn);
     conn.send_frame(tcp_frame(&TcpMessage::Dial { port, host })?)
         .await?;
     loop {
@@ -58,8 +58,10 @@ pub async fn host_bridge(conn: Box<dyn PeerConnection>, first_payload: &[u8]) ->
     };
     let target = host.unwrap_or_else(|| "127.0.0.1".into());
     let addr = format!("{target}:{port}");
+    let conn: Arc<dyn PeerConnection> = Arc::from(conn);
     match TcpStream::connect(&addr).await {
         Ok(remote) => {
+            let _ = remote.set_nodelay(true);
             conn.send_frame(tcp_frame(&TcpMessage::DialOk)?).await?;
             pipe_conn_stream(conn, remote).await
         }
@@ -74,8 +76,10 @@ pub async fn host_bridge(conn: Box<dyn PeerConnection>, first_payload: &[u8]) ->
     }
 }
 
-async fn pipe_conn_stream(conn: Box<dyn PeerConnection>, stream: TcpStream) -> Result<()> {
-    let conn = Arc::new(Mutex::new(conn));
+/// Full duplex: PeerConnection already serializes send/recv independently (IrohConn /
+/// UdsFrameConn). Never wrap the whole conn in one mutex across await points.
+async fn pipe_conn_stream(conn: Arc<dyn PeerConnection>, stream: TcpStream) -> Result<()> {
+    let _ = stream.set_nodelay(true);
     let (mut rd, mut wr) = stream.into_split();
 
     let c_up = conn.clone();
@@ -93,25 +97,21 @@ async fn pipe_conn_stream(conn: Box<dyn PeerConnection>, stream: TcpStream) -> R
                 Ok(f) => f,
                 Err(_) => break,
             };
-            if c_up.lock().await.send_frame(fr).await.is_err() {
+            if c_up.send_frame(fr).await.is_err() {
                 break;
             }
         }
         if let Ok(fr) = tcp_frame(&TcpMessage::Close {
             reason: "eof".into(),
         }) {
-            let _ = c_up.lock().await.send_frame(fr).await;
+            let _ = c_up.send_frame(fr).await;
         }
     };
 
     let c_dn = conn.clone();
     let down = async move {
         loop {
-            let frame = {
-                let g = c_dn.lock().await;
-                g.recv_frame().await
-            };
-            let frame = match frame {
+            let frame = match c_dn.recv_frame().await {
                 Ok(f) => f,
                 Err(_) => break,
             };
@@ -123,6 +123,7 @@ async fn pipe_conn_stream(conn: Box<dyn PeerConnection>, stream: TcpStream) -> R
                     if wr.write_all(&data).await.is_err() {
                         break;
                     }
+                    let _ = wr.flush().await;
                 }
                 Ok(TcpMessage::Close { .. }) => break,
                 Ok(_) => {}
@@ -136,6 +137,6 @@ async fn pipe_conn_stream(conn: Box<dyn PeerConnection>, stream: TcpStream) -> R
         _ = down => {}
     }
     debug!("tcp pipe done");
-    let _ = conn.lock().await.close().await;
+    let _ = conn.close().await;
     Ok(())
 }
