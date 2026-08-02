@@ -731,7 +731,7 @@ async fn cmd_link_help(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_arm(paths: &Paths, secs: Option<u64>) -> Result<()> {
+pub(crate) async fn cmd_arm(paths: &Paths, secs: Option<u64>) -> Result<()> {
     let cfg = Config::load(paths.config_file())?;
     let ttl = secs.unwrap_or(cfg.limits.arm_timeout_secs);
     let state = ArmState::arm(paths.arm_file(), ttl)?;
@@ -747,7 +747,7 @@ async fn cmd_arm(paths: &Paths, secs: Option<u64>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_arm_status(paths: &Paths) -> Result<()> {
+pub(crate) async fn cmd_arm_status(paths: &Paths) -> Result<()> {
     let arm = ArmState::load(paths.arm_file())?;
     if arm.is_effectively_armed() {
         println!("armed until {:?}", arm.until);
@@ -757,7 +757,7 @@ async fn cmd_arm_status(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_requests_list(paths: &Paths) -> Result<()> {
+pub(crate) async fn cmd_requests_list(paths: &Paths) -> Result<()> {
     let joins = JoinStore::open(paths.join_dir())?;
     let list = joins.list_pending()?;
     if list.is_empty() {
@@ -776,7 +776,7 @@ async fn cmd_requests_list(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_requests_decide(
+pub(crate) async fn cmd_requests_decide(
     paths: &Paths,
     device: &str,
     accept: bool,
@@ -822,7 +822,7 @@ fn resolve_pending(
     }
 }
 
-async fn cmd_link_join(paths: &Paths, target: &str) -> Result<()> {
+pub(crate) async fn cmd_link_join(paths: &Paths, target: &str) -> Result<()> {
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file())?;
     let mut store = DeviceStore::open(paths.devices_file())?;
@@ -988,7 +988,7 @@ async fn cmd_devices(paths: &Paths, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_unlink(paths: &Paths, device: &str) -> Result<()> {
+pub(crate) async fn cmd_unlink(paths: &Paths, device: &str) -> Result<()> {
     let mut store = DeviceStore::open(paths.devices_file())?;
     let id = resolve_device(&store, device)?;
     store.revoke(&id)?;

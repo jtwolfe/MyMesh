@@ -8,7 +8,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use mymesh_core::{ArmState, Config, DeviceStore, JoinStore, MeshState, Paths, PeerMetrics, PendingKickStore};
+use mymesh_core::{TrustState, ArmState, Config, DeviceStore, JoinStore, MeshState, Paths, PeerMetrics, PendingKickStore};
 use mymesh_crypto::{device_id_to_words, device_join_uri, Identity};
 use mymesh_protocol::FileEntry;
 use qrcode::QrCode;
@@ -187,6 +187,34 @@ struct KickWizard {
     target_label: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PromptKind {
+    None,
+    LinkJoin,
+    ArmSecs,
+    Label,
+    Alias,
+    Group,
+    UnlinkConfirm,
+    #[allow(dead_code)]
+    DenyRequest,
+    ExposePort,
+}
+
+impl Default for PromptKind {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+#[derive(Clone, Default)]
+struct Prompt {
+    kind: PromptKind,
+    title: String,
+    hint: String,
+    buf: String,
+}
+
 struct App {
     paths: Paths,
     tab: Tab,
@@ -200,6 +228,13 @@ struct App {
     term: TermPane,
     poll: PeerPoll,
     kick: KickWizard,
+    prompt: Prompt,
+    /// Active carrier page URL (if started from TUI)
+    carrier_url: Option<String>,
+    /// Scrollable detail text for Status tab extras
+    detail: String,
+    /// Pending join list selection index on Home
+    req_sel: usize,
     /// Last *applied* terminal size (backend buffer).
     term_size: (u16, u16),
     /// Most recent size observed from the OS (may be mid-animation).
@@ -266,6 +301,10 @@ pub async fn run_tui(paths: Paths) -> Result<()> {
             max_duration: Duration::from_secs(300),
         },
         kick: KickWizard::default(),
+        prompt: Prompt::default(),
+        carrier_url: None,
+        detail: String::new(),
+        req_sel: 0,
         term_size: (0, 0),
         pending_size: None,
         pending_since: None,
@@ -503,6 +542,12 @@ async fn run_loop(
     loop {
         // drain terminal VT output (non-blocking)
         term_pane::drain_output(&mut app.term);
+        if app.carrier_url.is_some() {
+            if let Ok(Some(msg)) = crate::magic_cmd::poll_carrier_join(&app.paths).await {
+                app.status = msg;
+                // keep page up for more joins
+            }
+        }
         if app.tab == Tab::Term {
             term_pane::refresh_peers(&app.paths, &mut app.term);
             term_pane::maybe_resize(&mut app.term);
@@ -598,6 +643,27 @@ async fn run_loop(
 }
 
 async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+    // modal text prompt captures keys first
+    if app.prompt.kind != PromptKind::None {
+        match code {
+            KeyCode::Esc => {
+                app.prompt = Prompt::default();
+                app.status = "cancelled".into();
+            }
+            KeyCode::Backspace => {
+                app.prompt.buf.pop();
+            }
+            KeyCode::Enter => {
+                submit_prompt(app).await;
+            }
+            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+                app.prompt.buf.push(c);
+            }
+            _ => {}
+        }
+        return;
+    }
+
     // global tab keys
     match code {
         KeyCode::Char('q') | KeyCode::Esc if app.tab != Tab::Term || !app.term.active => {
@@ -703,9 +769,36 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
     match app.tab {
         Tab::Home => match code {
             KeyCode::Char('a') => arm(app),
+            KeyCode::Char('A') => start_prompt(
+                app,
+                PromptKind::ArmSecs,
+                "Arm duration (seconds)",
+                "e.g. 300  (empty = default)",
+            ),
             KeyCode::Char('d') => disarm(app),
             KeyCode::Char('y') => accept_first(app),
+            KeyCode::Char('n') => deny_selected_request(app).await,
             KeyCode::Char('c') => copy_id(app),
+            KeyCode::Char('w') => show_words(app),
+            KeyCode::Char('u') => show_uri(app),
+            KeyCode::Char('l') => start_prompt(
+                app,
+                PromptKind::LinkJoin,
+                "Link by device id",
+                "paste hex id or 24 words, then Enter",
+            ),
+            KeyCode::Char('C') => start_carrier(app).await,
+            KeyCode::Char('h') => {
+                app.detail = crate::magic_cmd::hosts_text(&app.paths)
+                    .unwrap_or_else(|e| e.to_string());
+                app.status = "hosts listed in status detail — switch to Status or see Home right panel".into();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.req_sel = app.req_sel.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.req_sel = app.req_sel.saturating_add(1);
+            }
             _ => {}
         },
         Tab::Peers => {
@@ -794,6 +887,49 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             }
             KeyCode::Char('K') => start_kick_wizard(app, false),
             KeyCode::Char('F') => start_kick_wizard(app, true),
+            KeyCode::Char('U') => start_unlink(app),
+            KeyCode::Char('L') => start_prompt(
+                app,
+                PromptKind::Label,
+                "Rename peer label",
+                "new label for selected peer",
+            ),
+            KeyCode::Char('a') => start_prompt(
+                app,
+                PromptKind::Alias,
+                "Add alias",
+                "alias for selected peer (e.g. laptop)",
+            ),
+            KeyCode::Char('G') => start_prompt(
+                app,
+                PromptKind::Group,
+                "Add group",
+                "group tag for selected peer",
+            ),
+            KeyCode::Char('P') => {
+                app.status = "probe-all…".into();
+                match crate::probe::probe_all(&app.paths).await {
+                    Ok(rows) => {
+                        let n = rows.len();
+                        let mut s = String::from("probe-all:\n");
+                        for (l, r) in rows {
+                            match r {
+                                Ok(ms) => s.push_str(&format!("  {l}: {ms} ms\n")),
+                                Err(e) => s.push_str(&format!("  {l}: ERR {e}\n")),
+                            }
+                        }
+                        app.detail = s;
+                        app.status = format!("probe-all done ({n} peers)");
+                    }
+                    Err(e) => app.status = format!("probe-all: {e}"),
+                }
+            }
+            KeyCode::Char('e') => start_prompt(
+                app,
+                PromptKind::ExposePort,
+                "Expose remote port",
+                "port number on selected peer (e.g. 8080)",
+            ),
             _ => {}
           }
         }
@@ -911,6 +1047,60 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 let _ = crate::install::cmd_service("restart", false);
                 app.status = "service restart requested".into();
             }
+            KeyCode::Char('f') => {
+                app.detail = crate::firewall::tui_summary();
+                app.status = "firewall summary in detail pane".into();
+            }
+            KeyCode::Char('F') => {
+                app.status = "firewall open (pkexec/sudo)…".into();
+                match crate::firewall::tui_try_open_carrier() {
+                    Ok(m) => app.status = m,
+                    Err(e) => {
+                        app.detail = format!("{e}");
+                        app.status = "firewall needs elevation — see detail / status".into();
+                    }
+                }
+            }
+            KeyCode::Char('S') => {
+                match crate::magic_cmd::ssh_config_text(&app.paths, None) {
+                    Ok(txt) => {
+                        app.detail = txt;
+                        app.status = "ssh config in detail (copy from terminal if needed)".into();
+                    }
+                    Err(e) => app.status = format!("ssh-config: {e}"),
+                }
+            }
+            KeyCode::Char('m') => {
+                match crate::magic_cmd::magic_status_text(&app.paths) {
+                    Ok(txt) => {
+                        app.detail = txt;
+                        app.status = "magic plane status".into();
+                    }
+                    Err(e) => app.status = format!("magic: {e}"),
+                }
+            }
+            KeyCode::Char('h') => {
+                match crate::magic_cmd::hosts_text(&app.paths) {
+                    Ok(txt) => {
+                        app.detail = txt;
+                        app.status = "hosts".into();
+                    }
+                    Err(e) => app.status = format!("hosts: {e}"),
+                }
+            }
+            KeyCode::Char('i') => {
+                app.status = "reinstall user unit…".into();
+                match crate::install::cmd_install(&app.paths, false, false, None) {
+                    Ok(()) => app.status = "install ok — check agent line".into(),
+                    Err(e) => app.status = format!("install: {e}"),
+                }
+            }
+            KeyCode::Char('j') => {
+                match crate::magic_cmd::hosts_text(&app.paths) {
+                    Ok(txt) => app.detail = format!("devices/hosts\n{txt}"),
+                    Err(e) => app.detail = e.to_string(),
+                }
+            }
             _ => {}
         },
     }
@@ -957,9 +1147,24 @@ fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
 async fn click_button(app: &mut App, id: &str) {
     match id {
         "arm" => arm(app),
+        "arm_secs" => start_prompt(
+            app,
+            PromptKind::ArmSecs,
+            "Arm duration (seconds)",
+            "e.g. 300",
+        ),
         "disarm" => disarm(app),
         "accept" => accept_first(app),
+        "deny" => deny_selected_request(app).await,
+        "link" => start_prompt(
+            app,
+            PromptKind::LinkJoin,
+            "Link by device id",
+            "hex or 24 words",
+        ),
+        "carrier" => start_carrier(app).await,
         "copy_id" => copy_id(app),
+        "words" => show_words(app),
         "ping" => ping_sel(app).await,
         "bw" => bw_sel(app).await,
         "metrics" => metrics_sel(app).await,
@@ -984,6 +1189,31 @@ async fn click_button(app: &mut App, id: &str) {
         }
         "kick" => start_kick_wizard(app, false),
         "force_kick" => start_kick_wizard(app, true),
+        "probe_all" => {
+            app.status = "probe-all…".into();
+            match crate::probe::probe_all(&app.paths).await {
+                Ok(rows) => {
+                    let mut s = String::from("probe-all:
+");
+                    for (l, r) in rows {
+                        match r {
+                            Ok(ms) => s.push_str(&format!("  {l}: {ms} ms
+")),
+                            Err(e) => s.push_str(&format!("  {l}: ERR {e}
+")),
+                        }
+                    }
+                    app.detail = s;
+                    app.status = "probe-all done".into();
+                }
+                Err(e) => app.status = format!("probe-all: {e}"),
+            }
+        }
+        "label" => start_prompt(app, PromptKind::Label, "Rename peer label", "new label"),
+        "alias" => start_prompt(app, PromptKind::Alias, "Add alias", "alias name"),
+        "group" => start_prompt(app, PromptKind::Group, "Add group", "group tag"),
+        "unlink" => start_unlink(app),
+        "expose" => start_prompt(app, PromptKind::ExposePort, "Expose port", "remote port number"),
         "copy_lr" => transfer_selected(app).await,
         "clear_sel" => {
             app.files.selected.clear();
@@ -1030,6 +1260,53 @@ async fn click_button(app: &mut App, id: &str) {
         "svc_restart" => {
             let _ = crate::install::cmd_service("restart", false);
         }
+        "fw_info" => {
+            app.detail = crate::firewall::tui_summary();
+            app.status = "firewall summary".into();
+        }
+        "fw_open" => {
+            app.status = "firewall open…".into();
+            match crate::firewall::tui_try_open_carrier() {
+                Ok(m) => app.status = m,
+                Err(e) => {
+                    app.detail = format!("{e}");
+                    app.status = "needs elevation — see detail".into();
+                }
+            }
+        }
+        "ssh_cfg" => {
+            match crate::magic_cmd::ssh_config_text(&app.paths, None) {
+                Ok(txt) => {
+                    app.detail = txt;
+                    app.status = "ssh config".into();
+                }
+                Err(e) => app.status = format!("ssh-config: {e}"),
+            }
+        }
+        "magic" => {
+            match crate::magic_cmd::magic_status_text(&app.paths) {
+                Ok(txt) => {
+                    app.detail = txt;
+                    app.status = "magic".into();
+                }
+                Err(e) => app.status = format!("magic: {e}"),
+            }
+        }
+        "hosts" => {
+            match crate::magic_cmd::hosts_text(&app.paths) {
+                Ok(txt) => {
+                    app.detail = txt;
+                    app.status = "hosts".into();
+                }
+                Err(e) => app.status = format!("hosts: {e}"),
+            }
+        }
+        "install" => {
+            match crate::install::cmd_install(&app.paths, false, false, None) {
+                Ok(()) => app.status = "install ok".into(),
+                Err(e) => app.status = format!("install: {e}"),
+            }
+        }
         "quit" => app.should_quit = true,
         _ => {}
     }
@@ -1063,6 +1340,214 @@ fn copy_id(app: &mut App) {
         app.status = format!("id {}", id.device_id());
     }
 }
+
+fn start_prompt(app: &mut App, kind: PromptKind, title: &str, hint: &str) {
+    app.prompt = Prompt {
+        kind,
+        title: title.into(),
+        hint: hint.into(),
+        buf: String::new(),
+    };
+    app.status = format!("{title} — type then Enter (Esc cancel)");
+}
+
+fn show_words(app: &mut App) {
+    if let Ok(id) = Identity::load_or_create(app.paths.identity_file()) {
+        if let Ok(w) = device_id_to_words(&id.device_id()) {
+            app.detail = w.clone();
+            app.status = "24-word id in detail / home".into();
+        }
+    }
+}
+
+fn show_uri(app: &mut App) {
+    if let Ok(id) = Identity::load_or_create(app.paths.identity_file()) {
+        if let Ok(u) = device_join_uri(&id.device_id()) {
+            app.detail = u.clone();
+            app.status = format!("uri: {u}");
+        }
+    }
+}
+
+async fn start_carrier(app: &mut App) {
+    app.status = "starting carrier…".into();
+    match crate::magic_cmd::start_carrier_ui(&app.paths, 17878).await {
+        Ok(url) => {
+            app.carrier_url = Some(url.clone());
+            app.detail = format!(
+                "Connect-by-carrier\n\nOpen on phone (same LAN):\n  {url}\n\n\
+Other machine: mymesh id --uri (or show QR) → paste/scan on phone page.\n\
+Firewall: if phone times out, Status → [F] Open or:\n  {}\n",
+                crate::firewall::sudo_firewall_cmd("ufw allow")
+            );
+            app.status = format!("carrier: {url}");
+        }
+        Err(e) => app.status = format!("carrier: {e}"),
+    }
+}
+
+fn start_unlink(app: &mut App) {
+    let peers = load_peers(&app.paths);
+    if peers.is_empty() {
+        app.status = "no peers".into();
+        return;
+    }
+    let i = app.peer_sel.min(peers.len() - 1);
+    let id = peers[i].0.clone();
+    let label = peers[i].1.clone();
+    start_prompt(
+        app,
+        PromptKind::UnlinkConfirm,
+        &format!("Unlink {label}"),
+        "type UNLINK to confirm",
+    );
+    app.prompt.buf = String::new();
+    // stash target in status-side: reuse kick target field lightly
+    app.kick.target = Some(id);
+    app.kick.target_label = label;
+}
+
+async fn deny_selected_request(app: &mut App) {
+    let pending = JoinStore::open(app.paths.join_dir())
+        .ok()
+        .and_then(|j| j.list_pending().ok())
+        .unwrap_or_default();
+    if pending.is_empty() {
+        app.status = "no pending requests".into();
+        return;
+    }
+    let i = app.req_sel.min(pending.len() - 1);
+    let id = pending[i].device_id.to_string();
+    match crate::cmd_requests_decide(&app.paths, &id, false, "denied from TUI").await {
+        Ok(()) => app.status = format!("denied {}", &id[..8.min(id.len())]),
+        Err(e) => app.status = format!("deny: {e}"),
+    }
+}
+
+async fn submit_prompt(app: &mut App) {
+    let kind = app.prompt.kind;
+    let buf = app.prompt.buf.trim().to_string();
+    app.prompt = Prompt::default();
+    match kind {
+        PromptKind::None => {}
+        PromptKind::LinkJoin => {
+            if buf.is_empty() {
+                app.status = "empty link target".into();
+                return;
+            }
+            app.status = "linking…".into();
+            match crate::cmd_link_join(&app.paths, &buf).await {
+                Ok(()) => app.status = "link/join sent (host must accept if needed)".into(),
+                Err(e) => app.status = format!("link: {e}"),
+            }
+        }
+        PromptKind::ArmSecs => {
+            let secs = if buf.is_empty() {
+                None
+            } else {
+                match buf.parse::<u64>() {
+                    Ok(n) => Some(n),
+                    Err(_) => {
+                        app.status = "invalid seconds".into();
+                        return;
+                    }
+                }
+            };
+            match crate::cmd_arm(&app.paths, secs).await {
+                Ok(()) => app.status = format!("armed ({secs:?} secs)"),
+                Err(e) => app.status = format!("arm: {e}"),
+            }
+        }
+        PromptKind::Label => {
+            let peers = load_peers(&app.paths);
+            if peers.is_empty() || buf.is_empty() {
+                app.status = "need peer + label".into();
+                return;
+            }
+            let id = &peers[app.peer_sel.min(peers.len() - 1)].0;
+            match crate::magic_cmd::cmd_label(&app.paths, id, &buf).await {
+                Ok(()) => app.status = format!("label → {buf}"),
+                Err(e) => app.status = format!("label: {e}"),
+            }
+        }
+        PromptKind::Alias => {
+            let peers = load_peers(&app.paths);
+            if peers.is_empty() || buf.is_empty() {
+                app.status = "need peer + alias".into();
+                return;
+            }
+            let id = &peers[app.peer_sel.min(peers.len() - 1)].0;
+            match crate::magic_cmd::cmd_alias(&app.paths, id, &buf, false).await {
+                Ok(()) => app.status = format!("alias {buf}"),
+                Err(e) => app.status = format!("alias: {e}"),
+            }
+        }
+        PromptKind::Group => {
+            let peers = load_peers(&app.paths);
+            if peers.is_empty() || buf.is_empty() {
+                app.status = "need peer + group".into();
+                return;
+            }
+            let id = &peers[app.peer_sel.min(peers.len() - 1)].0;
+            match crate::magic_cmd::cmd_group(&app.paths, id, &buf, false).await {
+                Ok(()) => app.status = format!("group {buf}"),
+                Err(e) => app.status = format!("group: {e}"),
+            }
+        }
+        PromptKind::UnlinkConfirm => {
+            if buf != "UNLINK" {
+                app.status = "unlink cancelled (type UNLINK exactly)".into();
+                return;
+            }
+            if let Some(id) = app.kick.target.take() {
+                match crate::cmd_unlink(&app.paths, &id).await {
+                    Ok(()) => app.status = format!("unlinked {}", app.kick.target_label),
+                    Err(e) => app.status = format!("unlink: {e}"),
+                }
+            }
+        }
+        PromptKind::DenyRequest => {
+            deny_selected_request(app).await;
+        }
+        PromptKind::ExposePort => {
+            let peers = load_peers(&app.paths);
+            if peers.is_empty() {
+                app.status = "no peers".into();
+                return;
+            }
+            let port: u16 = match buf.parse() {
+                Ok(p) => p,
+                Err(_) => {
+                    app.status = "invalid port".into();
+                    return;
+                }
+            };
+            let id = peers[app.peer_sel.min(peers.len() - 1)].0.clone();
+            app.status = format!("expose {id}:{port} (blocking until stopped)…");
+            // spawn so TUI stays alive
+            let paths = app.paths.clone();
+            tokio::spawn(async move {
+                let _ = crate::magic_cmd::cmd_expose(&paths, &id, port, None).await;
+            });
+            app.status = format!(
+                "expose listening locally on {port} → peer (background). Check CLI logs if needed."
+            );
+        }
+    }
+}
+
+fn load_peers(paths: &Paths) -> Vec<(String, String)> {
+    DeviceStore::open(paths.devices_file())
+        .map(|s| {
+            s.list()
+                .into_iter()
+                .filter(|d| matches!(d.trust, TrustState::Trusted))
+                .map(|d| (d.id.to_string(), d.label.as_str().to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 
 async fn ping_sel(app: &mut App) {
     if let Some(id) = selected_peer_id(app) {
@@ -1718,6 +2203,7 @@ async fn pull_file_helper(
 
 // ─── UI ──────────────────────────────────────────────────────────────
 fn ui(f: &mut TuiFrame, app: &mut App) {
+    // prompt drawn last
     app.buttons.clear();
     app.tab_rects.clear();
 
@@ -1778,6 +2264,7 @@ fn ui(f: &mut TuiFrame, app: &mut App) {
         Tab::Term => term_pane::draw(f, content, &mut app.term),
         Tab::Status => draw_status(f, content, app),
     }
+    draw_prompt_overlay(f, app);
     draw_status_line(f, status, app);
 }
 
@@ -1946,9 +2433,14 @@ fn draw_action_bar(f: &mut TuiFrame, area: Rect, app: &mut App) {
     let specs: Vec<(&str, &str)> = match app.tab {
         Tab::Home => vec![
             ("arm", "[a] Arm"),
+            ("arm_secs", "[A] Arm…"),
             ("disarm", "[d] Disarm"),
             ("accept", "[y] Accept"),
-            ("copy_id", "[c] Show ID"),
+            ("deny", "[n] Deny"),
+            ("link", "[l] Link"),
+            ("carrier", "[C] Carrier"),
+            ("copy_id", "[c] ID"),
+            ("words", "[w] Words"),
             ("quit", "[q] Quit"),
         ],
         Tab::Peers => vec![
@@ -1957,6 +2449,12 @@ fn draw_action_bar(f: &mut TuiFrame, area: Rect, app: &mut App) {
             ("metrics", "[m] Metrics"),
             ("poll", "[t] Poll"),
             ("mesh_sync", "[g] Sync"),
+            ("probe_all", "[P] All"),
+            ("label", "[L] Label"),
+            ("alias", "[a] Alias"),
+            ("group", "[G] Group"),
+            ("unlink", "[U] Unlink"),
+            ("expose", "[e] Expose"),
             ("kick", "[K] Kick"),
             ("force_kick", "[F] Force"),
             ("quit", "[q] Quit"),
@@ -1979,6 +2477,12 @@ fn draw_action_bar(f: &mut TuiFrame, area: Rect, app: &mut App) {
             ("svc_start", "[s] Start"),
             ("svc_stop", "[x] Stop"),
             ("svc_restart", "[r] Restart"),
+            ("fw_info", "[f] FW"),
+            ("fw_open", "[F] Open"),
+            ("ssh_cfg", "[S] SSH"),
+            ("magic", "[m] Magic"),
+            ("hosts", "[h] Hosts"),
+            ("install", "[i] Install"),
             ("quit", "[q] Quit"),
         ],
     };
@@ -2013,6 +2517,46 @@ fn draw_action_bar(f: &mut TuiFrame, area: Rect, app: &mut App) {
         };
         push_btn(app, f, id, label, r, hot);
         x = x.saturating_add(w);
+    }
+}
+
+
+
+fn draw_prompt_overlay(f: &mut TuiFrame, app: &App) {
+    if app.prompt.kind == PromptKind::None {
+        return;
+    }
+    let area = centered_rect(70, 7, f.area());
+    f.render_widget(Clear, area);
+    let text = format!(
+        "{}\n{}\n\n> {}\n\nEnter confirm · Esc cancel",
+        app.prompt.title,
+        app.prompt.hint,
+        app.prompt.buf
+    );
+    f.render_widget(
+        Paragraph::new(text)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" input ")
+                    .border_style(Style::default().fg(C_ACCENT))
+                    .style(Style::default().bg(Color::Rgb(24, 24, 36))),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn centered_rect(pct_x: u16, height: u16, r: Rect) -> Rect {
+    let w = (r.width as u32 * pct_x as u32 / 100) as u16;
+    let x = r.x + (r.width.saturating_sub(w)) / 2;
+    let y = r.y + (r.height.saturating_sub(height)) / 2;
+    Rect {
+        x,
+        y,
+        width: w.max(20),
+        height: height.min(r.height),
     }
 }
 
@@ -2097,6 +2641,14 @@ fn draw_home(f: &mut TuiFrame, area: Rect, app: &App) {
             }
         }
     }
+    if let Some(url) = &app.carrier_url {
+        left_lines.push(Line::from(Span::styled(
+            "Carrier active",
+            Style::default().fg(C_OK).add_modifier(Modifier::BOLD),
+        )));
+        left_lines.push(Line::from(Span::raw(format!("  {url}"))));
+        left_lines.push(Line::from(""));
+    }
     left_lines.push(Line::from(""));
     left_lines.push(Line::from(Span::styled(
         format!("Pending joins ({})", pending.len()),
@@ -2108,9 +2660,14 @@ fn draw_home(f: &mut TuiFrame, area: Rect, app: &App) {
             Style::default().fg(C_MUTED),
         )));
     } else {
-        for p in pending.iter().take(6) {
+        for (i, p) in pending.iter().take(8).enumerate() {
+            let mark = if i == app.req_sel.min(pending.len().saturating_sub(1)) {
+                "▸"
+            } else {
+                "•"
+            };
             left_lines.push(Line::from(format!(
-                "  • {}  {}  {}",
+                "  {mark} {}  {}  {}",
                 p.device_id.short(),
                 p.label,
                 p.fingerprint

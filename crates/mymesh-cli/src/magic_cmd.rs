@@ -482,3 +482,159 @@ Browser:
 "#
     );
 }
+
+
+/// Helpers that return strings for the TUI (no stdout dependency).
+pub fn ssh_config_text(paths: &Paths, domain: Option<String>) -> Result<String> {
+    let cfg = Config::load(paths.config_file())?;
+    let domain = domain.unwrap_or_else(|| cfg.magic.domain.clone());
+    let domain = domain.trim_start_matches('.').to_string();
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "mymesh".into());
+    let store = DeviceStore::open(paths.devices_file())?;
+    let mut o = String::new();
+    o.push_str("# MyMesh SSH — append to ~/.ssh/config\n");
+    o.push_str(&format!("Host *.{domain}\n"));
+    o.push_str(&format!("  ProxyCommand {exe} proxy-ssh %h\n"));
+    o.push_str("  StrictHostKeyChecking accept-new\n");
+    o.push_str("  UserKnownHostsFile ~/.ssh/mymesh_known_hosts\n\n");
+    for d in store.list() {
+        if d.trust != TrustState::Trusted {
+            continue;
+        }
+        let name = d.label.as_str().to_lowercase();
+        o.push_str(&format!("Host {name}.{domain} {name}\n"));
+        o.push_str(&format!("  HostName {name}.{domain}\n"));
+        o.push_str(&format!("  ProxyCommand {exe} proxy-ssh %h\n"));
+        for a in &d.aliases {
+            o.push_str(&format!("Host {a}.{domain} {a}\n"));
+            o.push_str(&format!("  HostName {a}.{domain}\n"));
+            o.push_str(&format!("  ProxyCommand {exe} proxy-ssh %h\n"));
+        }
+        o.push('\n');
+    }
+    Ok(o)
+}
+
+pub fn hosts_text(paths: &Paths) -> Result<String> {
+    let store = DeviceStore::open(paths.devices_file())?;
+    let cfg = Config::load(paths.config_file())?;
+    let domain = cfg.magic.domain.trim_start_matches('.');
+    let id = Identity::load_or_create(paths.identity_file())?;
+    let local = id.device_id();
+    let mut o = String::new();
+    o.push_str(&format!(
+        "self  {}  {}  mesh-ip {}\n",
+        cfg.device_label,
+        local.short(),
+        mesh_ip_string(&local)
+    ));
+    o.push_str(&format!(
+        "magic DNS {}  SOCKS {}  *.{domain}\n",
+        cfg.magic.dns_bind, cfg.magic.socks_bind
+    ));
+    for d in store.list() {
+        if d.trust != TrustState::Trusted {
+            continue;
+        }
+        o.push_str(&format!(
+            "• {}  {}.{}  {}  aliases={} groups={}\n",
+            d.label.as_str(),
+            d.label.as_str().to_lowercase(),
+            domain,
+            mesh_ip_string(&d.id),
+            d.aliases.join(","),
+            d.groups.join(",")
+        ));
+    }
+    Ok(o)
+}
+
+pub fn magic_status_text(paths: &Paths) -> Result<String> {
+    let cfg = Config::load(paths.config_file())?;
+    Ok(format!(
+        "magic.enabled = {}\n\
+         domain        = *.{}\n\
+         dns_bind      = {}\n\
+         socks_bind    = {}\n\
+         auto_ports    = {:?}\n\
+         agent must run (mymesh serve / user unit) for DNS+SOCKS+port plane.\n\
+         Browser: ALL_PROXY=socks5://{}  or system DNS → {}\n",
+        cfg.magic.enabled,
+        cfg.magic.domain.trim_start_matches('.'),
+        cfg.magic.dns_bind,
+        cfg.magic.socks_bind,
+        cfg.magic.auto_ports,
+        cfg.magic.socks_bind,
+        cfg.magic.dns_bind,
+    ))
+}
+
+/// Start carrier HTTP page; returns URL. Caller polls pending + join.
+pub async fn start_carrier_ui(paths: &Paths, port: u16) -> Result<String> {
+    let identity = Identity::load_or_create(paths.identity_file())?;
+    let cfg = Config::load(paths.config_file())?;
+    let pend = carrier_pending_path(paths);
+    let _ = std::fs::remove_file(&pend);
+    let handle = start_carrier(
+        paths.clone(),
+        Identity::from_secret_bytes(identity.to_secret_bytes()),
+        cfg.device_label.clone(),
+        port,
+        None,
+    )
+    .await?;
+    let _ = mymesh_core::ArmState::arm(paths.arm_file(), 900);
+    Ok(handle.url)
+}
+
+/// If phone posted a peer URI, complete join. Returns Some(msg) when done/attempted.
+pub async fn poll_carrier_join(paths: &Paths) -> Result<Option<String>> {
+    let pend = carrier_pending_path(paths);
+    if !pend.exists() {
+        return Ok(None);
+    }
+    let uri = std::fs::read_to_string(&pend)?.trim().to_string();
+    let _ = std::fs::remove_file(&pend);
+    if uri.is_empty() {
+        return Ok(None);
+    }
+    let identity = Identity::load_or_create(paths.identity_file())?;
+    let cfg = Config::load(paths.config_file())?;
+    let host_id = parse_join_target(&uri)?;
+    let transport = IrohTransport::bind(&identity).await?;
+    let mut store = DeviceStore::open(paths.devices_file())?;
+    match transport.connect(host_id).await {
+        Ok(conn) => {
+            match run_join_as_guest(
+                conn,
+                &identity,
+                &cfg.device_label,
+                &mut store,
+                &paths.mesh_file(),
+                mymesh_core::Capability::all(),
+            )
+            .await
+            {
+                Ok(peer) => {
+                    let _ = transport.shutdown().await;
+                    Ok(Some(format!(
+                        "carrier linked → {} ({})",
+                        peer.label,
+                        peer.id.short()
+                    )))
+                }
+                Err(e) => {
+                    let _ = transport.shutdown().await;
+                    Ok(Some(format!("carrier join failed: {e}")))
+                }
+            }
+        }
+        Err(e) => {
+            let _ = transport.shutdown().await;
+            Ok(Some(format!("carrier connect failed: {e}")))
+        }
+    }
+}
