@@ -1,5 +1,5 @@
-//! Background agent: accept sessions and host terminal/files channels.
-use mymesh_core::{Capability, Config, DeviceStore, Result};
+//! Background agent: join requests + authenticated sessions.
+use mymesh_core::{ArmState, Capability, Config, DeviceStore, Result};
 use mymesh_crypto::Identity;
 use mymesh_files::{apply_host_message, FileTransferEngine, PathSandbox};
 use mymesh_net::Transport;
@@ -7,12 +7,10 @@ use mymesh_protocol::{
     decode_msg, encode_msg, ChannelId, ChannelKind, FileMessage, Frame, TerminalMessage,
 };
 use mymesh_terminal::TerminalHost;
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::join::handle_join_as_host;
 use crate::session::Session;
 
 #[derive(Clone)]
@@ -20,9 +18,10 @@ pub struct Agent {
     secret: [u8; 32],
     label: String,
     devices_path: PathBuf,
+    arm_path: PathBuf,
+    join_dir: PathBuf,
     config: Config,
-    files: Arc<FileTransferEngine>,
-    put_paths: Arc<Mutex<HashMap<String, String>>>,
+    files: std::sync::Arc<FileTransferEngine>,
 }
 
 impl Agent {
@@ -30,6 +29,8 @@ impl Agent {
         identity: &Identity,
         label: String,
         devices_path: PathBuf,
+        arm_path: PathBuf,
+        join_dir: PathBuf,
         config: Config,
     ) -> Result<Self> {
         let sandbox = PathSandbox::new(config.effective_sandbox_root())?;
@@ -37,9 +38,10 @@ impl Agent {
             secret: identity.to_secret_bytes(),
             label,
             devices_path,
+            arm_path,
+            join_dir,
             config,
-            files: Arc::new(FileTransferEngine::new(sandbox)),
-            put_paths: Arc::new(Mutex::new(HashMap::new())),
+            files: std::sync::Arc::new(FileTransferEngine::new(sandbox)),
         })
     }
 
@@ -63,21 +65,50 @@ impl Agent {
             let conn = transport.accept().await?;
             let peer = conn.peer_id();
             let store = self.store()?;
-            if !store.is_trusted(&peer) {
-                warn!(peer = %peer.short(), "rejecting untrusted peer");
-                let _ = conn.close().await;
-                continue;
-            }
             let agent = self.clone();
-            tokio::spawn(async move {
-                if let Err(e) = agent.handle_connection(conn).await {
-                    warn!(peer = %peer.short(), %e, "session ended with error");
+            if store.is_trusted(&peer) {
+                tokio::spawn(async move {
+                    if let Err(e) = agent.handle_session(conn).await {
+                        warn!(peer = %peer.short(), %e, "session ended with error");
+                    }
+                });
+            } else {
+                let arm = ArmState::load(&self.arm_path)?;
+                if arm.is_effectively_armed() {
+                    tokio::spawn(async move {
+                        if let Err(e) = agent.handle_join(conn).await {
+                            warn!(peer = %peer.short(), %e, "join handling failed");
+                        }
+                    });
+                } else {
+                    warn!(
+                        peer = %peer.short(),
+                        "rejecting untrusted peer (not armed for joins)"
+                    );
+                    let _ = conn.close().await;
                 }
-            });
+            }
         }
     }
 
-    async fn handle_connection(
+    async fn handle_join(
+        &self,
+        conn: Box<dyn mymesh_net::PeerConnection>,
+    ) -> Result<()> {
+        let identity = self.identity();
+        handle_join_as_host(
+            conn,
+            &identity,
+            &self.label,
+            &self.devices_path,
+            &self.arm_path,
+            &self.join_dir,
+            self.config.limits.arm_timeout_secs,
+        )
+        .await
+    }
+
+    async fn handle_session(
         &self,
         conn: Box<dyn mymesh_net::PeerConnection>,
     ) -> Result<()> {
@@ -178,13 +209,10 @@ impl Agent {
                             }
                         }
                         ChannelKind::Control => {
-                            let msg: mymesh_protocol::ControlMessage = decode_msg(&frame.payload)?;
-                            if matches!(msg, mymesh_protocol::ControlMessage::Ping { .. }) {
-                                // ignore/pong optional
-                            }
+                            let _msg: mymesh_protocol::ControlMessage = decode_msg(&frame.payload)?;
                         }
                         ChannelKind::Desktop => {
-                            warn!("desktop not enabled in M1–M3");
+                            warn!("desktop not enabled yet");
                         }
                     }
                 }

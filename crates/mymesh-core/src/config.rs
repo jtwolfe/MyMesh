@@ -81,6 +81,13 @@ pub struct Limits {
     pub max_transfers: u32,
     pub desktop_fps: u32,
     pub pair_ttl_secs: u64,
+    /// How long `connect-request allow` stays armed (seconds).
+    #[serde(default = "default_arm_timeout")]
+    pub arm_timeout_secs: u64,
+}
+
+fn default_arm_timeout() -> u64 {
+    600
 }
 
 impl Default for Limits {
@@ -90,6 +97,7 @@ impl Default for Limits {
             max_transfers: 4,
             desktop_fps: 30,
             pair_ttl_secs: 600,
+            arm_timeout_secs: 600,
         }
     }
 }

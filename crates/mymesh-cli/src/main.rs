@@ -1,17 +1,23 @@
-//! MyMesh CLI — pair devices, open shells, copy files, control desktops.
+//! MyMesh CLI — link devices, shells, files.
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use console::style;
-use mymesh_core::{Capability, Config, DeviceStore, Paths};
-use mymesh_crypto::Identity;
+use mymesh_core::{
+    ArmState, Capability, Config, DeviceStore, JoinDecision, JoinStore, Paths,
+};
+use mymesh_crypto::{
+    device_id_to_words, device_join_uri, parse_device_id, Identity,
+};
 use mymesh_net::{
-    run_mailbox_server, FsMailbox, HttpMailbox, IrohTransport, LocalFabric,
-    LocalRendezvous, Rendezvous, Transport,
+    run_mailbox_server, FsMailbox, HttpMailbox, IrohTransport, LocalFabric, LocalRendezvous,
+    Rendezvous, Transport,
 };
 use mymesh_protocol::{
     decode_msg, encode_msg, ChannelId, FileMessage, Frame, TerminalMessage,
 };
-use mymesh_session::{run_guest_pair, run_host_pair_code, Agent, Session};
+use mymesh_session::{
+    run_guest_pair, run_host_pair_code, run_join_as_guest, Agent, Session,
+};
 use mymesh_terminal::TerminalClient;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -21,10 +27,7 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "mymesh",
     version,
-    about = "Peer-to-peer remote access: terminal, files, desktop — pair like Signal",
-    long_about = "MyMesh links your machines with a short pairing code. After linking,\n\
-devices dial each other with NAT traversal (no port forwards). Use one binary\n\
-as both client and service."
+    about = "Peer-to-peer remote access — pair like Signal, connect like Syncthing"
 )]
 struct Cli {
     #[arg(long, global = true, env = "MYMESH_HOME")]
@@ -37,46 +40,66 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Status,
+    /// Show this device id (hex + 24-word form)
+    Id {
+        #[arg(long)]
+        qr: bool,
+        #[arg(long)]
+        words: bool,
+        #[arg(long)]
+        uri: bool,
+    },
     Init {
         #[arg(long)]
         label: Option<String>,
     },
-    /// Link a new device (Signal-style pairing code)
+    /// Link to another device (default: join by device id / words)
     Link {
+        /// Host device id (64-char hex or 24-word phrase). Omit to show your id.
+        target: Option<String>,
+        /// SPAKE short-code path (advanced)
+        #[arg(long)]
         code: Option<String>,
         #[arg(long)]
         nameplate: Option<u16>,
-        /// Shared directory for FS mailbox (default: $MYMESH_MAILBOX_DIR or XDG runtime)
         #[arg(long, env = "MYMESH_MAILBOX_DIR")]
         mailbox_dir: Option<PathBuf>,
-        /// HTTP mailbox base URL (default: $MYMESH_MAILBOX / config)
         #[arg(long, env = "MYMESH_MAILBOX")]
         mailbox: Option<String>,
+        /// Local FS mailbox under XDG runtime (auto path)
+        #[arg(long)]
+        local: bool,
+    },
+    /// Arm / disarm accepting join requests
+    ConnectRequest {
+        #[command(subcommand)]
+        action: ConnectRequestCmd,
+    },
+    /// List / accept / deny pending join requests
+    Requests {
+        #[command(subcommand)]
+        action: RequestsCmd,
     },
     Devices {
         #[arg(long)]
         json: bool,
     },
     Unlink { device: String },
-    /// Open a remote terminal on a linked device
     Shell {
         device: String,
         #[arg(long)]
         shell: Option<String>,
     },
-    /// Copy files: local path or device:path
     Cp { src: String, dst: String },
     Desktop {
         device: String,
         #[arg(long, default_value_t = 30)]
         fps: u8,
     },
-    /// Run the background agent (accept shells/files)
     Serve {
         #[arg(long)]
         foreground: bool,
     },
-    /// Run HTTP pairing mailbox server
     Mailbox {
         #[arg(long, default_value = "0.0.0.0:9876")]
         bind: String,
@@ -86,6 +109,29 @@ enum Commands {
         scenario: DemoCmd,
     },
     InstallNotes,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConnectRequestCmd {
+    /// Allow join requests until timeout (default 10m)
+    Allow {
+        #[arg(long)]
+        secs: Option<u64>,
+    },
+    /// Stop accepting join requests
+    Deny,
+    Status,
+}
+
+#[derive(Subcommand, Debug)]
+enum RequestsCmd {
+    List,
+    Accept { device: String },
+    Deny {
+        device: String,
+        #[arg(long, default_value = "denied by operator")]
+        reason: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -107,29 +153,55 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Init { label } => cmd_init(&paths, label).await?,
         Commands::Status => cmd_status(&paths).await?,
+        Commands::Id { qr, words, uri } => cmd_id(&paths, qr, words, uri).await?,
         Commands::Link {
+            target,
             code,
             nameplate,
             mailbox_dir,
             mailbox,
-        } => cmd_link(&paths, code, nameplate, mailbox_dir, mailbox).await?,
+            local,
+        } => {
+            if code.is_some() || mailbox_dir.is_some() || mailbox.is_some() || local || nameplate.is_some() {
+                // Advanced SPAKE path
+                if let Some(c) = code {
+                    cmd_link_spake_guest(&paths, &c, mailbox_dir, mailbox, local).await?;
+                } else if target.is_none() {
+                    cmd_link_spake_host(&paths, nameplate, mailbox_dir, mailbox, local).await?;
+                } else {
+                    bail!("use `mymesh link <device-id>` for default join, or `mymesh link --code …` for SPAKE");
+                }
+            } else if let Some(t) = target {
+                cmd_link_join(&paths, &t).await?;
+            } else {
+                cmd_link_help(&paths).await?;
+            }
+        }
+        Commands::ConnectRequest { action } => match action {
+            ConnectRequestCmd::Allow { secs } => cmd_arm(&paths, secs).await?,
+            ConnectRequestCmd::Deny => {
+                ArmState::disarm(paths.arm_file())?;
+                println!("{} disarmed — join requests will be rejected", style("ok").green().bold());
+            }
+            ConnectRequestCmd::Status => cmd_arm_status(&paths).await?,
+        },
+        Commands::Requests { action } => match action {
+            RequestsCmd::List => cmd_requests_list(&paths).await?,
+            RequestsCmd::Accept { device } => cmd_requests_decide(&paths, &device, true, "").await?,
+            RequestsCmd::Deny { device, reason } => {
+                cmd_requests_decide(&paths, &device, false, &reason).await?
+            }
+        },
         Commands::Devices { json } => cmd_devices(&paths, json).await?,
         Commands::Unlink { device } => cmd_unlink(&paths, &device).await?,
         Commands::Shell { device, shell } => cmd_shell(&paths, &device, shell).await?,
         Commands::Cp { src, dst } => cmd_cp(&paths, &src, &dst).await?,
-        Commands::Desktop { device, fps } => {
-            let _ = (device, fps);
-            println!(
-                "{}",
-                style("desktop: deferred to M4 after M1–M3 validation").yellow()
-            );
+        Commands::Desktop { .. } => {
+            println!("{}", style("desktop: deferred (M4)").yellow());
         }
-        Commands::Serve { foreground } => {
-            let _ = foreground;
-            cmd_serve(&paths).await?;
-        }
+        Commands::Serve { .. } => cmd_serve(&paths).await?,
         Commands::Mailbox { bind } => {
-            let addr: SocketAddr = bind.parse().context("invalid --bind address")?;
+            let addr: SocketAddr = bind.parse().context("invalid --bind")?;
             run_mailbox_server(addr).await?;
         }
         Commands::Demo { scenario } => match scenario {
@@ -166,13 +238,59 @@ async fn cmd_init(paths: &Paths, label: Option<String>) -> Result<()> {
     cfg.validate()?;
     cfg.save(paths.config_file())?;
     let _ = DeviceStore::open(paths.devices_file())?;
+    let words = device_id_to_words(&id.device_id())?;
     println!("{} identity {}", style("ok").green().bold(), id.device_id());
     println!(
         "  fingerprint  {}",
         mymesh_core::NodeFingerprint::from_device_id(&id.device_id())
     );
+    println!("  word id      (24 words)");
+    for (i, w) in words.split_whitespace().enumerate() {
+        if i % 6 == 0 {
+            print!("               ");
+        }
+        print!("{w} ");
+        if i % 6 == 5 {
+            println!();
+        }
+    }
+    if words.split_whitespace().count() % 6 != 0 {
+        println!();
+    }
     println!("  config       {}", paths.config_file().display());
-    println!("  devices      {}", paths.devices_file().display());
+    Ok(())
+}
+
+async fn cmd_id(paths: &Paths, qr: bool, words_only: bool, uri: bool) -> Result<()> {
+    let id = Identity::load_or_create(paths.identity_file())?;
+    let did = id.device_id();
+    let words = device_id_to_words(&did)?;
+    if uri {
+        println!("{}", device_join_uri(&did)?);
+        return Ok(());
+    }
+    if words_only {
+        println!("{words}");
+        return Ok(());
+    }
+    println!("{}", style("MyMesh device id").bold());
+    println!("  hex     {did}");
+    println!(
+        "  short   {}  fingerprint {}",
+        did.short(),
+        mymesh_core::NodeFingerprint::from_device_id(&did)
+    );
+    println!("  words   {words}");
+    println!("  uri     {}", device_join_uri(&did)?);
+    if qr {
+        // Minimal QR-less placeholder: print URI for scanners / future --qr render
+        println!();
+        println!(
+            "{}",
+            style("(QR rendering: pipe uri into a qr tool, e.g. qrencode)").dim()
+        );
+        println!("  {}", device_join_uri(&did)?);
+    }
     Ok(())
 }
 
@@ -180,35 +298,191 @@ async fn cmd_status(paths: &Paths) -> Result<()> {
     let id = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file())?;
     let store = DeviceStore::open(paths.devices_file())?;
+    let arm = ArmState::load(paths.arm_file())?;
+    let words = device_id_to_words(&id.device_id())?;
     println!("{}", style("MyMesh").bold());
     println!("  label        {}", cfg.device_label);
     println!("  device id    {}", id.device_id());
+    println!("  short        {}", id.device_id().short());
     println!(
         "  fingerprint  {}",
         mymesh_core::NodeFingerprint::from_device_id(&id.device_id())
     );
+    println!("  words        {}…", words.split_whitespace().take(3).collect::<Vec<_>>().join(" "));
     println!("  linked       {}", store.list().len());
+    if arm.is_effectively_armed() {
+        println!(
+            "  join arm     {} until {:?}",
+            style("ARMED").green().bold(),
+            arm.until
+        );
+    } else {
+        println!("  join arm     {}", style("disarmed").dim());
+    }
     println!(
         "  services     terminal={} files={} desktop={}",
         cfg.daemon.enable_terminal, cfg.daemon.enable_files, cfg.daemon.enable_desktop
     );
-    if let Some(u) = &cfg.rendezvous_url {
-        println!("  mailbox url  {u}");
-    }
-    if let Some(d) = &cfg.mailbox_dir {
-        println!("  mailbox dir  {}", d.display());
-    }
-    println!(
-        "  sandbox      {}",
-        cfg.effective_sandbox_root().display()
-    );
     Ok(())
 }
+
+async fn cmd_link_help(paths: &Paths) -> Result<()> {
+    let id = Identity::load_or_create(paths.identity_file())?;
+    let words = device_id_to_words(&id.device_id())?;
+    println!("{}", style("Link a device (default path)").bold());
+    println!();
+    println!("On the HOST (existing machine):");
+    println!("  1. {}", style("mymesh serve --foreground").cyan());
+    println!("  2. {}", style("mymesh connect-request allow").cyan());
+    println!();
+    println!("On the JOINER (new machine):");
+    println!("  {}", style("mymesh link <host-hex-or-24-words>").cyan());
+    println!();
+    println!("Then on the HOST:");
+    println!("  {}", style("mymesh requests list").cyan());
+    println!("  {}", style("mymesh requests accept <id>").cyan());
+    println!();
+    println!("Your device id:");
+    println!("  hex   {}", id.device_id());
+    println!("  words {words}");
+    println!();
+    println!("{}", style("Advanced: SPAKE short code").dim());
+    println!("  mymesh link --local          # host, auto FS mailbox");
+    println!("  mymesh link --code CODE --local");
+    Ok(())
+}
+
+async fn cmd_arm(paths: &Paths, secs: Option<u64>) -> Result<()> {
+    let cfg = Config::load(paths.config_file())?;
+    let ttl = secs.unwrap_or(cfg.limits.arm_timeout_secs);
+    let state = ArmState::arm(paths.arm_file(), ttl)?;
+    let id = Identity::load_or_create(paths.identity_file())?;
+    let words = device_id_to_words(&id.device_id())?;
+    println!(
+        "{} accepting join requests until {:?}",
+        style("ARMED").green().bold(),
+        state.until
+    );
+    println!("  ensure {} is running", style("mymesh serve").cyan());
+    println!("  your id (hex)   {}", id.device_id());
+    println!("  your id (words) {words}");
+    println!();
+    println!("On the other machine:");
+    println!("  mymesh link {}", id.device_id());
+    Ok(())
+}
+
+async fn cmd_arm_status(paths: &Paths) -> Result<()> {
+    let arm = ArmState::load(paths.arm_file())?;
+    if arm.is_effectively_armed() {
+        println!("armed until {:?}", arm.until);
+    } else {
+        println!("disarmed");
+    }
+    Ok(())
+}
+
+async fn cmd_requests_list(paths: &Paths) -> Result<()> {
+    let joins = JoinStore::open(paths.join_dir())?;
+    let list = joins.list_pending()?;
+    if list.is_empty() {
+        println!("No pending join requests.");
+        return Ok(());
+    }
+    for p in list {
+        println!(
+            "{}  {}  fp={}  caps={:?}",
+            p.device_id.short(),
+            p.label,
+            p.fingerprint,
+            p.capabilities
+        );
+        println!("    {}", p.device_id);
+    }
+    Ok(())
+}
+
+async fn cmd_requests_decide(paths: &Paths, device: &str, accept: bool, reason: &str) -> Result<()> {
+    let joins = JoinStore::open(paths.join_dir())?;
+    let pending = joins.list_pending()?;
+    let id = resolve_pending(&pending, device)?;
+    if accept {
+        joins.write_decision(&id, JoinDecision::Accept)?;
+        println!(
+            "{} accept written for {} — agent will complete join",
+            style("ok").green().bold(),
+            id.short()
+        );
+    } else {
+        joins.write_decision(
+            &id,
+            JoinDecision::Deny {
+                reason: reason.to_string(),
+            },
+        )?;
+        println!("{} deny written for {}", style("ok").green().bold(), id.short());
+    }
+    Ok(())
+}
+
+fn resolve_pending(
+    pending: &[mymesh_core::PendingJoin],
+    q: &str,
+) -> Result<mymesh_core::DeviceId> {
+    if let Ok(id) = parse_device_id(q) {
+        return Ok(id);
+    }
+    let matches: Vec<_> = pending
+        .iter()
+        .filter(|p| {
+            p.label.starts_with(q)
+                || p.device_id.short().starts_with(q)
+                || p.device_id.to_string().starts_with(q)
+        })
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(one.device_id),
+        [] => bail!("no pending request matched '{q}'"),
+        _ => bail!("ambiguous pending device '{q}'"),
+    }
+}
+
+async fn cmd_link_join(paths: &Paths, target: &str) -> Result<()> {
+    let identity = Identity::load_or_create(paths.identity_file())?;
+    let cfg = Config::load(paths.config_file())?;
+    let mut store = DeviceStore::open(paths.devices_file())?;
+    let host_id = parse_device_id(target)?;
+    println!(
+        "requesting link to {}…",
+        style(host_id.short()).cyan()
+    );
+    println!("  (host must be running serve + connect-request allow)");
+
+    let transport = IrohTransport::bind(&identity).await?;
+    let conn = transport.connect(host_id).await?;
+    let peer = run_join_as_guest(
+        conn,
+        &identity,
+        &cfg.device_label,
+        &mut store,
+        Capability::all(),
+    )
+    .await?;
+    println!(
+        "{} linked to {} ({})",
+        style("ok").green().bold(),
+        peer.label,
+        peer.id.short()
+    );
+    transport.shutdown().await;
+    Ok(())
+}
+
+// --- SPAKE advanced path ---
 
 enum BoxBackend {
     Fs(FsMailbox),
     Http(HttpMailbox),
-    Local(LocalRendezvous),
 }
 
 #[async_trait::async_trait]
@@ -222,10 +496,8 @@ impl Rendezvous for BoxBackend {
         match self {
             Self::Fs(m) => m.send(code, as_host, msg).await,
             Self::Http(m) => m.send(code, as_host, msg).await,
-            Self::Local(m) => m.send(code, as_host, msg).await,
         }
     }
-
     async fn recv(
         &self,
         code: &str,
@@ -234,7 +506,6 @@ impl Rendezvous for BoxBackend {
         match self {
             Self::Fs(m) => m.recv(code, as_host).await,
             Self::Http(m) => m.recv(code, as_host).await,
-            Self::Local(m) => m.recv(code, as_host).await,
         }
     }
 }
@@ -243,84 +514,84 @@ fn pick_mailbox(
     paths: &Paths,
     mailbox_dir: Option<PathBuf>,
     mailbox: Option<String>,
+    local: bool,
 ) -> Result<BoxBackend> {
     let cfg = Config::load(paths.config_file())?;
     if let Some(url) = mailbox.or(cfg.rendezvous_url.clone()) {
-        println!("  using HTTP mailbox {}", style(&url).cyan());
+        println!("  SPAKE HTTP mailbox {}", style(&url).cyan());
         return Ok(BoxBackend::Http(HttpMailbox::new(url)));
     }
-    let dir = mailbox_dir
-        .or(cfg.mailbox_dir.clone())
-        .unwrap_or_else(mymesh_net::default_local_mailbox_dir);
-    println!("  using FS mailbox {}", style(dir.display()).cyan());
+    let dir = if local {
+        mymesh_net::default_local_mailbox_dir()
+    } else {
+        mailbox_dir
+            .or(cfg.mailbox_dir.clone())
+            .unwrap_or_else(mymesh_net::default_local_mailbox_dir)
+    };
+    println!("  SPAKE FS mailbox {}", style(dir.display()).cyan());
     Ok(BoxBackend::Fs(FsMailbox::new(dir)?))
 }
 
-async fn cmd_link(
+async fn cmd_link_spake_host(
     paths: &Paths,
-    code: Option<String>,
     nameplate: Option<u16>,
     mailbox_dir: Option<PathBuf>,
     mailbox: Option<String>,
+    local: bool,
 ) -> Result<()> {
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file())?;
     let mut store = DeviceStore::open(paths.devices_file())?;
-    let rendezvous = pick_mailbox(paths, mailbox_dir, mailbox)?;
-    let caps = Capability::all();
+    let rendezvous = pick_mailbox(paths, mailbox_dir, mailbox, local)?;
+    let np = nameplate.unwrap_or_else(|| rand::random::<u16>() % 900 + 100);
+    let code = mymesh_crypto::code_from_entropy(np);
+    println!("{}", style("SPAKE host (advanced)").bold());
+    println!("  pairing code   {}", style(code.as_string()).cyan().bold());
+    println!("  peer runs:     mymesh link --code {} …", code.as_string());
+    let outcome = run_host_pair_code(
+        &identity,
+        &cfg.device_label,
+        Capability::all(),
+        &mut store,
+        &rendezvous,
+        &code,
+    )
+    .await?;
+    println!(
+        "{} linked {} ({})",
+        style("ok").green().bold(),
+        outcome.peer.label,
+        outcome.peer.id.short()
+    );
+    Ok(())
+}
 
-    if let Some(code) = code {
-        println!("Linking with code {} …", style(&code).cyan().bold());
-        let outcome = run_guest_pair(
-            &identity,
-            &cfg.device_label,
-            caps,
-            &mut store,
-            &rendezvous,
-            &code,
-        )
-        .await?;
-        println!(
-            "{} linked {} ({})",
-            style("ok").green().bold(),
-            outcome.peer.label,
-            outcome.peer.id.short()
-        );
-        println!("  Run `mymesh serve` on both sides, then `mymesh shell {}`", outcome.peer.label);
-    } else {
-        let np = nameplate.unwrap_or_else(|| rand::random::<u16>() % 900 + 100);
-        let code = mymesh_crypto::code_from_entropy(np);
-        println!("{}", style("Hosting a link session…").bold());
-        println!();
-        println!("  ┌─────────────────────────────────────────┐");
-        println!(
-            "  │  pairing code   {}  │",
-            style(code.as_string()).cyan().bold()
-        );
-        println!("  └─────────────────────────────────────────┘");
-        println!();
-        println!(
-            "On the other device:\n  {}",
-            style(format!("mymesh link {}", code.as_string())).bold()
-        );
-        println!("Waiting for peer (ctrl-c to cancel)…");
-
-        let outcome = run_host_pair_code(
-            &identity,
-            &cfg.device_label,
-            caps,
-            &mut store,
-            &rendezvous,
-            &code,
-        )
-        .await?;
-        println!(
-            "{} linked {} ({})",
-            style("ok").green().bold(),
-            outcome.peer.label,
-            outcome.peer.id.short()
-        );
-    }
+async fn cmd_link_spake_guest(
+    paths: &Paths,
+    code: &str,
+    mailbox_dir: Option<PathBuf>,
+    mailbox: Option<String>,
+    local: bool,
+) -> Result<()> {
+    let identity = Identity::load_or_create(paths.identity_file())?;
+    let cfg = Config::load(paths.config_file())?;
+    let mut store = DeviceStore::open(paths.devices_file())?;
+    let rendezvous = pick_mailbox(paths, mailbox_dir, mailbox, local)?;
+    let outcome = run_guest_pair(
+        &identity,
+        &cfg.device_label,
+        Capability::all(),
+        &mut store,
+        &rendezvous,
+        code,
+    )
+    .await?;
+    println!(
+        "{} linked {} ({})",
+        style("ok").green().bold(),
+        outcome.peer.label,
+        outcome.peer.id.short()
+    );
     Ok(())
 }
 
@@ -331,18 +602,19 @@ async fn cmd_devices(paths: &Paths, json: bool) -> Result<()> {
         return Ok(());
     }
     if store.list().is_empty() {
-        println!("No linked devices. Run `mymesh link` on both sides.");
+        println!("No linked devices. See `mymesh link`.");
         return Ok(());
     }
     for d in store.list() {
+        let words = device_id_to_words(&d.id).unwrap_or_default();
+        let wshort: String = words.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
         println!(
-            "{}  {}  {:?}  caps={:?}",
+            "{}  {}  {:?}  words={wshort}…",
             d.id.short(),
             d.label,
-            d.trust,
-            d.capabilities
+            d.trust
         );
-        println!("    {}", d.fingerprint);
+        println!("    {}", d.id);
     }
     Ok(())
 }
@@ -356,7 +628,7 @@ async fn cmd_unlink(paths: &Paths, device: &str) -> Result<()> {
 }
 
 fn resolve_device(store: &DeviceStore, q: &str) -> Result<mymesh_core::DeviceId> {
-    if let Ok(id) = q.parse::<mymesh_core::DeviceId>() {
+    if let Ok(id) = parse_device_id(q) {
         return Ok(id);
     }
     let matches: Vec<_> = store
@@ -380,17 +652,22 @@ async fn cmd_serve(paths: &Paths) -> Result<()> {
         cfg.device_label,
         identity.device_id().short()
     );
-    println!("  sandbox  {}", cfg.effective_sandbox_root().display());
-    println!("  transport iroh (NAT traversal + relays)");
-
-    // Keep transport alive for the entire client operation (dropping it closes connections).
+    let arm = ArmState::load(paths.arm_file())?;
+    if arm.is_effectively_armed() {
+        println!("  join         {}", style("ARMED").green());
+    } else {
+        println!(
+            "  join         disarmed ({} to allow)",
+            style("mymesh connect-request allow").cyan()
+        );
+    }
     let transport = IrohTransport::bind(&identity).await?;
-    println!("  endpoint {}", identity.device_id());
-
     let agent = Agent::new(
         &identity,
         cfg.device_label.clone(),
         paths.devices_file(),
+        paths.arm_file(),
+        paths.join_dir(),
         cfg,
     )?;
     agent.run(&transport).await?;
@@ -406,9 +683,8 @@ async fn open_session_to(
     let store = DeviceStore::open(paths.devices_file())?;
     let peer = resolve_device(&store, device)?;
     if !store.is_trusted(&peer) {
-        bail!("device {device} is not trusted — pair with `mymesh link` first");
+        bail!("device not trusted — link first");
     }
-    // Keep transport alive for the entire client operation (dropping it closes connections).
     let transport = IrohTransport::bind(&identity).await?;
     println!(
         "connecting to {} ({})…",
@@ -428,7 +704,7 @@ async fn open_session_to(
 }
 
 async fn cmd_shell(paths: &Paths, device: &str, shell: Option<String>) -> Result<()> {
-    let (session, transport, _peer) = open_session_to(paths, device).await?;
+    let (session, transport, _) = open_session_to(paths, device).await?;
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     session
         .send_raw(
@@ -441,11 +717,8 @@ async fn cmd_shell(paths: &Paths, device: &str, shell: Option<String>) -> Result
             })?,
         )
         .await?;
-
     let client = TerminalClient::attach()?;
     let conn = session.into_conn();
-
-    // stdin thread → channel
     let (tx_in, mut rx_in) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
     std::thread::spawn(move || {
         let mut buf = [0u8; 1024];
@@ -461,7 +734,6 @@ async fn cmd_shell(paths: &Paths, device: &str, shell: Option<String>) -> Result
             }
         }
     });
-
     loop {
         tokio::select! {
             frame = conn.recv_frame() => {
@@ -470,9 +742,7 @@ async fn cmd_shell(paths: &Paths, device: &str, shell: Option<String>) -> Result
                     continue;
                 }
                 let msg: TerminalMessage = decode_msg(&frame.payload)?;
-                if !client.handle_host_msg(msg)? {
-                    break;
-                }
+                if !client.handle_host_msg(msg)? { break; }
             }
             input = rx_in.recv() => {
                 match input {
@@ -492,14 +762,12 @@ async fn cmd_shell(paths: &Paths, device: &str, shell: Option<String>) -> Result
     Ok(())
 }
 
-#[derive(Debug)]
 enum CpSide {
     Local(PathBuf),
     Remote { device: String, path: String },
 }
 
 fn parse_cp_side(s: &str) -> CpSide {
-    // device:path — device has no slash; path may be absolute
     if let Some((dev, path)) = s.split_once(':') {
         if !dev.contains('/') && !dev.is_empty() {
             return CpSide::Remote {
@@ -512,21 +780,14 @@ fn parse_cp_side(s: &str) -> CpSide {
 }
 
 async fn cmd_cp(paths: &Paths, src: &str, dst: &str) -> Result<()> {
-    let src_s = parse_cp_side(src);
-    let dst_s = parse_cp_side(dst);
-    match (src_s, dst_s) {
+    match (parse_cp_side(src), parse_cp_side(dst)) {
         (CpSide::Local(local), CpSide::Remote { device, path }) => {
             push_file(paths, &local, &device, &path).await
         }
         (CpSide::Remote { device, path }, CpSide::Local(local)) => {
             pull_file(paths, &device, &path, &local).await
         }
-        (CpSide::Local(_), CpSide::Local(_)) => {
-            bail!("both sides local — use cp(1) instead")
-        }
-        (CpSide::Remote { .. }, CpSide::Remote { .. }) => {
-            bail!("device-to-device copy not yet supported; pull then push")
-        }
+        _ => bail!("use device:path on exactly one side"),
     }
 }
 
@@ -535,7 +796,6 @@ async fn push_file(paths: &Paths, local: &Path, device: &str, remote: &str) -> R
     let size = data.len() as u64;
     let (session, transport, _) = open_session_to(paths, device).await?;
     let conn = session.into_conn();
-
     conn.send_frame(Frame {
         channel: ChannelId::files(1),
         payload: encode_msg(&FileMessage::Put {
@@ -546,15 +806,6 @@ async fn push_file(paths: &Paths, local: &Path, device: &str, remote: &str) -> R
         })?,
     })
     .await?;
-
-    let pb = indicatif::ProgressBar::new(size);
-    pb.set_style(
-        indicatif::ProgressStyle::with_template(
-            "{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
-        )?
-        .progress_chars("#>-"),
-    );
-
     const CHUNK: usize = 64 * 1024;
     let mut offset = 0u64;
     for chunk in data.chunks(CHUNK) {
@@ -567,7 +818,6 @@ async fn push_file(paths: &Paths, local: &Path, device: &str, remote: &str) -> R
         })
         .await?;
         offset += chunk.len() as u64;
-        pb.set_position(offset);
     }
     conn.send_frame(Frame {
         channel: ChannelId::files(1),
@@ -577,11 +827,8 @@ async fn push_file(paths: &Paths, local: &Path, device: &str, remote: &str) -> R
         })?,
     })
     .await?;
-
-    // Wait for host Done ack
     let frame = conn.recv_frame().await?;
     let msg: FileMessage = decode_msg(&frame.payload)?;
-    pb.finish_and_clear();
     match msg {
         FileMessage::Done { bytes, .. } => {
             println!(
@@ -592,8 +839,8 @@ async fn push_file(paths: &Paths, local: &Path, device: &str, remote: &str) -> R
                 remote
             );
         }
-        FileMessage::Error { message } => bail!("remote error: {message}"),
-        other => bail!("unexpected reply: {other:?}"),
+        FileMessage::Error { message } => bail!("{message}"),
+        other => bail!("unexpected {other:?}"),
     }
     let _ = conn.close().await;
     transport.shutdown().await;
@@ -612,29 +859,19 @@ async fn pull_file(paths: &Paths, device: &str, remote: &str, local: &Path) -> R
         })?,
     })
     .await?;
-
     if let Some(parent) = local.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut file = std::fs::File::create(local)?;
-    let mut total = 0u64;
-    let pb = indicatif::ProgressBar::new_spinner();
-    pb.set_style(indicatif::ProgressStyle::with_template(
-        "{spinner:.green} {msg}",
-    )?);
-
     loop {
         let frame = conn.recv_frame().await?;
         let msg: FileMessage = decode_msg(&frame.payload)?;
         match msg {
-            FileMessage::Chunk { offset: _, data } => {
+            FileMessage::Chunk { data, .. } => {
                 use std::io::Write;
                 file.write_all(&data)?;
-                total += data.len() as u64;
-                pb.set_message(format!("received {total} bytes"));
             }
             FileMessage::Done { bytes, .. } => {
-                pb.finish_and_clear();
                 println!(
                     "{} pulled {}:{} → {} ({bytes} bytes)",
                     style("ok").green().bold(),
@@ -644,8 +881,8 @@ async fn pull_file(paths: &Paths, device: &str, remote: &str, local: &Path) -> R
                 );
                 break;
             }
-            FileMessage::Error { message } => bail!("remote error: {message}"),
-            other => bail!("unexpected: {other:?}"),
+            FileMessage::Error { message } => bail!("{message}"),
+            other => bail!("unexpected {other:?}"),
         }
     }
     let _ = conn.close().await;
@@ -653,30 +890,28 @@ async fn pull_file(paths: &Paths, device: &str, remote: &str, local: &Path) -> R
     Ok(())
 }
 
-// --- demos (in-process, no iroh) ---
+// --- demos ---
 
 async fn demo_pair() -> Result<()> {
     use mymesh_session::run_guest_pair;
-
     let dir = tempfile_dir()?;
     let host_paths = sub_paths(&dir, "host")?;
     let guest_paths = sub_paths(&dir, "guest")?;
-
     let host_id = Identity::load_or_create(host_paths.identity_file())?;
     let guest_id = Identity::load_or_create(guest_paths.identity_file())?;
     let mut host_store = DeviceStore::open(host_paths.devices_file())?;
     let mut guest_store = DeviceStore::open(guest_paths.devices_file())?;
     let rendezvous = LocalRendezvous::new();
     let caps = Capability::all();
-    let code = "42-maple-orbit";
-
-    let host_fut = run_host_pair_with_code(
+    let code_str = "42-maple-orbit";
+    let code = mymesh_crypto::parse_code(code_str)?;
+    let host_fut = run_host_pair_code(
         &host_id,
         "host-demo",
         caps.clone(),
         &mut host_store,
         &rendezvous,
-        code,
+        &code,
     );
     let guest_fut = run_guest_pair(
         &guest_id,
@@ -684,137 +919,19 @@ async fn demo_pair() -> Result<()> {
         caps,
         &mut guest_store,
         &rendezvous,
-        code,
+        code_str,
     );
-
     let (h, g) = tokio::join!(host_fut, guest_fut);
     let h = h?;
     let g = g?;
-    assert_eq!(h.shared_confirm, g.shared_confirm);
     println!("{} SPAKE2 pairing succeeded", style("ok").green().bold());
-    println!(
-        "  host  linked guest {} ({})",
-        h.peer.label,
-        h.peer.id.short()
-    );
-    println!(
-        "  guest linked host  {} ({})",
-        g.peer.label,
-        g.peer.id.short()
-    );
-    println!("  confirm {}", hex::encode(h.shared_confirm));
+    println!("  host  linked {} ({})", h.peer.label, h.peer.id.short());
+    println!("  guest linked {} ({})", g.peer.label, g.peer.id.short());
     Ok(())
 }
 
-async fn run_host_pair_with_code(
-    identity: &Identity,
-    label: &str,
-    capabilities: Vec<Capability>,
-    store: &mut DeviceStore,
-    rendezvous: &impl Rendezvous,
-    code: &str,
-) -> mymesh_core::Result<mymesh_session::PairOutcome> {
-    use chrono::Utc;
-    use mymesh_core::{DeviceLabel, DeviceRecord, NodeFingerprint, TrustState};
-    use mymesh_crypto::{parse_code, PairingRole, PairingSession};
-    use mymesh_protocol::PairingMessage;
-    use sha2::{Digest, Sha256};
-
-    let code = parse_code(code)?;
-    let code_str = code.as_string();
-    let spake = PairingSession::start(PairingRole::Host, &code.password_bytes())?;
-    let my_spake = spake.outbound_message().to_vec();
-    rendezvous
-        .send(&code_str, true, PairingMessage::Spake(my_spake))
-        .await?;
-    let peer_spake = match rendezvous.recv(&code_str, true).await? {
-        PairingMessage::Spake(m) => m,
-        other => {
-            return Err(mymesh_core::Error::Pairing(format!(
-                "expected SPAKE, got {other:?}"
-            )))
-        }
-    };
-    let secret = spake.finish(&peer_spake)?;
-
-    let vk = identity.verifying_key_bytes();
-    let device_id = identity.device_id();
-    let sign_material = [device_id.as_bytes().as_slice(), label.as_bytes(), &vk].concat();
-    let signature = identity.sign(&sign_material);
-    let mut h = Sha256::new();
-    h.update(secret.as_bytes());
-    h.update(&sign_material);
-    let offer_binder: [u8; 32] = h.finalize().into();
-
-    rendezvous
-        .send(
-            &code_str,
-            true,
-            PairingMessage::IdentityOffer {
-                device_id,
-                label: label.to_string(),
-                verifying_key: vk,
-                capabilities: capabilities.clone(),
-                signature,
-                binder: offer_binder,
-            },
-        )
-        .await?;
-
-    let peer = match rendezvous.recv(&code_str, true).await? {
-        PairingMessage::IdentityAccept {
-            device_id: peer_id,
-            label: peer_label,
-            verifying_key,
-            accepted_capabilities,
-            signature,
-            binder: peer_binder,
-        } => {
-            let material = [
-                peer_id.as_bytes().as_slice(),
-                peer_label.as_bytes(),
-                &verifying_key,
-            ]
-            .concat();
-            let mut h = Sha256::new();
-            h.update(secret.as_bytes());
-            h.update(&material);
-            let expect: [u8; 32] = h.finalize().into();
-            if expect != peer_binder {
-                return Err(mymesh_core::Error::Pairing("binder mismatch".into()));
-            }
-            let pub_id = mymesh_crypto::IdentityPublic { verifying_key };
-            pub_id.verify(&material, &signature)?;
-            DeviceRecord {
-                id: peer_id,
-                label: DeviceLabel::new(peer_label),
-                fingerprint: NodeFingerprint::from_device_id(&peer_id).as_str().to_string(),
-                capabilities: accepted_capabilities,
-                trust: TrustState::Trusted,
-                linked_at: Utc::now(),
-                last_seen: Some(Utc::now()),
-                endpoint_hint: None,
-            }
-        }
-        other => {
-            return Err(mymesh_core::Error::Pairing(format!(
-                "unexpected: {other:?}"
-            )))
-        }
-    };
-    store.upsert(peer.clone())?;
-    Ok(mymesh_session::PairOutcome {
-        code: Some(code),
-        peer,
-        shared_confirm: secret.derive(b"mymesh/confirm"),
-    })
-}
-
 async fn demo_session() -> Result<()> {
-    use mymesh_protocol::{encode_msg, ChannelId, TerminalMessage};
-
     demo_pair().await?;
-
     let fabric = LocalFabric::new();
     let host_id = Identity::generate();
     let guest_id = Identity::generate();
@@ -823,7 +940,6 @@ async fn demo_session() -> Result<()> {
     let guest_paths = sub_paths(&dir, "guest2")?;
     let mut host_store = DeviceStore::open(host_paths.devices_file())?;
     let mut guest_store = DeviceStore::open(guest_paths.devices_file())?;
-
     let now = chrono::Utc::now();
     host_store.upsert(mymesh_core::DeviceRecord {
         id: guest_id.device_id(),
@@ -849,15 +965,11 @@ async fn demo_session() -> Result<()> {
         last_seen: Some(now),
         endpoint_hint: None,
     })?;
-
     let host_ep = fabric.endpoint(host_id.device_id());
     let guest_ep = fabric.endpoint(guest_id.device_id());
-
     let accept = tokio::spawn(async move { host_ep.accept().await });
     let guest_conn = guest_ep.connect(host_id.device_id()).await?;
     let host_conn = accept.await??;
-
-    // Asymmetric handshake on fabric: guest dials, host accepts
     let host_hs = Session::handshake_acceptor(
         host_conn,
         &host_id,
@@ -872,28 +984,9 @@ async fn demo_session() -> Result<()> {
         &guest_store,
         Capability::all(),
     );
-    let (host_sess, guest_sess) = tokio::join!(host_hs, guest_hs);
-    let host_sess = host_sess?;
-    let guest_sess = guest_sess?;
-
-    guest_sess
-        .send_raw(
-            ChannelId::terminal(1),
-            encode_msg(&TerminalMessage::Open {
-                cols: 80,
-                rows: 24,
-                shell: None,
-                env: vec![],
-            })?,
-        )
-        .await?;
-    let frame = host_sess.recv().await?;
-    println!(
-        "{} session handshake + terminal open frame ({} bytes payload)",
-        style("ok").green().bold(),
-        frame.payload.len()
-    );
-    let _ = guest_sess;
+    let (h, g) = tokio::join!(host_hs, guest_hs);
+    let _ = (h?, g?);
+    println!("{} session handshake ok", style("ok").green().bold());
     Ok(())
 }
 
@@ -903,7 +996,7 @@ fn tempfile_dir() -> Result<PathBuf> {
     Ok(p)
 }
 
-fn sub_paths(root: &std::path::Path, name: &str) -> Result<Paths> {
+fn sub_paths(root: &Path, name: &str) -> Result<Paths> {
     let p = Paths {
         config_dir: root.join(name).join("config"),
         data_dir: root.join(name).join("data"),
@@ -915,47 +1008,31 @@ fn sub_paths(root: &std::path::Path, name: &str) -> Result<Paths> {
 
 fn print_install_notes() {
     println!(
-        r#"# MyMesh install (Linux)
+        r#"# MyMesh — default link flow
 
-## From source
-curl -fsSL https://raw.githubusercontent.com/jtwolfe/MyMesh/main/install.sh | bash
+## Both machines
+mymesh init --label <name>
+mymesh serve --foreground   # keep running (systemd later)
 
-## Pair two machines
-# optional: shared HTTP mailbox
-mymesh mailbox --bind 0.0.0.0:9876
-export MYMESH_MAILBOX=http://YOUR_HOST:9876
+## Host (existing)
+mymesh connect-request allow
+mymesh id                   # share hex or 24 words with joiner
 
-# machine A
-mymesh init --label desktop
-mymesh link
-# machine B
-mymesh init --label laptop
-mymesh link <code-from-A>
+## Joiner (new)
+mymesh link <host-id-or-words>
 
-# both machines
-mymesh serve --foreground
+## Host
+mymesh requests list
+mymesh requests accept <short-id>
+# arm auto-disables after accept
 
-# laptop → desktop
-mymesh shell desktop
-mymesh cp ./file desktop:~/file
+## Then
+mymesh shell <label>
+mymesh cp ./file peer:~/file
 
-## systemd user service
-mkdir -p ~/.config/systemd/user
-cat > ~/.config/systemd/user/mymesh.service <<'UNIT'
-[Unit]
-Description=MyMesh peer agent
-After=network-online.target
-
-[Service]
-ExecStart=%h/.local/bin/mymesh serve --foreground
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=default.target
-UNIT
-systemctl --user daemon-reload
-systemctl --user enable --now mymesh.service
+## Advanced SPAKE / local
+mymesh link --local
+mymesh link --code 123-word-word --local
 "#
     );
 }

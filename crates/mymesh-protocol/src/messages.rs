@@ -45,6 +45,32 @@ pub enum ControlMessage {
         stream: u32,
         reason: String,
     },
+    /// Joiner → host: request to be added (host must be armed).
+    JoinRequest {
+        protocol_version: u16,
+        device_id: DeviceId,
+        label: String,
+        verifying_key: [u8; 32],
+        capabilities: Vec<Capability>,
+        ts: i64,
+        #[serde(with = "crate::ser_fixed::array64")]
+        signature: [u8; 64],
+    },
+    JoinPending {
+        host_id: DeviceId,
+        host_label: String,
+        message: String,
+    },
+    JoinAccept {
+        device_id: DeviceId,
+        label: String,
+        capabilities: Vec<Capability>,
+        #[serde(with = "crate::ser_fixed::array64")]
+        signature: [u8; 64],
+    },
+    JoinDeny {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -43,4 +43,12 @@ impl Paths {
     pub fn log_dir(&self) -> PathBuf {
         self.data_dir.join("logs")
     }
+
+    pub fn arm_file(&self) -> PathBuf {
+        self.data_dir.join("arm.json")
+    }
+
+    pub fn join_dir(&self) -> PathBuf {
+        self.data_dir.join("join")
+    }
 }

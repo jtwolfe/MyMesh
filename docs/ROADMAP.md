@@ -100,3 +100,10 @@ Native capture (X11 / Wayland portal) and input injection. Until then:
 - TUN/VPN data plane
 - Mobile clients
 - GUI / tray app
+
+
+## M-Link (request/accept) — implemented
+
+- Default join: arm → link by id → accept → auto-disarm
+- 24-word BIP39 display ids
+- SPAKE/local mailbox retained as advanced

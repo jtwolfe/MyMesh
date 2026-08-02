@@ -68,3 +68,4 @@ axum = { version = "0.8", features = ["macros"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 url = "2"
+bip39 = "2"

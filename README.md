@@ -10,6 +10,35 @@ Pair two machines with a short code (Signal linked-devices style). After that:
 
 NAT hole punching + relay fallback via [iroh](https://iroh.computer) (QUIC, dial by public key).
 
+
+## Link two machines (default)
+
+```bash
+# both
+cargo build --release -p mymesh-cli
+./target/release/mymesh init --label desktop   # or laptop
+./target/release/mymesh serve --foreground     # keep running
+
+# on host (existing machine)
+./target/release/mymesh connect-request allow
+./target/release/mymesh id                     # share hex or 24 words
+
+# on joiner
+./target/release/mymesh link <host-hex-or-24-words>
+
+# on host
+./target/release/mymesh requests list
+./target/release/mymesh requests accept <short-id>
+# arm auto-disables after accept
+
+./target/release/mymesh shell <label>
+./target/release/mymesh cp ./file peer:~/file
+```
+
+Device ids are **64-char hex** or **24 BIP39 words** (full entropy). See [docs/JOIN.md](docs/JOIN.md).
+
+SPAKE / shared-folder pairing remains available as advanced (`--local`, `--mailbox-dir`, `--code`).
+
 ## Status
 
 | Milestone | Scope | State |
