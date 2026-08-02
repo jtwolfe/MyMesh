@@ -10,7 +10,7 @@ use mymesh_net::{IrohTransport, Transport};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame as TuiFrame;
 use tokio::sync::mpsc;
 
@@ -344,72 +344,108 @@ pub fn key_to_bytes(code: KeyCode, app_cursor: bool) -> Option<Vec<u8>> {
 }
 
 pub fn draw(f: &mut TuiFrame, area: Rect, term: &mut TermPane) {
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Block::default().style(Style::default().bg(Color::Rgb(18, 18, 24))),
+        area,
+    );
+
+    if area.height < 6 || area.width < 20 {
+        f.render_widget(
+            Paragraph::new("terminal too small").style(Style::default().fg(C_MUTED)),
+            area,
+        );
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(area);
 
     term.peer_rect = chunks[0];
     term.screen_rect = chunks[1];
 
+    // Sync VT size to the actual inner pane *before* painting cells.
+    let inner_w = chunks[1].width.saturating_sub(2);
+    let inner_h = chunks[1].height.saturating_sub(2);
+    if inner_w >= 20 && inner_h >= 5 {
+        let cols = inner_w;
+        let rows = inner_h;
+        if cols != term.cols || rows != term.rows {
+            term.cols = cols;
+            term.rows = rows;
+            term.parser.set_size(rows, cols);
+            if term.connected {
+                term.send_resize();
+            }
+        }
+    }
+
     let peer_hot = term.pick_peer || !term.connected;
     let title = term.peer_title();
     let peer_line = format!(
-        "SYSTEM  [ {title} ]  · n/[ ] cycle · click · {}",
-        if term.connected {
-            "connected"
-        } else {
-            "idle"
-        }
+        " SYSTEM  [ {title} ]   n/[ ] cycle · click   {}",
+        if term.connected { "connected" } else { "idle" }
     );
     f.render_widget(
-        Paragraph::new(peer_line).style(
-            Style::default()
-                .fg(if peer_hot { Color::Black } else { C_TEXT })
-                .bg(if peer_hot { C_ACCENT } else { C_BTN }),
-        ).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(if peer_hot { C_ACCENT } else { C_BORDER }))
-                .title(Span::styled(" shell target ", Style::default().fg(C_MUTED))),
-        ),
+        Paragraph::new(peer_line)
+            .style(
+                Style::default()
+                    .fg(if peer_hot { Color::Black } else { C_TEXT })
+                    .bg(if peer_hot { C_ACCENT } else { C_BTN }),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(if peer_hot { C_ACCENT } else { C_BORDER }))
+                    .title(Span::styled(" shell target ", Style::default().fg(C_MUTED)))
+                    .style(Style::default().bg(C_BTN)),
+            ),
         chunks[0],
     );
 
     let focus = term.active && !term.pick_peer;
-    f.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(if focus { C_OK } else { C_BORDER }))
-            .title(Span::styled(
-                format!(
-                    " PTY {}×{} · {} · {} ",
-                    term.cols,
-                    term.rows,
-                    if focus { "FOCUS" } else { "view" },
-                    term.status_msg
-                ),
-                Style::default().fg(C_ACCENT),
-            ))
-            .style(Style::default().bg(Color::Black).fg(C_TEXT)),
-        chunks[1],
-    );
-
-    let inner = Rect {
-        x: chunks[1].x + 1,
-        y: chunks[1].y + 1,
-        width: chunks[1].width.saturating_sub(2),
-        height: chunks[1].height.saturating_sub(2),
-    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if focus { C_OK } else { C_BORDER }))
+        .title(Span::styled(
+            format!(
+                " PTY {}x{} · {} · {} ",
+                term.cols,
+                term.rows,
+                if focus { "FOCUS" } else { "view" },
+                term.status_msg
+            ),
+            Style::default().fg(C_ACCENT),
+        ))
+        .style(Style::default().bg(Color::Black).fg(C_TEXT));
+    let inner = block.inner(chunks[1]);
+    f.render_widget(block, chunks[1]);
+    // Fill entire inner with black spaces so wide terminals never show ghosts.
+    if inner.width > 0 && inner.height > 0 {
+        let blank = " ".repeat(inner.width as usize);
+        for row in 0..inner.height {
+            f.render_widget(
+                Paragraph::new(blank.as_str())
+                    .style(Style::default().bg(Color::Black).fg(C_TEXT)),
+                Rect {
+                    x: inner.x,
+                    y: inner.y + row,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+        }
+    }
 
     let screen = term.parser.screen();
     let rows = inner.height.min(term.rows);
     let cols = inner.width.min(term.cols);
-    // vt100 returns (row, col) — NOT (x, y)
     let (cursor_row, cursor_col) = screen.cursor_position();
 
     for row in 0..rows {
@@ -422,11 +458,17 @@ pub fn draw(f: &mut TuiFrame, area: Rect, term: &mut TermPane) {
                     if s.is_empty() {
                         ' '
                     } else {
-                        s.chars().next().unwrap_or(' ')
+                        // Keep single-width; drop combining/wide leftovers
+                        let ch = s.chars().next().unwrap_or(' ');
+                        if ch.is_control() { ' ' } else { ch }
                     }
                 })
                 .unwrap_or(' ');
             line.push(ch);
+        }
+        // Pad to full row width so partial cells don't leave debris
+        while line.chars().count() < cols as usize {
+            line.push(' ');
         }
         f.render_widget(
             Paragraph::new(line).style(Style::default().fg(C_TEXT).bg(Color::Black)),
@@ -439,7 +481,6 @@ pub fn draw(f: &mut TuiFrame, area: Rect, term: &mut TermPane) {
         );
     }
 
-    // cursor: x = col, y = row
     let show_cursor = focus
         && term.scroll == 0
         && !screen.hide_cursor()
@@ -474,12 +515,13 @@ pub fn draw(f: &mut TuiFrame, area: Rect, term: &mut TermPane) {
     }
 
     let hint = if term.connected {
-        "Enter/i focus · arrows/keys remote · Ctrl+C to remote · Ctrl+Q detach · x disconnect"
+        " Enter/i focus · keys remote · Ctrl+C remote · Ctrl+Q detach · x disconnect"
     } else {
-        "n/[ ] choose system · Enter/c connect (peer agent must run)"
+        " n/[ ] choose system · Enter/c connect (peer agent must run)"
     };
     f.render_widget(
-        Paragraph::new(hint).style(Style::default().fg(C_MUTED)),
+        Paragraph::new(hint)
+            .style(Style::default().fg(C_MUTED).bg(Color::Rgb(18, 18, 24))),
         chunks[2],
     );
 }

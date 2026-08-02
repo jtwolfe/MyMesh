@@ -15,7 +15,7 @@ use qrcode::QrCode;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame as TuiFrame, Terminal};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -200,6 +200,8 @@ struct App {
     term: TermPane,
     poll: PeerPoll,
     kick: KickWizard,
+    /// Last known terminal size — used to force a clean redraw on resize.
+    term_size: (u16, u16),
 }
 
 pub async fn run_tui(paths: Paths) -> Result<()> {
@@ -260,6 +262,7 @@ pub async fn run_tui(paths: Paths) -> Result<()> {
             max_duration: Duration::from_secs(300),
         },
         kick: KickWizard::default(),
+        term_size: (0, 0),
     };
 
     let res = run_loop(&mut terminal, &mut app).await;
@@ -484,6 +487,15 @@ async fn run_loop(
             }
         }
 
+        // Detect size changes even if the backend missed Resize events.
+        if let Ok((w, h)) = crossterm::terminal::size() {
+            if app.term_size != (w, h) {
+                app.term_size = (w, h);
+                let _ = terminal.autoresize();
+                let _ = terminal.clear();
+            }
+        }
+
         terminal.draw(|f| ui(f, app))?;
         if app.should_quit {
             break;
@@ -492,9 +504,11 @@ async fn run_loop(
         if event::poll(Duration::from_millis(80))? {
             match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => {
-                    // Ctrl+C always quits
+                    // Ctrl+C quits only when NOT focused in remote shell
+                    let shell_focus = app.tab == Tab::Term && app.term.active && !app.term.pick_peer;
                     if k.modifiers.contains(KeyModifiers::CONTROL)
-                        && (k.code == KeyCode::Char('c') || k.code == KeyCode::Char('C'))
+                        && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('C'))
+                        && !shell_focus
                     {
                         app.should_quit = true;
                         continue;
@@ -518,7 +532,11 @@ async fn run_loop(
                         }
                     }
                 }
-                Event::Resize(_, _) => {}
+                Event::Resize(w, h) => {
+                    app.term_size = (w, h);
+                    let _ = terminal.autoresize();
+                    let _ = terminal.clear();
+                }
                 _ => {}
             }
         }
@@ -1648,33 +1666,61 @@ fn ui(f: &mut TuiFrame, app: &mut App) {
     app.tab_rects.clear();
 
     let root = f.area();
-    // dark background
+    // Full clear every frame — prevents ghost cells after resize / wide terminals.
+    f.render_widget(Clear, root);
     f.render_widget(
         Block::default().style(Style::default().bg(C_BG).fg(C_TEXT)),
         root,
     );
 
+    // Adaptive chrome: collapse action bar on short terminals.
+    let (header_h, action_h, status_h) = if root.height < 12 {
+        (3u16, 0u16, 1u16)
+    } else if root.height < 18 {
+        (3, 3, 1)
+    } else {
+        (3, 3, 2)
+    };
+
+    let mut constraints = vec![Constraint::Length(header_h)];
+    if action_h > 0 {
+        constraints.push(Constraint::Length(action_h));
+    }
+    constraints.push(Constraint::Min(3));
+    constraints.push(Constraint::Length(status_h));
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // title + tabs
-            Constraint::Length(3), // action buttons
-            Constraint::Min(8),    // content
-            Constraint::Length(2), // status
-        ])
+        .constraints(constraints)
         .split(root);
 
-    draw_header(f, chunks[0], app);
-    draw_action_bar(f, chunks[1], app);
-    app.content = chunks[2];
-    match app.tab {
-        Tab::Home => draw_home(f, chunks[2], app),
-        Tab::Peers => draw_peers(f, chunks[2], app),
-        Tab::Files => draw_files(f, chunks[2], app),
-        Tab::Term => term_pane::draw(f, chunks[2], &mut app.term),
-        Tab::Status => draw_status(f, chunks[2], app),
+    let mut i = 0usize;
+    draw_header(f, chunks[i], app);
+    i += 1;
+    if action_h > 0 {
+        draw_action_bar(f, chunks[i], app);
+        i += 1;
     }
-    draw_status_line(f, chunks[3], app);
+    let content = chunks[i];
+    i += 1;
+    let status = chunks[i];
+
+    app.content = content;
+    // Clear content region so panels never leave trails from previous tab/size.
+    f.render_widget(Clear, content);
+    f.render_widget(
+        Block::default().style(Style::default().bg(C_BG)),
+        content,
+    );
+
+    match app.tab {
+        Tab::Home => draw_home(f, content, app),
+        Tab::Peers => draw_peers(f, content, app),
+        Tab::Files => draw_files(f, content, app),
+        Tab::Term => term_pane::draw(f, content, &mut app.term),
+        Tab::Status => draw_status(f, content, app),
+    }
+    draw_status_line(f, status, app);
 }
 
 fn panel(title: &str) -> Block<'_> {
@@ -1689,13 +1735,24 @@ fn panel(title: &str) -> Block<'_> {
 }
 
 fn draw_header(f: &mut TuiFrame, area: Rect, app: &mut App) {
+    if area.width < 10 || area.height == 0 {
+        return;
+    }
+    f.render_widget(Clear, area);
+
+    let brand_w = 12u16.min(area.width / 4);
+    let ver_w = 14u16.min(area.width / 5);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(14), Constraint::Min(10), Constraint::Length(18)])
+        .constraints([
+            Constraint::Length(brand_w),
+            Constraint::Min(8),
+            Constraint::Length(ver_w),
+        ])
         .split(area);
 
     let brand = Paragraph::new(Line::from(vec![
-        Span::styled(" ◆ ", Style::default().fg(C_ACCENT2)),
+        Span::styled(" * ", Style::default().fg(C_ACCENT2)),
         Span::styled(
             "MyMesh",
             Style::default()
@@ -1711,14 +1768,7 @@ fn draw_header(f: &mut TuiFrame, area: Rect, app: &mut App) {
     );
     f.render_widget(brand, cols[0]);
 
-    // tab buttons with exact rects (account for borders: x+1)
-    let n = Tab::ALL.len() as u16;
     let tab_area = cols[1];
-    let inner_w = tab_area.width.saturating_sub(2);
-    let slot = if n == 0 { 1 } else { inner_w / n };
-    let mut x = tab_area.x.saturating_add(1);
-    let y = tab_area.y.saturating_add(1);
-    // background
     f.render_widget(
         Block::default()
             .borders(Borders::ALL)
@@ -1726,34 +1776,52 @@ fn draw_header(f: &mut TuiFrame, area: Rect, app: &mut App) {
             .style(Style::default().bg(C_PANEL)),
         tab_area,
     );
-    for tab in Tab::ALL {
-        let w = slot.max(8).min(16);
-        let r = Rect {
-            x,
-            y,
-            width: w.saturating_sub(1).max(1),
-            height: 1,
-        };
-        app.tab_rects.push((tab, r));
-        let selected = app.tab == tab;
-        let label = format!("[{}]{}", tab.key(), tab.title());
-        let style = if selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(C_ACCENT)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(C_MUTED).bg(C_BTN)
-        };
-        f.render_widget(Paragraph::new(label).style(style).alignment(Alignment::Center), r);
-        x = x.saturating_add(w);
+    let n = Tab::ALL.len() as u16;
+    let inner_w = tab_area.width.saturating_sub(2);
+    let inner_h = tab_area.height.saturating_sub(2).max(1);
+    if n > 0 && inner_w > 0 {
+        let base = inner_w / n;
+        let rem = inner_w % n;
+        let mut x = tab_area.x.saturating_add(1);
+        let y = tab_area.y.saturating_add(1);
+        for (i, tab) in Tab::ALL.iter().enumerate() {
+            let w = base + if (i as u16) < rem { 1 } else { 0 };
+            if w == 0 {
+                break;
+            }
+            let r = Rect {
+                x,
+                y,
+                width: w,
+                height: inner_h.min(1),
+            };
+            app.tab_rects.push((*tab, r));
+            let selected = app.tab == *tab;
+            let label = format!("[{}]{}", tab.key(), tab.title().trim());
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(C_ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(C_MUTED).bg(C_PANEL)
+            };
+            // Pad label visually by filling whole slot
+            f.render_widget(
+                Paragraph::new(label)
+                    .style(style)
+                    .alignment(Alignment::Center),
+                r,
+            );
+            x = x.saturating_add(w);
+        }
     }
 
     let ver = Paragraph::new(Line::from(Span::styled(
-        format!(" v{} ", env!("CARGO_PKG_VERSION")),
+        format!("v{}", env!("CARGO_PKG_VERSION")),
         Style::default().fg(C_MUTED),
     )))
-    .alignment(Alignment::Right)
+    .alignment(Alignment::Center)
     .block(
         Block::default()
             .borders(Borders::ALL)
@@ -1764,6 +1832,9 @@ fn draw_header(f: &mut TuiFrame, area: Rect, app: &mut App) {
 }
 
 fn push_btn(app: &mut App, f: &mut TuiFrame, id: &'static str, label: &str, rect: Rect, hot: bool) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
     app.buttons.push(Btn {
         id,
         rect,
@@ -1776,34 +1847,28 @@ fn push_btn(app: &mut App, f: &mut TuiFrame, id: &'static str, label: &str, rect
     } else {
         Style::default().fg(C_TEXT).bg(C_BTN)
     };
+    // Compact single-row buttons: solid fill, no nested borders (avoids edge artifacts).
     f.render_widget(
         Paragraph::new(label)
             .style(style)
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(if hot { C_ACCENT } else { C_BORDER })),
-            ),
+            .alignment(Alignment::Center),
         rect,
     );
 }
 
 fn draw_action_bar(f: &mut TuiFrame, area: Rect, app: &mut App) {
-    f.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(C_BORDER))
-            .title(Span::styled(" actions ", Style::default().fg(C_MUTED)))
-            .style(Style::default().bg(C_PANEL)),
-        area,
-    );
-    let inner = Rect {
-        x: area.x + 1,
-        y: area.y,
-        width: area.width.saturating_sub(2),
-        height: area.height,
-    };
+    if area.height < 3 || area.width < 8 {
+        return;
+    }
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_BORDER))
+        .title(Span::styled(" actions ", Style::default().fg(C_MUTED)))
+        .style(Style::default().bg(C_PANEL));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
     let specs: Vec<(&str, &str)> = match app.tab {
         Tab::Home => vec![
             ("arm", "[a] Arm"),
@@ -1824,16 +1889,16 @@ fn draw_action_bar(f: &mut TuiFrame, area: Rect, app: &mut App) {
         ],
         Tab::Files => vec![
             ("copy_lr", "[c] Transfer"),
-            ("clear_sel", "[x] Clear sel"),
-            ("src_node", "[n] Src node"),
-            ("dst_node", "[N] Dst node"),
+            ("clear_sel", "[x] Clear"),
+            ("src_node", "[n] Src"),
+            ("dst_node", "[N] Dst"),
             ("quit", "[q] Quit"),
         ],
         Tab::Term => vec![
             ("term_peer", "[n] Peer"),
-            ("term_connect", "[c/Enter] Connect"),
+            ("term_connect", "[c] Connect"),
             ("term_input", "[i] Focus"),
-            ("term_disc", "[x] Disconnect"),
+            ("term_disc", "[x] Disc"),
             ("quit", "[q] Quit"),
         ],
         Tab::Status => vec![
@@ -1844,21 +1909,26 @@ fn draw_action_bar(f: &mut TuiFrame, area: Rect, app: &mut App) {
         ],
     };
     let n = specs.len() as u16;
-    if n == 0 || inner.width < 4 {
+    if n == 0 || inner.width < 4 || inner.height == 0 {
         return;
     }
-    let slot = (inner.width / n).max(8);
+    // Equal columns across full width (no leftover gap on ultrawide).
+    let base = inner.width / n;
+    let rem = inner.width % n;
     let mut x = inner.x;
-    for (id, label) in specs {
-        let w = slot.min(18).min(inner.x + inner.width - x);
-        if w < 6 {
+    for (i, (id, label)) in specs.into_iter().enumerate() {
+        let w = base + if (i as u16) < rem { 1 } else { 0 };
+        if w < 4 {
             break;
         }
+        // 1px gap between buttons except last
+        let gap = if i + 1 < n as usize { 1u16 } else { 0 };
+        let bw = w.saturating_sub(gap).max(3);
         let r = Rect {
             x,
             y: inner.y,
-            width: w.saturating_sub(1).max(5),
-            height: 3,
+            width: bw,
+            height: inner.height.min(1).max(1),
         };
         let hot = match id {
             "arm" => ArmState::load(app.paths.arm_file())
@@ -1873,6 +1943,7 @@ fn draw_action_bar(f: &mut TuiFrame, area: Rect, app: &mut App) {
 }
 
 fn draw_home(f: &mut TuiFrame, area: Rect, app: &App) {
+    f.render_widget(Clear, area);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
@@ -2009,6 +2080,7 @@ fn draw_home(f: &mut TuiFrame, area: Rect, app: &App) {
 }
 
 fn draw_peers(f: &mut TuiFrame, area: Rect, app: &App) {
+    f.render_widget(Clear, area);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
@@ -2240,6 +2312,7 @@ fn spark_bar(ratio: f64, width: usize) -> String {
 }
 
 fn draw_files(f: &mut TuiFrame, area: Rect, app: &mut App) {
+    f.render_widget(Clear, area);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -2379,7 +2452,7 @@ fn file_list_items(
             let key = format!("{side}:{}", e.path);
             let marked = selected.contains(&key);
             let mark = if marked { "● " } else { "  " };
-            let icon = if e.is_dir { "📁" } else { "📄" };
+            let icon = if e.is_dir { "[D]" } else { " · " };
             let size = if e.is_dir {
                 String::new()
             } else {
@@ -2403,6 +2476,7 @@ fn file_list_items(
 }
 
 fn draw_status(f: &mut TuiFrame, area: Rect, app: &App) {
+    f.render_widget(Clear, area);
     let active = crate::install::service_is_active(false);
     let marker = std::fs::read_to_string(app.paths.install_marker()).unwrap_or_default();
     // try systemctl show
@@ -2443,15 +2517,20 @@ Install: mymesh install   ·  Uninstall: mymesh uninstall\n",
 }
 
 fn draw_status_line(f: &mut TuiFrame, area: Rect, app: &App) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    f.render_widget(Clear, area);
     let p = Paragraph::new(Line::from(vec![
-        Span::styled(" │ ", Style::default().fg(C_BORDER)),
+        Span::styled(" ", Style::default().fg(C_BORDER)),
         Span::styled(&app.status, Style::default().fg(C_TEXT)),
     ]))
+    .style(Style::default().bg(C_PANEL).fg(C_TEXT))
     .block(
         Block::default()
-            .borders(Borders::TOP)
+            .borders(if area.height > 1 { Borders::TOP } else { Borders::NONE })
             .border_style(Style::default().fg(C_BORDER))
-            .style(Style::default().bg(C_BG)),
+            .style(Style::default().bg(C_PANEL)),
     );
     f.render_widget(p, area);
 }
