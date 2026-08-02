@@ -124,6 +124,18 @@ enum FilesFocus {
     DstList,
 }
 
+/// Result of a background pane listing (never applied on the UI task's await).
+enum PaneListResult {
+    Src {
+        gen: u64,
+        entries: Result<Vec<BrowserEntry>, String>,
+    },
+    Dst {
+        gen: u64,
+        entries: Result<Vec<BrowserEntry>, String>,
+    },
+}
+
 struct FileBrowser {
     nodes: Vec<BrowserNode>,
     src_node: usize,
@@ -139,8 +151,16 @@ struct FileBrowser {
     dst_scroll: usize,
     /// Selected paths per side: "src:path" / "dst:path"
     selected: std::collections::HashSet<String>,
-    busy: String,
-    last_refresh: Instant,
+    busy_src: String,
+    busy_dst: String,
+    /// Generation bumped on node/cwd change; stale bg results are dropped.
+    refresh_gen: u64,
+    last_remote_src: Instant,
+    last_remote_dst: Instant,
+    src_inflight: bool,
+    dst_inflight: bool,
+    list_tx: mpsc::UnboundedSender<PaneListResult>,
+    list_rx: mpsc::UnboundedReceiver<PaneListResult>,
     /// Hit-test rects (updated each draw)
     src_list_rect: Rect,
     dst_list_rect: Rect,
@@ -212,26 +232,36 @@ pub async fn run_tui(paths: Paths) -> Result<()> {
         tab_rects: vec![],
         buttons: vec![],
         content: Rect::default(),
-        files: FileBrowser {
-            nodes: load_nodes(&paths),
-            src_node: 0,
-            dst_node: 0,
-            src_cwd: home.display().to_string(),
-            dst_cwd: home.display().to_string(),
-            src: local_to_browser(&list_local(&home)),
-            dst: local_to_browser(&list_local(&home)),
-            focus: FilesFocus::SrcList,
-            src_sel: 0,
-            dst_sel: 0,
-            src_scroll: 0,
-            dst_scroll: 0,
-            selected: std::collections::HashSet::new(),
-            busy: String::new(),
-            last_refresh: Instant::now() - Duration::from_secs(100),
-            src_list_rect: Rect::default(),
-            dst_list_rect: Rect::default(),
-            src_node_rect: Rect::default(),
-            dst_node_rect: Rect::default(),
+        files: {
+            let (list_tx, list_rx) = mpsc::unbounded_channel();
+            FileBrowser {
+                nodes: load_nodes(&paths),
+                src_node: 0,
+                dst_node: 0,
+                src_cwd: home.display().to_string(),
+                dst_cwd: home.display().to_string(),
+                src: local_to_browser(&list_local(&home)),
+                dst: local_to_browser(&list_local(&home)),
+                focus: FilesFocus::SrcList,
+                src_sel: 0,
+                dst_sel: 0,
+                src_scroll: 0,
+                dst_scroll: 0,
+                selected: std::collections::HashSet::new(),
+                busy_src: String::new(),
+                busy_dst: String::new(),
+                refresh_gen: 1,
+                last_remote_src: Instant::now() - Duration::from_secs(100),
+                last_remote_dst: Instant::now() - Duration::from_secs(100),
+                src_inflight: false,
+                dst_inflight: false,
+                list_tx,
+                list_rx,
+                src_list_rect: Rect::default(),
+                dst_list_rect: Rect::default(),
+                src_node_rect: Rect::default(),
+                dst_node_rect: Rect::default(),
+            }
         },
         term: TermPane {
             peer: None,
@@ -458,31 +488,12 @@ async fn run_loop(
             }
         }
 
-        // metrics poll
-        if app.poll.enabled {
-            if app.poll.started.elapsed() > app.poll.max_duration {
-                app.poll.enabled = false;
-                app.status = "metrics poll auto-stopped (5m remote window)".into();
-            } else if app.poll.last.elapsed() >= app.poll.interval {
-                if let Some(id) = selected_peer_id(app) {
-                    app.poll.last = Instant::now();
-                    match crate::probe::probe_host_metrics(&app.paths, &id).await {
-                        Ok(s) => {
-                            app.status = format!(
-                                "metrics {} · CPU {:.0}% · mem {}/{}",
-                                s.hostname,
-                                s.cpu_pct,
-                                human_bytes(s.mem_used_bytes),
-                                human_bytes(s.mem_total_bytes)
-                            );
-                        }
-                        Err(e) => app.status = format!("metrics err: {e}"),
-                    }
-                }
-            }
+        if app.poll.enabled && app.poll.started.elapsed() > app.poll.max_duration {
+            app.poll.enabled = false;
+            app.status = "metrics poll auto-stopped (5m remote window)".into();
         }
 
-        // Files: rebuild node list + auto-refresh panes every 2s
+        // Files: non-blocking — apply bg results + schedule peer lists off the UI task
         if app.tab == Tab::Files {
             app.files.nodes = load_nodes(&app.paths);
             if app.files.src_node >= app.files.nodes.len() {
@@ -491,9 +502,23 @@ async fn run_loop(
             if app.files.dst_node >= app.files.nodes.len() {
                 app.files.dst_node = 0;
             }
-            if app.files.last_refresh.elapsed() >= Duration::from_secs(2) {
-                app.files.last_refresh = Instant::now();
-                refresh_file_panes(app).await;
+            drain_file_list_results(app);
+            // local panes: cheap sync refresh; peers: background every 5s
+            schedule_file_refresh(app, false);
+        }
+
+        // Metrics poll also off UI thread
+        if app.poll.enabled
+            && app.poll.started.elapsed() <= app.poll.max_duration
+            && app.poll.last.elapsed() >= app.poll.interval
+        {
+            if let Some(id) = selected_peer_id(app) {
+                app.poll.last = Instant::now();
+                let paths = app.paths.clone();
+                let id = id.clone();
+                tokio::spawn(async move {
+                    let _ = crate::probe::probe_host_metrics(&paths, &id).await;
+                });
             }
         }
 
@@ -734,29 +759,29 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             }
             KeyCode::Char('[') => {
                 cycle_node(app, true, -1);
-                refresh_file_panes(app).await;
+                kick_file_refresh(app, true);
             }
             KeyCode::Char(']') => {
                 cycle_node(app, true, 1);
-                refresh_file_panes(app).await;
+                kick_file_refresh(app, true);
             }
             KeyCode::Char('{') => {
                 cycle_node(app, false, -1);
-                refresh_file_panes(app).await;
+                kick_file_refresh(app, true);
             }
             KeyCode::Char('}') => {
                 cycle_node(app, false, 1);
-                refresh_file_panes(app).await;
+                kick_file_refresh(app, true);
             }
             KeyCode::Char('n') => {
                 app.files.focus = FilesFocus::SrcNode;
                 cycle_node(app, true, 1);
-                refresh_file_panes(app).await;
+                kick_file_refresh(app, true);
             }
             KeyCode::Char('N') => {
                 app.files.focus = FilesFocus::DstNode;
                 cycle_node(app, false, 1);
-                refresh_file_panes(app).await;
+                kick_file_refresh(app, true);
             }
             KeyCode::Char(' ') => toggle_select(app),
             KeyCode::Enter => enter_file(app).await,
@@ -766,8 +791,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 app.status = "selection cleared".into();
             }
             KeyCode::Char('r') => {
-                app.files.last_refresh = Instant::now() - Duration::from_secs(100);
-                refresh_file_panes(app).await;
+                kick_file_refresh(app, true);
             }
             KeyCode::Backspace | KeyCode::Char('u') => files_go_up(app).await,
             _ => {}
@@ -880,12 +904,12 @@ async fn click_button(app: &mut App, id: &str) {
         "src_node" => {
             app.files.focus = FilesFocus::SrcNode;
             cycle_node(app, true, 1);
-            refresh_file_panes(app).await;
+            kick_file_refresh(app, true);
         }
         "dst_node" => {
             app.files.focus = FilesFocus::DstNode;
             cycle_node(app, false, 1);
-            refresh_file_panes(app).await;
+            kick_file_refresh(app, true);
         }
         "term_connect" => connect_term(app).await,
         "term_input" => {
@@ -1040,7 +1064,6 @@ fn cycle_node(app: &mut App, src: bool, delta: i32) {
         app.files.selected.retain(|k| !k.starts_with("dst:"));
         app.status = format!("dest → {}", app.files.nodes[app.files.dst_node].title());
     }
-    app.files.last_refresh = Instant::now() - Duration::from_secs(100);
 }
 
 fn toggle_select(app: &mut App) {
@@ -1110,13 +1133,13 @@ async fn handle_files_click(app: &mut App, col: u16, row: u16) {
     if rect_contains(app.files.src_node_rect, col, row) {
         app.files.focus = FilesFocus::SrcNode;
         cycle_node(app, true, 1);
-        refresh_file_panes(app).await;
+        kick_file_refresh(app, true);
         return;
     }
     if rect_contains(app.files.dst_node_rect, col, row) {
         app.files.focus = FilesFocus::DstNode;
         cycle_node(app, false, 1);
-        refresh_file_panes(app).await;
+        kick_file_refresh(app, true);
         return;
     }
     if rect_contains(app.files.src_list_rect, col, row) {
@@ -1140,60 +1163,139 @@ async fn handle_files_click(app: &mut App, col: u16, row: u16) {
     }
 }
 
-async fn refresh_file_panes(app: &mut App) {
-    let home = dirs_home();
-    // source
-    match load_pane_entries(&app.paths, &app.files.nodes, app.files.src_node, &app.files.src_cwd).await {
-        Ok(entries) => {
-            app.files.src = entries;
-            if app.files.src_sel >= app.files.src.len() && !app.files.src.is_empty() {
-                app.files.src_sel = app.files.src.len() - 1;
+fn drain_file_list_results(app: &mut App) {
+    while let Ok(msg) = app.files.list_rx.try_recv() {
+        match msg {
+            PaneListResult::Src { gen, entries } => {
+                if gen != app.files.refresh_gen {
+                    continue;
+                }
+                app.files.src_inflight = false;
+                match entries {
+                    Ok(list) => {
+                        app.files.src = list;
+                        app.files.busy_src.clear();
+                        if app.files.src_sel >= app.files.src.len() && !app.files.src.is_empty() {
+                            app.files.src_sel = app.files.src.len() - 1;
+                        }
+                    }
+                    Err(e) => app.files.busy_src = e,
+                }
+            }
+            PaneListResult::Dst { gen, entries } => {
+                if gen != app.files.refresh_gen {
+                    continue;
+                }
+                app.files.dst_inflight = false;
+                match entries {
+                    Ok(list) => {
+                        app.files.dst = list;
+                        app.files.busy_dst.clear();
+                        if app.files.dst_sel >= app.files.dst.len() && !app.files.dst.is_empty() {
+                            app.files.dst_sel = app.files.dst.len() - 1;
+                        }
+                    }
+                    Err(e) => app.files.busy_dst = e,
+                }
             }
         }
-        Err(e) => app.files.busy = format!("src: {e}"),
     }
-    match load_pane_entries(&app.paths, &app.files.nodes, app.files.dst_node, &app.files.dst_cwd).await {
-        Ok(entries) => {
-            app.files.dst = entries;
-            if app.files.dst_sel >= app.files.dst.len() && !app.files.dst.is_empty() {
-                app.files.dst_sel = app.files.dst.len() - 1;
-            }
-            if app.files.busy.starts_with("src:") {
-                // keep
-            } else {
-                app.files.busy.clear();
-            }
-        }
-        Err(e) => app.files.busy = format!("dst: {e}"),
-    }
-    let _ = home;
 }
 
-async fn load_pane_entries(
-    paths: &Paths,
-    nodes: &[BrowserNode],
-    idx: usize,
-    cwd: &str,
-) -> anyhow::Result<Vec<BrowserEntry>> {
-    let node = nodes.get(idx).cloned().unwrap_or(BrowserNode::Local);
-    match node {
+/// Immediate local fill + optional peer background fetch.
+fn kick_file_refresh(app: &mut App, force: bool) {
+    app.files.refresh_gen = app.files.refresh_gen.saturating_add(1);
+    // cancel conceptual inflight by gen bump
+    app.files.src_inflight = false;
+    app.files.dst_inflight = false;
+    schedule_file_refresh(app, force);
+}
+
+fn schedule_file_refresh(app: &mut App, force: bool) {
+    let gen = app.files.refresh_gen;
+    // --- source ---
+    let src_node = app
+        .files
+        .nodes
+        .get(app.files.src_node)
+        .cloned()
+        .unwrap_or(BrowserNode::Local);
+    match src_node {
         BrowserNode::Local => {
-            let dir = PathBuf::from(if cwd.is_empty() {
+            let dir = PathBuf::from(if app.files.src_cwd.is_empty() {
                 dirs_home().display().to_string()
             } else {
-                cwd.to_string()
+                app.files.src_cwd.clone()
             });
-            Ok(local_to_browser(&list_local(&dir)))
+            app.files.src = local_to_browser(&list_local(&dir));
+            app.files.busy_src.clear();
+            app.files.src_inflight = false;
         }
         BrowserNode::Peer { id, .. } => {
-            let path = if cwd == "~" || cwd.is_empty() {
-                "."
+            let due = force || app.files.last_remote_src.elapsed() >= Duration::from_secs(5);
+            if due && !app.files.src_inflight {
+                app.files.src_inflight = true;
+                app.files.last_remote_src = Instant::now();
+                app.files.busy_src = "loading…".into();
+                let paths = app.paths.clone();
+                let cwd = app.files.src_cwd.clone();
+                let tx = app.files.list_tx.clone();
+                tokio::spawn(async move {
+                    let entries = load_peer_entries(&paths, &id, &cwd).await;
+                    let _ = tx.send(PaneListResult::Src { gen, entries });
+                });
+            }
+        }
+    }
+    // --- dest ---
+    let dst_node = app
+        .files
+        .nodes
+        .get(app.files.dst_node)
+        .cloned()
+        .unwrap_or(BrowserNode::Local);
+    match dst_node {
+        BrowserNode::Local => {
+            let dir = PathBuf::from(if app.files.dst_cwd.is_empty() {
+                dirs_home().display().to_string()
             } else {
-                cwd
-            };
-            let entries = crate::probe::remote_list(paths, &id, path).await?;
+                app.files.dst_cwd.clone()
+            });
+            app.files.dst = local_to_browser(&list_local(&dir));
+            app.files.busy_dst.clear();
+            app.files.dst_inflight = false;
+        }
+        BrowserNode::Peer { id, .. } => {
+            let due = force || app.files.last_remote_dst.elapsed() >= Duration::from_secs(5);
+            if due && !app.files.dst_inflight {
+                app.files.dst_inflight = true;
+                app.files.last_remote_dst = Instant::now();
+                app.files.busy_dst = "loading…".into();
+                let paths = app.paths.clone();
+                let cwd = app.files.dst_cwd.clone();
+                let tx = app.files.list_tx.clone();
+                tokio::spawn(async move {
+                    let entries = load_peer_entries(&paths, &id, &cwd).await;
+                    let _ = tx.send(PaneListResult::Dst { gen, entries });
+                });
+            }
+        }
+    }
+}
+
+async fn load_peer_entries(
+    paths: &Paths,
+    id: &str,
+    cwd: &str,
+) -> Result<Vec<BrowserEntry>, String> {
+    let path = if cwd == "~" || cwd.is_empty() {
+        "."
+    } else {
+        cwd
+    };
+    match crate::probe::remote_list(paths, id, path).await {
+        Ok(entries) => {
             let mut v = remote_to_browser(&entries);
-            // inject parent if not root
             if path != "." && path != "/" {
                 let parent = Path::new(path)
                     .parent()
@@ -1212,6 +1314,7 @@ async fn load_pane_entries(
             }
             Ok(v)
         }
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -1250,7 +1353,7 @@ async fn files_go_up(app: &mut App) {
             app.files.dst_scroll = 0;
         }
     }
-    refresh_file_panes(app).await;
+    kick_file_refresh(app, true);
 }
 
 async fn enter_file(app: &mut App) {
@@ -1283,7 +1386,7 @@ async fn enter_file(app: &mut App) {
         app.files.dst_sel = 0;
         app.files.dst_scroll = 0;
     }
-    refresh_file_panes(app).await;
+    kick_file_refresh(app, true);
 }
 
 async fn transfer_selected(app: &mut App) {
@@ -1324,7 +1427,7 @@ async fn transfer_selected(app: &mut App) {
                 Err(err) => app.status = format!("copy {}: {err}", e.name),
             }
         }
-        refresh_file_panes(app).await;
+        kick_file_refresh(app, true);
         return;
     }
 
@@ -1381,7 +1484,7 @@ async fn transfer_selected(app: &mut App) {
     }
     app.files.selected.clear();
     app.status = format!("transfer done · ok={ok} err={err}");
-    refresh_file_panes(app).await;
+    kick_file_refresh(app, true);
 }
 
 async fn push_file_helper(
@@ -2288,18 +2391,29 @@ fn draw_files(f: &mut TuiFrame, area: Rect, app: &mut App) {
         &app.files.selected,
     );
 
+    let src_busy = if app.files.busy_src.is_empty() {
+        ""
+    } else {
+        app.files.busy_src.as_str()
+    };
+    let dst_busy = if app.files.busy_dst.is_empty() {
+        ""
+    } else {
+        app.files.busy_dst.as_str()
+    };
     let src_title = format!(
-        " {}  sel:{}  {}",
+        " {}  sel:{}  {} {}",
         app.files.src_cwd,
         app.files.selected.iter().filter(|k| k.starts_with("src:")).count(),
-        if matches!(app.files.focus, FilesFocus::SrcList) { "◀" } else { "" }
+        if matches!(app.files.focus, FilesFocus::SrcList) { "◀" } else { "" },
+        src_busy
     );
     let dst_title = format!(
         " {}  sel:{}  {} {}",
         app.files.dst_cwd,
         app.files.selected.iter().filter(|k| k.starts_with("dst:")).count(),
         if matches!(app.files.focus, FilesFocus::DstList) { "◀" } else { "" },
-        if app.files.busy.is_empty() { "" } else { app.files.busy.as_str() }
+        dst_busy
     );
 
     f.render_widget(
