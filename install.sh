@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# MyMesh source install helper (v0.1.0-alpha.1)
+# Builds the CLI from this repo. Does NOT install a systemd service yet.
+# See docs/INSTALL-POLICY.md for the planned install model.
 # MyMesh installer — builds from source on Linux and installs the mymesh binary.
 set -euo pipefail
 
