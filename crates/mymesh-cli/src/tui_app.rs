@@ -200,8 +200,12 @@ struct App {
     term: TermPane,
     poll: PeerPoll,
     kick: KickWizard,
-    /// Last known terminal size — used to force a clean redraw on resize.
+    /// Last *applied* terminal size (backend buffer).
     term_size: (u16, u16),
+    /// Most recent size observed from the OS (may be mid-animation).
+    pending_size: Option<(u16, u16)>,
+    /// When pending_size last changed — used to debounce Hyprland fullscreen storms.
+    pending_since: Option<Instant>,
 }
 
 pub async fn run_tui(paths: Paths) -> Result<()> {
@@ -263,6 +267,8 @@ pub async fn run_tui(paths: Paths) -> Result<()> {
         },
         kick: KickWizard::default(),
         term_size: (0, 0),
+        pending_size: None,
+        pending_since: None,
     };
 
     let res = run_loop(&mut terminal, &mut app).await;
@@ -440,6 +446,58 @@ fn bar_ratio(used: u64, total: u64) -> f64 {
     }
 }
 
+
+/// Record a size observation. Resets the debounce clock when size changes.
+fn note_pending_size(app: &mut App, w: u16, h: u16) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    match app.pending_size {
+        Some(prev) if prev == (w, h) => {}
+        _ => {
+            app.pending_size = Some((w, h));
+            app.pending_since = Some(Instant::now());
+        }
+    }
+}
+
+/// After ~120ms of a stable size (and it differs from the applied buffer),
+/// autoresize once and hard-clear. Avoids mid-animation corruption.
+fn try_apply_settled_resize(
+    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
+    app: &mut App,
+) -> Result<()> {
+    const SETTLE: Duration = Duration::from_millis(120);
+    let Some(pending) = app.pending_size else {
+        return Ok(());
+    };
+    let Some(since) = app.pending_since else {
+        return Ok(());
+    };
+    if since.elapsed() < SETTLE {
+        return Ok(());
+    }
+    // Re-check OS size — if still moving, keep waiting.
+    if let Ok((w, h)) = crossterm::terminal::size() {
+        if (w, h) != pending {
+            note_pending_size(app, w, h);
+            return Ok(());
+        }
+    }
+    if app.term_size == pending {
+        app.pending_size = None;
+        app.pending_since = None;
+        return Ok(());
+    }
+    app.term_size = pending;
+    app.pending_size = None;
+    app.pending_since = None;
+    let _ = terminal.autoresize();
+    // One clean slate after settle — not on every intermediate frame.
+    let _ = terminal.clear();
+    Ok(())
+}
+
 // ─── main loop ───────────────────────────────────────────────────────
 async fn run_loop(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
@@ -487,14 +545,13 @@ async fn run_loop(
             }
         }
 
-        // Detect size changes even if the backend missed Resize events.
+        // Hyprland fullscreen (and similar WMs) emit a storm of intermediate
+        // sizes. Applying clear/autoresize on every step desyncs the backend
+        // buffer and produces jumbled chrome. Debounce until size settles.
         if let Ok((w, h)) = crossterm::terminal::size() {
-            if app.term_size != (w, h) {
-                app.term_size = (w, h);
-                let _ = terminal.autoresize();
-                let _ = terminal.clear();
-            }
+            note_pending_size(app, w, h);
         }
+        try_apply_settled_resize(terminal, app)?;
 
         terminal.draw(|f| ui(f, app))?;
         if app.should_quit {
@@ -533,9 +590,8 @@ async fn run_loop(
                     }
                 }
                 Event::Resize(w, h) => {
-                    app.term_size = (w, h);
-                    let _ = terminal.autoresize();
-                    let _ = terminal.clear();
+                    // Only record — apply after debounce settle.
+                    note_pending_size(app, w, h);
                 }
                 _ => {}
             }
