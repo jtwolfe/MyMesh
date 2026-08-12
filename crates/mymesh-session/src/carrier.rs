@@ -574,6 +574,9 @@ async fn pair_decide(
             format!("write decision: {e}"),
         );
     }
+    // Drop pending immediately so GET /pending no longer lists it (align mock;
+    // prevents double-decide overwrite). take_decision still finds the decision file.
+    let _ = std::fs::remove_file(joins.pending_path(&device_id));
     // fingerprint + short only — never log full words
     info!(
         peer = %device_id.short(),
@@ -641,7 +644,11 @@ async fn api_peer(
 ) -> Json<serde_json::Value> {
     *st.pending_peer.lock().await = Some(body.uri.clone());
     *st.status.lock().await = format!("received peer ({} bytes) - host will dial", body.uri.len());
-    let _ = ArmState::arm(st.paths.arm_file(), 600);
+    // Do not re-arm when already armed: new until would invalidate pair/v1 bootstrap token/QR.
+    let arm = ArmState::load(st.paths.arm_file()).unwrap_or_default();
+    if !arm.is_effectively_armed() {
+        let _ = ArmState::arm(st.paths.arm_file(), 600);
+    }
     let path = carrier_pending_path(&st.paths);
     let _ = std::fs::write(&path, body.uri.as_bytes());
     Json(serde_json::json!({
@@ -894,12 +901,36 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["state"], "accepted");
 
+        // pending tombstoned immediately (no double-decide / list leak)
+        assert!(joins.list_pending().unwrap().is_empty());
+        // double-decide → not_found; decision still readable by host take_decision
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/pair/v1/decide")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "device_id_hex": joiner.to_string(),
+                            "decision": "deny",
+                            "reason": "late"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_body(resp).await["state"], "not_found");
+
         let d = joins.take_decision(&joiner).unwrap().unwrap();
         assert!(matches!(d, JoinDecision::Accept));
 
-        // not_found — re-open router state; bootstrap restored from disk
+        // not_found for unknown id — re-open router; bootstrap restored from disk
         let st2 = test_state(paths.clone(), secret, "host");
-        // restore same token from disk
         let token2 = mint_token(&st2).await;
         assert_eq!(token, token2);
         joins
@@ -958,11 +989,45 @@ mod tests {
             .unwrap();
         let v = json_body(resp).await;
         assert_eq!(v["state"], "denied");
+        assert!(joins.list_pending().unwrap().is_empty());
         let d = joins.take_decision(&joiner).unwrap().unwrap();
         match d {
             JoinDecision::Deny { reason } => assert_eq!(reason, "nope"),
             _ => panic!("expected deny"),
         }
+    }
+
+    #[tokio::test]
+    async fn html_api_peer_does_not_rearm_when_armed() {
+        let paths = tmp_paths();
+        let secret = [0x66u8; 32];
+        let first = ArmState::arm(paths.arm_file(), 900).unwrap();
+        let until = first.until.expect("until set");
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        let st = test_state(paths.clone(), secret, "host");
+        let _token = mint_token(&st).await;
+        let app = build_router(st);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/peer")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"uri":"mymesh://join/ab"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let arm = ArmState::load(paths.arm_file()).unwrap();
+        assert!(arm.is_effectively_armed());
+        assert_eq!(
+            arm.until,
+            Some(until),
+            "HTML peer must not change arm.until"
+        );
     }
 
     #[tokio::test]
