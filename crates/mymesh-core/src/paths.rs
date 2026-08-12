@@ -91,4 +91,9 @@ impl Paths {
     pub fn mmk_runtime_file(&self) -> PathBuf {
         self.data_dir.join("mmk-runtime.json")
     }
+
+    /// Person owner claim file (mode 0600). Written by owner claim (S4 / B4).
+    pub fn mesh_owner_file(&self) -> PathBuf {
+        self.data_dir.join("mesh-owner.json")
+    }
 }
