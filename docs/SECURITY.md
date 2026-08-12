@@ -2,6 +2,7 @@
 
 **Audience:** operators running MyMesh v0.1.0-alpha.x  
 **Status:** best-effort documentation; not a formal audit.  
+**Threat model & S9 controls:** **[THREATS.md](THREATS.md)** (C1–C7 checklist, implemented vs planned)  
 **S0 contracts:** [MASTER-KEY.md](MASTER-KEY.md), [GRANTS.md](GRANTS.md), [GUEST.md](GUEST.md), [PAIR-V2.md](PAIR-V2.md), [CARRIER-NEXT.md](CARRIER-NEXT.md)
 
 ## Trust model
@@ -33,6 +34,22 @@ Default member grant remains **without** Admin (`terminal` / `files` / `desktop`
 
 - **v1:** LAN `host` required in QR; phone HTTP decide ([JOIN.md](JOIN.md)).
 - **v2:** optional host; **required session nonce**; confirm codes as Crockford base32 **4-4**; unbound confirm fails **`not_bound`** closed (no hang). See [PAIR-V2.md](PAIR-V2.md).
+
+## S9 control checklist (summary)
+
+Full detail, threat narratives, and honest status: **[THREATS.md](THREATS.md)**. Source design: [CARRIER-NEXT.md](CARRIER-NEXT.md) §S9.
+
+| ID | Threat | Control | Status (this tree) |
+|----|--------|---------|---------------------|
+| **C1** | Session fixation | token + sid + nonce + TTL | **Implemented** (pair v2) |
+| **C2** | Wrong joiner accept | bind joiner_did + confirm HMAC | **Implemented** |
+| **C3** | Backup theft | password Argon2id AEAD | **Implemented** (owner sealed backup; MMK wrap separate) |
+| **C4** | Guest residual | wipe + grant revoke | **Partial** — revoke done; continuity wipe planned (S8) |
+| **C5** | Topology MITM | mesh-auth session; optional sig | **Partial** — mesh session enforced; `snapshot_sig` not yet |
+| **C6** | Facet bleed | allowlists enforced S7 | **Planned** (schema only today) |
+| **C7** | Decide brute force | rate limits | **Planned** (PR D1) |
+
+Do **not** claim full S9 hardening until D1–D3 land and C4 residual wipe (Wave E) is real.
 
 ## What linking proves
 
@@ -68,6 +85,9 @@ Prefer private disclosure for exploitable bugs until a security contact is forma
 - Resistance to malicious trusted peers
 - Stable threat model under system-wide install
 - Formal verification or third-party audit
+- Online rate limits for pair decide / backup unwrap (**C7** — planned)
+- Multi-identity facet isolation (**C6** — planned S7)
+- Continuity wipe-on-leave for guest residual data (**C4** complete path — planned S8)
 
 ## Magic plane & SSH (alpha.3)
 
@@ -79,6 +99,6 @@ Prefer private disclosure for exploitable bugs until a security contact is forma
 
 ## See also
 
+- **[THREATS.md](THREATS.md)** — threat catalog + C1–C7 implemented vs planned  
 - [MASTER-KEY.md](MASTER-KEY.md) · [GRANTS.md](GRANTS.md) · [GUEST.md](GUEST.md) · [PAIR-V2.md](PAIR-V2.md)  
 - [JOIN.md](JOIN.md) · [CARRIER-NEXT.md](CARRIER-NEXT.md) · [ARCHITECTURE.md](ARCHITECTURE.md)
-

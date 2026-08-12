@@ -9,7 +9,7 @@
 | **Repos** | `~/Workspace/carrier`, `~/Workspace/MyMesh` |
 | **Scope** | Full next phase after alpha.1 (slices S0–S9, waves A–E) |
 | **Out of scope (implementation)** | GlassSpear site/agent work — parked as future consumer of Carrier identity/presence and Continuity packs |
-| **Normative priors** | Carrier: `docs/PLATFORM.md`, `docs/TRUST-MODEL.md`, `docs/protocol/PAIR-HTTP.md`, `docs/protocol/PAIRING.md`, `docs/design/ALPHA-1.md`, `docs/THREATS.md`, `docs/FACETS.md`, `docs/RELATIONSHIP.md`. MyMesh: `docs/JOIN.md`, `docs/SECURITY.md`, `docs/ARCHITECTURE.md`, `docs/ALPHA-3.md`, `docs/ROADMAP.md` |
+| **Normative priors** | Carrier: `docs/PLATFORM.md`, `docs/TRUST-MODEL.md`, `docs/protocol/PAIR-HTTP.md`, `docs/protocol/PAIRING.md`, `docs/design/ALPHA-1.md`, `docs/THREATS.md`, `docs/FACETS.md`, `docs/RELATIONSHIP.md`. MyMesh: `docs/JOIN.md`, `docs/SECURITY.md`, `docs/THREATS.md` (S9 C1–C7), `docs/ARCHITECTURE.md`, `docs/ALPHA-3.md`, `docs/ROADMAP.md` |
 
 ---
 
@@ -1153,6 +1153,8 @@ Metrics dir: extend MyMesh `paths.metrics_dir` JSON counters (existing metrics p
 | C6 | Facet bleed | allowlists enforced S7 |
 | C7 | Decide brute force | rate limits above |
 
+**Operator-facing expansion (implemented vs planned in this tree):** [THREATS.md](THREATS.md) · [SECURITY.md](SECURITY.md).
+
 ---
 
 ## API / Interface Changes (summary)
@@ -1272,6 +1274,8 @@ Reject dual-authority north star; recovery matrix needs both.
 | MMK lost, owner alive | Admin lockout | recover-master --owner-proof | S3/S4 |
 | Owner lost, MMK alive | Person lockout | MMK clear owner; new claim | S4 |
 | Audit secret leak | Tokens | Redaction | S9 |
+
+Living checklist with honest **implemented vs planned** status: **[THREATS.md](THREATS.md)** (C1–C7). Operator model: [SECURITY.md](SECURITY.md).
 
 ### AuthN/Z summary
 

@@ -445,7 +445,8 @@ carrier phone timeout?
 - [ALPHA-3.md](ALPHA-3.md) — magic plane  
 - [JOIN.md](JOIN.md) — pairing details  
 - [PAIR-V2.md](PAIR-V2.md) · [DEMO-PAIR.md](DEMO-PAIR.md) · [MASTER-KEY.md](MASTER-KEY.md) · [GRANTS.md](GRANTS.md) · [GUEST.md](GUEST.md)  
-- [SECURITY.md](SECURITY.md) — threat model  
+- [SECURITY.md](SECURITY.md) — operator security model  
+- [THREATS.md](THREATS.md) — threat catalog + S9 control checklist C1–C7  
 - [CARRIER-NEXT.md](CARRIER-NEXT.md) — S0–S9 design  
 
 - [ROADMAP.md](ROADMAP.md) — next releases  

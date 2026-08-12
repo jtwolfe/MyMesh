@@ -159,7 +159,8 @@ Linking model: **[docs/JOIN.md](docs/JOIN.md)**
 | [docs/GRANTS.md](docs/GRANTS.md) | S0: grant schema |
 | [docs/GUEST.md](docs/GUEST.md) | S0: guest membership (no full roster) |
 | [docs/CARRIER-NEXT.md](docs/CARRIER-NEXT.md) | S0–S9 design (MyMesh + Carrier next phase) |
-| [docs/SECURITY.md](docs/SECURITY.md) | Threat model (alpha) |
+| [docs/SECURITY.md](docs/SECURITY.md) | Operator security model (alpha) |
+| [docs/THREATS.md](docs/THREATS.md) | Threat catalog + S9 control checklist C1–C7 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crate layout, endpoint ownership |
 | [docs/INSTALL-POLICY.md](docs/INSTALL-POLICY.md) | User vs root install |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | What’s next |
@@ -195,6 +196,8 @@ crates/
 - **Files** sandboxed (default: home)
 - A compromised linked peer with Terminal+Files is powerful — unlink / kick promptly
 - Firewall helper is **explicit only**; never opens ports by itself
+
+Threat model and S9 controls **C1–C7** (session fixation, wrong joiner, backup theft, guest residual, topology MITM, facet bleed, decide rate limits): **[docs/THREATS.md](docs/THREATS.md)** · operator notes: **[docs/SECURITY.md](docs/SECURITY.md)**
 
 ---
 

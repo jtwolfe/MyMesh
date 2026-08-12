@@ -5,7 +5,7 @@
 | **Status** | Normative contract freeze (S0) |
 | **Slice** | S1–S2 implement; this doc freezes wire, confirm algorithm, fail-closed rules |
 | **Source** | [CARRIER-NEXT.md](CARRIER-NEXT.md) §S0–S2, Wave A protocol appendix |
-| **Related** | [DEMO-PAIR.md](DEMO-PAIR.md) (E2E demo), [JOIN.md](JOIN.md), [MASTER-KEY.md](MASTER-KEY.md), [GUEST.md](GUEST.md), [SECURITY.md](SECURITY.md) |
+| **Related** | [DEMO-PAIR.md](DEMO-PAIR.md) (E2E demo), [JOIN.md](JOIN.md), [MASTER-KEY.md](MASTER-KEY.md), [GUEST.md](GUEST.md), [SECURITY.md](SECURITY.md), [THREATS.md](THREATS.md) (C1–C2) |
 
 ---
 
