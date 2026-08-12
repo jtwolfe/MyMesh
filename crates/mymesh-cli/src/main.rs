@@ -1359,6 +1359,14 @@ fn cmd_grant_create(
     let _auth = mymesh_core::AdminAuthority::host_local();
     debug_assert!(_auth.may_mutate_local_store());
 
+    // S9: grant mutate 30 / min / session (host-local CLI uses fixed session key).
+    if let Err(rl) = mymesh_core::rate_limit_check(
+        mymesh_core::LimitKind::GrantMutate,
+        mymesh_core::HOST_LOCAL_SESSION,
+    ) {
+        bail!("rate_limited: grant mutate; retry after {}s", rl.retry_after_secs);
+    }
+
     let identity = Identity::load_or_create(paths.identity_file())?;
     let local_id = identity.device_id();
     let mesh = MeshState::load(paths.mesh_file())?;
@@ -1385,6 +1393,7 @@ fn cmd_grant_create(
             IssuedBy::device(&local_id),
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    mymesh_core::record_grant_mutate(paths.metrics_dir());
 
     println!(
         "{} grant {}  guest {} → object {}",
@@ -1461,10 +1470,17 @@ fn cmd_grant_list(paths: &Paths, json: bool, all: bool) -> Result<()> {
 
 fn cmd_grant_revoke(paths: &Paths, grant_id: &str) -> Result<()> {
     let _auth = mymesh_core::AdminAuthority::host_local();
+    if let Err(rl) = mymesh_core::rate_limit_check(
+        mymesh_core::LimitKind::GrantMutate,
+        mymesh_core::HOST_LOCAL_SESSION,
+    ) {
+        bail!("rate_limited: grant mutate; retry after {}s", rl.retry_after_secs);
+    }
     let mut grants = GrantStore::open(paths.grants_file())?;
     let g = grants
         .revoke(grant_id.trim())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    mymesh_core::record_grant_mutate(paths.metrics_dir());
     println!(
         "{} revoked grant {} (subject {} → object)",
         style("ok").green().bold(),
@@ -2450,8 +2466,13 @@ fn cmd_owner_backup_store(
         owner.mark_backup_stored();
         owner.save(paths.mesh_owner_file())?;
     }
-    // Smoke-check roundtrip.
-    let (out, _) = unseal_owner_backup(password.as_bytes(), &sealed)?;
+    // Smoke-check roundtrip under S9 unwrap rate limit (5 / 15 min / person_id).
+    let (out, _) = rate_limited_unseal_owner_backup(
+        paths,
+        person_id,
+        password.as_bytes(),
+        &sealed,
+    )?;
     if out != seed {
         bail!("internal: backup roundtrip mismatch");
     }
@@ -2462,6 +2483,34 @@ fn cmd_owner_backup_store(
         paths.owner_backup_file().display()
     );
     Ok(())
+}
+
+/// S9: rate-limit backup unwrap attempts (5 / 15 min / person_id) and record metrics.
+fn rate_limited_unseal_owner_backup(
+    paths: &Paths,
+    person_id: &str,
+    password: &[u8],
+    sealed: &OwnerBackupSealed,
+) -> Result<([u8; 32], String)> {
+    if let Err(rl) =
+        mymesh_core::rate_limit_check(mymesh_core::LimitKind::OwnerBackupUnwrap, person_id)
+    {
+        mymesh_core::record_owner_backup_unwrap(paths.metrics_dir(), "rate_limited");
+        bail!(
+            "rate_limited: owner backup unwrap; retry after {}s",
+            rl.retry_after_secs
+        );
+    }
+    match unseal_owner_backup(password, sealed) {
+        Ok(v) => {
+            mymesh_core::record_owner_backup_unwrap(paths.metrics_dir(), "ok");
+            Ok(v)
+        }
+        Err(e) => {
+            mymesh_core::record_owner_backup_unwrap(paths.metrics_dir(), "fail");
+            Err(e.into())
+        }
+    }
 }
 
 /// Read MMK password from (in order): `--password-file`, `MYMESH_MMK_PASSWORD`, interactive prompt.

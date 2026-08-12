@@ -12,8 +12,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use console::style;
 use mymesh_core::{
-    apply_pair_confirm, ArmState, Config, JoinDecision, JoinStore, MeshState, NodeFingerprint,
-    PairEndpointClass, PairPhase, PairSessionStore, Paths,
+    apply_pair_confirm, record_pair_decide, ArmState, Config, JoinDecision, JoinStore, MeshState,
+    NodeFingerprint, PairEndpointClass, PairPhase, PairSessionStore, Paths,
 };
 use mymesh_crypto::{parse_device_id, Identity};
 use mymesh_session::{build_pair_qr_v2, run_join_as_guest, PairQrV2Params};
@@ -173,6 +173,7 @@ pub async fn cmd_pair_confirm(
                 JoinDecision::Accept => "accept",
                 JoinDecision::Deny { .. } => "deny",
             };
+            record_pair_decide(paths.metrics_dir(), kind);
             println!(
                 "{} pair confirm {kind} for joiner {} (sid {})",
                 style("ok").green().bold(),
@@ -186,9 +187,14 @@ pub async fn cmd_pair_confirm(
             Ok(())
         }
         Err(e) => {
+            // S9 metrics: bad_code / rate_limited results on decide/confirm path.
+            let code = e.code();
+            if matches!(code, "bad_code" | "rate_limited") {
+                record_pair_decide(paths.metrics_dir(), code);
+            }
             eprintln!("{} {}", style("error").red().bold(), e);
             // Map to process exit via bail so main returns non-zero.
-            bail!("{}", e.code());
+            bail!("{}", code);
         }
     }
 }

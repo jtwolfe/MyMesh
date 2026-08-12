@@ -34,8 +34,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use mymesh_core::{
-    Capability, DeviceId, DeviceRecord, DeviceStore, MeshState, NodeFingerprint, PairPhase,
-    PairSessionStore, Paths, TrustState,
+    record_mesh_auth_challenge, Capability, DeviceId, DeviceRecord, DeviceStore, LimitKind,
+    MeshState, NodeFingerprint, PairPhase, PairSessionStore, Paths, RateLimitState, TrustState,
 };
 use mymesh_crypto::{
     accept_owner_claim, check_claim_authorized, resolve_claim_fingerprint, ClaimAuthMethod,
@@ -216,6 +216,8 @@ pub struct MeshApiState {
     pub secret: [u8; 32],
     pub label: String,
     pub auth: Arc<Mutex<MeshAuthStore>>,
+    /// Shared with carrier for IP-scoped S9 limits.
+    pub rate_limits: Arc<RateLimitState>,
 }
 
 pub fn mesh_v1_routes(st: MeshApiState) -> Router {
@@ -309,6 +311,40 @@ fn mesh_err(status: StatusCode, code: &'static str, error: impl Into<String>) ->
         .into_response()
 }
 
+fn mesh_rate_limited(retry_after_secs: u64) -> Response {
+    let mut resp = mesh_err(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limited",
+        format!("rate limit exceeded; retry after {retry_after_secs}s"),
+    );
+    let hv = header::HeaderValue::from_str(&retry_after_secs.to_string())
+        .unwrap_or_else(|_| header::HeaderValue::from_static("60"));
+    resp.headers_mut().insert(header::RETRY_AFTER, hv);
+    resp
+}
+
+/// Client key for IP-scoped limits: X-Forwarded-For → X-Real-IP → "unknown".
+fn client_ip_key(headers: &HeaderMap) -> String {
+    if let Some(xff) = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(first) = xff.split(',').next() {
+            let t = first.trim();
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
+    }
+    if let Some(rip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        let t = rip.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    "unknown".into()
+}
+
 fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     let val = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let rest = val
@@ -387,7 +423,15 @@ fn methods_allowed(paths: &Paths) -> Vec<&'static str> {
 
 // ── Handlers ────────────────────────────────────────────────────────────────
 
-async fn auth_challenge(State(st): State<MeshApiState>) -> Response {
+async fn auth_challenge(State(st): State<MeshApiState>, headers: HeaderMap) -> Response {
+    // S9: 30 / min / ip
+    let ip = client_ip_key(&headers);
+    if let Err(rl) = st.rate_limits.check(LimitKind::MeshAuthChallenge, &ip) {
+        record_mesh_auth_challenge(st.paths.metrics_dir());
+        return mesh_rate_limited(rl.retry_after_secs);
+    }
+    record_mesh_auth_challenge(st.paths.metrics_dir());
+
     let mesh = match MeshState::load(st.paths.mesh_file()) {
         Ok(m) => m,
         Err(e) => {
@@ -1426,6 +1470,7 @@ mod tests {
             secret,
             label: label.into(),
             auth: Arc::new(Mutex::new(MeshAuthStore::default())),
+            rate_limits: Arc::new(RateLimitState::new()),
         }
     }
 
@@ -2237,5 +2282,62 @@ mod tests {
         let b = auth_challenge_preimage("cid", &nonce, "mesh", AuthMethod::MrkProof);
         assert_ne!(a, b);
         assert!(a.starts_with(AUTH_DOMAIN));
+    }
+
+    /// S9: mesh auth challenge — 30 / min / ip → 429 + mesh_auth_challenge_total.
+    #[tokio::test]
+    async fn auth_challenge_rate_limit_per_ip() {
+        let paths = tmp_paths();
+        let secret = [0xD1u8; 32];
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        let metrics = paths.metrics_dir();
+        let st = test_state(paths, secret, "host");
+        let app = mesh_v1_routes(st);
+
+        let ip = "198.51.100.7";
+        let limit = mymesh_core::MESH_AUTH_CHALLENGE.max as usize;
+        for i in 0..limit {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/mesh/v1/auth/challenge")
+                        .header("x-forwarded-for", ip)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "hit {i}");
+        }
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/mesh/v1/auth/challenge")
+                    .header("x-forwarded-for", ip)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(json_body(resp).await["code"], "rate_limited");
+
+        // Other IP ok
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mesh/v1/auth/challenge")
+                    .header("x-forwarded-for", "198.51.100.8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let counters = mymesh_core::EventCounters::load(&metrics).unwrap();
+        assert!(counters.mesh_auth_challenge_total > limit as u64);
     }
 }
