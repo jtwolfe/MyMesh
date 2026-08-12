@@ -175,9 +175,27 @@ All three require `Authorization: Bearer <mesh session>` (fail closed: 401 witho
 - `object_device_id_hex` optional — defaults to **serving host**.
 - `capabilities`: subset of `terminal` | `files` | `desktop` | `tcp` (`admin` rejected).
 - `days` optional → `constraints.not_after`.
-- Response: grant object (201); `issued_by` reflects auth method (`person_id` | `master_key_proof` | `device_id`).
 
-**List:** `{ "grants": [ /* Grant */ ] }`. Active only unless `?all=true`.
+**HTTP response DTO** (hex DeviceIds — mesh/v1 convention; on-disk `grants.json` may still use raw bytes from C1 serde):
+
+```json
+{
+  "grant_id": "<ULID>",
+  "mesh_id": "<UUID>",
+  "subject_device_id_hex": "<64-hex>",
+  "object": { "kind": "device", "device_id_hex": "<64-hex>" },
+  "role": "guest",
+  "capabilities": ["terminal", "files"],
+  "constraints": { "not_after": "..." },
+  "issued_by": { "kind": "person_id|master_key_proof|device_id", "value": "..." },
+  "issued_at": "<RFC3339>",
+  "revoked_at": null
+}
+```
+
+Create returns **201** + that object; `issued_by` reflects auth method.
+
+**List:** `{ "grants": [ /* GrantHttp */ ] }`. Active only unless `?all=true`.
 
 **Revoke:** returns grant with `revoked_at` set (idempotent if already revoked). 404 `grant_not_found` if missing.
 

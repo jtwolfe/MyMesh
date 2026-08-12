@@ -41,9 +41,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use mymesh_core::{
-    not_after_days, parse_capabilities, Capability, DeviceId, DeviceRecord, DeviceStore, Grant,
-    GrantStore, IssuedBy, MeshState, NodeFingerprint, PairPhase, PairSessionStore, Paths,
-    TrustState,
+    not_after_days, parse_capabilities, Capability, DeviceId, DeviceRecord, DeviceStore, Error,
+    Grant, GrantConstraints, GrantObject, GrantRole, GrantStore, IssuedBy, MeshState,
+    NodeFingerprint, PairPhase, PairSessionStore, Paths, TrustState,
 };
 use mymesh_crypto::{
     accept_owner_claim, check_claim_authorized, resolve_claim_fingerprint, ClaimAuthMethod,
@@ -1278,9 +1278,53 @@ struct ListGrantsQuery {
     all: bool,
 }
 
+/// HTTP wire grant — DeviceIds as hex (mesh/v1 convention). Store serde stays bytes.
+#[derive(Serialize)]
+struct GrantHttp {
+    grant_id: String,
+    mesh_id: String,
+    subject_device_id_hex: String,
+    object: GrantObjectHttp,
+    role: GrantRole,
+    capabilities: Vec<Capability>,
+    constraints: GrantConstraints,
+    issued_by: IssuedBy,
+    issued_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum GrantObjectHttp {
+    Device { device_id_hex: String },
+}
+
+impl From<&Grant> for GrantHttp {
+    fn from(g: &Grant) -> Self {
+        let object = match &g.object {
+            GrantObject::Device { device_id } => GrantObjectHttp::Device {
+                device_id_hex: device_id.to_string(),
+            },
+        };
+        Self {
+            grant_id: g.grant_id.clone(),
+            mesh_id: g.mesh_id.clone(),
+            subject_device_id_hex: g.subject_device_id.to_string(),
+            object,
+            role: g.role,
+            capabilities: g.capabilities.clone(),
+            constraints: g.constraints.clone(),
+            issued_by: g.issued_by.clone(),
+            issued_at: g.issued_at,
+            revoked_at: g.revoked_at,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct GrantsListResponse {
-    grants: Vec<Grant>,
+    grants: Vec<GrantHttp>,
 }
 
 /// Authz for grant create/list/revoke (docs/GRANTS.md + CARRIER-NEXT matrix).
@@ -1301,6 +1345,12 @@ fn require_grants_mutate_authz(
                     "device_member session missing subject device",
                 )
             })?;
+            // Serving host = agent identity (data-dir owner); not host-local CLI but
+            // same process trust as filesystem access for this node.
+            let host_id = host_identity(&st.secret).device_id();
+            if device_id == host_id {
+                return Ok(());
+            }
             let store = DeviceStore::open(st.paths.devices_file()).map_err(|e| {
                 mesh_err(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1308,28 +1358,27 @@ fn require_grants_mutate_authz(
                     format!("device store: {e}"),
                 )
             })?;
+            let Some(rec) = store.get(&device_id) else {
+                return Err(mesh_err(
+                    StatusCode::FORBIDDEN,
+                    "not_member",
+                    "device not in mesh store",
+                ));
+            };
             // Explicit guest reject (fail closed; guests never get Admin path).
-            if let Some(rec) = store.get(&device_id) {
-                if rec.mesh_role.is_guest() {
-                    return Err(mesh_err(
-                        StatusCode::FORBIDDEN,
-                        "guest_forbidden",
-                        "guests cannot create, list, or revoke grants",
-                    ));
-                }
-                if rec.trust != TrustState::Trusted {
-                    return Err(mesh_err(
-                        StatusCode::FORBIDDEN,
-                        "not_member",
-                        "device is not Trusted",
-                    ));
-                }
+            if rec.mesh_role.is_guest() {
+                return Err(mesh_err(
+                    StatusCode::FORBIDDEN,
+                    "guest_forbidden",
+                    "guests cannot create, list, or revoke grants",
+                ));
             }
-            // Serving host self-auth is not host-local CLI — require Admin on record
-            // or treat host identity as agent-local authority (data-dir owner).
-            let host_id = host_identity(&st.secret).device_id();
-            if device_id == host_id {
-                return Ok(());
+            if rec.trust != TrustState::Trusted {
+                return Err(mesh_err(
+                    StatusCode::FORBIDDEN,
+                    "not_member",
+                    "device is not Trusted",
+                ));
             }
             if !store.has_admin(&device_id) {
                 return Err(mesh_err(
@@ -1475,19 +1524,14 @@ async fn grants_create(
         not_after_days(body.days),
         issued_by_for_session(&st, &session),
     ) {
-        Ok(g) => (StatusCode::CREATED, Json(g)).into_response(),
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("Admin") || msg.contains("empty") {
-                mesh_err(StatusCode::BAD_REQUEST, "invalid_caps", msg)
-            } else {
-                mesh_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal",
-                    format!("create grant: {msg}"),
-                )
-            }
-        }
+        Ok(g) => (StatusCode::CREATED, Json(GrantHttp::from(&g))).into_response(),
+        // Config = validation (empty caps / Admin on guest); other variants unexpected.
+        Err(Error::Config(msg)) => mesh_err(StatusCode::BAD_REQUEST, "invalid_caps", msg),
+        Err(e) => mesh_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("create grant: {e}"),
+        ),
     }
 }
 
@@ -1515,11 +1559,11 @@ async fn grants_list(
         }
     };
     let now = Utc::now();
-    let list: Vec<Grant> = grants
+    let list: Vec<GrantHttp> = grants
         .list()
         .into_iter()
         .filter(|g| q.all || g.is_active(now))
-        .cloned()
+        .map(GrantHttp::from)
         .collect();
     Json(GrantsListResponse { grants: list }).into_response()
 }
@@ -1548,23 +1592,17 @@ async fn grants_revoke(
         }
     };
     match grants.revoke(&id) {
-        Ok(g) => Json(g).into_response(),
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("not found") || msg.contains("NotFound") {
-                mesh_err(
-                    StatusCode::NOT_FOUND,
-                    "grant_not_found",
-                    format!("grant {id} not found"),
-                )
-            } else {
-                mesh_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal",
-                    format!("revoke grant: {msg}"),
-                )
-            }
-        }
+        Ok(g) => Json(GrantHttp::from(&g)).into_response(),
+        Err(Error::NotFound(_)) => mesh_err(
+            StatusCode::NOT_FOUND,
+            "grant_not_found",
+            format!("grant {id} not found"),
+        ),
+        Err(e) => mesh_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("revoke grant: {e}"),
+        ),
     }
 }
 
@@ -2701,21 +2739,16 @@ mod tests {
         let created = json_body(resp).await;
         assert_eq!(created["role"], "guest");
         assert_eq!(created["mesh_id"], mesh.mesh_id);
-        // DeviceId serde is raw bytes array (C1 GrantStore shape).
-        let subject_bytes: Vec<u8> = created["subject_device_id"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|n| n.as_u64().unwrap() as u8)
-            .collect();
-        assert_eq!(subject_bytes.as_slice(), guest.device_id().as_bytes().as_slice());
-        let object_bytes: Vec<u8> = created["object"]["device_id"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|n| n.as_u64().unwrap() as u8)
-            .collect();
-        assert_eq!(object_bytes.as_slice(), host.device_id().as_bytes().as_slice());
+        // HTTP DTO: DeviceIds as hex (mesh/v1 convention; store still raw bytes).
+        assert_eq!(
+            created["subject_device_id_hex"],
+            guest.device_id().to_string()
+        );
+        assert_eq!(
+            created["object"]["device_id_hex"],
+            host.device_id().to_string()
+        );
+        assert_eq!(created["object"]["kind"], "device");
         assert_eq!(created["issued_by"]["kind"], "person_id");
         assert!(created["revoked_at"].is_null());
         let grant_id = created["grant_id"].as_str().unwrap().to_string();
@@ -2955,6 +2988,7 @@ mod tests {
         assert_eq!(json_body(resp).await["code"], "guest_forbidden");
 
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/mesh/v1/grants")
@@ -2966,6 +3000,187 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(json_body(resp).await["code"], "guest_forbidden");
+
+        // Guest cannot revoke either.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/grants/01FAKEGRANTID000000000000/revoke")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json_body(resp).await["code"], "guest_forbidden");
+    }
+
+    #[tokio::test]
+    async fn grants_pair_read_forbidden() {
+        let paths = tmp_paths();
+        let secret = [0x7Du8; 32];
+        let host = Identity::from_secret_bytes(secret);
+        let mesh = MeshState::new_mesh();
+        mesh.save(paths.mesh_file()).unwrap();
+
+        let pair_store = PairSessionStore::open(paths.pair_sessions_dir()).unwrap();
+        let armed = pair_store
+            .arm_new(
+                &mesh.mesh_id,
+                host.device_id(),
+                900,
+                PairEndpointClass::Confirm,
+            )
+            .unwrap();
+        let mut sess = armed.session;
+        sess.joiner_device_id = Some(DeviceId::from_bytes([0xABu8; 32]));
+        sess.phase = PairPhase::Bound;
+        pair_store.save(&sess).unwrap();
+        let pair_token = URL_SAFE_NO_PAD.encode(armed.token_raw);
+
+        let st = test_state(paths, secret, "host");
+        let app = mesh_v1_routes(st);
+        let (_, ch) = get_challenge(&app, "/mesh/v1/auth/challenge").await;
+        let body = serde_json::json!({
+            "challenge_id": ch["challenge_id"],
+            "method": "pair_read",
+            "sid": sess.sid,
+            "token": pair_token,
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/auth/session")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mesh_tok = json_body(resp).await["session_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let guest = Identity::from_secret_bytes([0x7Eu8; 32]);
+        let create_body = serde_json::json!({
+            "subject_device_id_hex": guest.device_id().to_string(),
+            "capabilities": ["terminal"],
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/grants")
+                    .header(header::AUTHORIZATION, format!("Bearer {mesh_tok}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(create_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json_body(resp).await["code"], "forbidden");
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mesh/v1/grants")
+                    .header(header::AUTHORIZATION, format!("Bearer {mesh_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json_body(resp).await["code"], "forbidden");
+    }
+
+    #[tokio::test]
+    async fn grants_create_via_mrk_proof() {
+        let paths = tmp_paths();
+        let secret = [0x7Fu8; 32];
+        let host = Identity::from_secret_bytes(secret);
+        let mesh = MeshState::new_mesh();
+        mesh.save(paths.mesh_file()).unwrap();
+
+        let password = b"test-mmk-grants-mrk";
+        let init = mesh_init(
+            password,
+            Some(mymesh_crypto::KdfParams {
+                m: 64_000,
+                t: 2,
+                p: 1,
+            }),
+        )
+        .unwrap();
+        init.file.save(paths.mesh_master_file()).unwrap();
+        MmkRuntime::from_mrk(&init.mrk)
+            .save(paths.mmk_runtime_file())
+            .unwrap();
+
+        let st = test_state(paths, secret, "host");
+        let app = mesh_v1_routes(st);
+        let (_, ch) = get_challenge(&app, "/mesh/v1/auth/challenge").await;
+        let cid = ch["challenge_id"].as_str().unwrap().to_string();
+        let nonce = decode_b64_32(ch["nonce"].as_str().unwrap()).unwrap();
+        let pre = auth_challenge_preimage(&cid, &nonce, &mesh.mesh_id, AuthMethod::MrkProof);
+        let admin = mrk_admin_identity(&init.mrk);
+        let sig = admin.sign(&pre);
+        let body = serde_json::json!({
+            "challenge_id": cid,
+            "method": "mrk_proof",
+            "sig_hex": hex::encode(sig),
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/auth/session")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let token = json_body(resp).await["session_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let guest = Identity::from_secret_bytes([0x80u8; 32]);
+        let create = serde_json::json!({
+            "subject_device_id_hex": guest.device_id().to_string(),
+            "capabilities": ["desktop"],
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/grants")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(create.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let g = json_body(resp).await;
+        assert_eq!(g["issued_by"]["kind"], "master_key_proof");
+        assert_eq!(g["issued_by"]["value"], init.mrk.fingerprint());
+        assert_eq!(
+            g["object"]["device_id_hex"],
+            host.device_id().to_string()
+        );
     }
 
     #[tokio::test]
