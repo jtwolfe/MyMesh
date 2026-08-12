@@ -1,8 +1,9 @@
-//! Connect-by-carrier: local web page + pair/v1 + pair/v2 HTTP for phone-assisted join.
+//! Connect-by-carrier: local web page + pair/v1 + pair/v2 + mesh/v1 HTTP.
 //!
 //! Port 17878 (default). Serves deprecated HTML (`/`, `/api/*`) and machine API
-//! under `/pair/v1` (status / pending / decide) and `/pair/v2` using the same
-//! `Paths` as serve. PairSessionStore is source of truth for v2 (PAIR-V2.md).
+//! under `/pair/v1` (status / pending / decide), `/pair/v2`, and `/mesh/v1`
+//! (auth challenge + topology) using the same `Paths` as serve.
+//! PairSessionStore is source of truth for v2 (PAIR-V2.md).
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
@@ -26,6 +27,8 @@ use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
+use crate::mesh_api::{self, MeshApiState, MeshAuthStore};
+
 /// Pair HTTP listen port (matches `CARRIER_TCP` / PAIR-HTTP.md).
 pub const PAIR_HTTP_PORT: u16 = 17878;
 /// Path prefix for the machine pair API (v1, alpha.1).
@@ -44,6 +47,8 @@ struct CarrierState {
     status: Arc<Mutex<String>>,
     /// Arm-scoped bootstrap secret (raw 32 bytes). None when disarmed/expired.
     bootstrap: Arc<Mutex<Option<BootstrapToken>>>,
+    /// In-memory mesh/v1 auth challenges + sessions.
+    mesh_auth: Arc<Mutex<MeshAuthStore>>,
 }
 
 #[derive(Clone)]
@@ -167,6 +172,7 @@ pub async fn start_carrier(
         pending_peer: Arc::new(Mutex::new(None)),
         status: Arc::new(Mutex::new("waiting for phone".into())),
         bootstrap: bootstrap.clone(),
+        mesh_auth: Arc::new(Mutex::new(MeshAuthStore::default())),
     };
 
     // Mint arm-scoped token so QR is valid immediately.
@@ -187,7 +193,7 @@ pub async fn start_carrier(
     let fp = NodeFingerprint::from_device_id(&id).as_str().to_string();
     let mesh_id = MeshState::load(paths.mesh_file())?.mesh_id;
     let pair_qr = build_pair_qr(&host_base, &token_b64, &fp, Some(&mesh_id));
-    info!(%url, %host_base, "carrier + pair/v1 listening");
+    info!(%url, %host_base, "carrier + pair/v1 + mesh/v1 listening");
 
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
@@ -205,7 +211,13 @@ pub async fn start_carrier(
 }
 
 fn build_router(st: CarrierState) -> Router {
-    Router::new()
+    let mesh_st = MeshApiState {
+        paths: st.paths.clone(),
+        secret: st.secret,
+        label: st.label.clone(),
+        auth: st.mesh_auth.clone(),
+    };
+    let pair_app = Router::new()
         // Deprecated HTML / phone-paste fallback
         .route("/", get(page))
         .route("/api/status", get(api_status))
@@ -219,8 +231,11 @@ fn build_router(st: CarrierState) -> Router {
         .route("/pair/v2/status", get(pair_v2_status))
         .route("/pair/v2/pending", get(pair_v2_pending))
         .route("/pair/v2/decide", post(pair_v2_decide))
+        .with_state(st);
+    // mesh/v1 auth challenge + topology (Issue 4 / B3) — separate state type, merge after
+    pair_app
+        .merge(mesh_api::mesh_v1_routes(mesh_st))
         .layer(CorsLayer::permissive())
-        .with_state(st)
 }
 
 /// Build `carrier://pair?v=1&host=…&token=…&fp=…&mesh?…` deep link.
@@ -1313,6 +1328,7 @@ mod tests {
             pending_peer: Arc::new(Mutex::new(None)),
             status: Arc::new(Mutex::new("test".into())),
             bootstrap: Arc::new(Mutex::new(None)),
+            mesh_auth: Arc::new(Mutex::new(MeshAuthStore::default())),
         }
     }
 
