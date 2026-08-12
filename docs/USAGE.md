@@ -103,13 +103,15 @@ Internet-first decide without requiring phone HTTP to the host. Full demo checkl
 ```bash
 # Machine A (resident) — mymesh serve must be running
 mymesh pair dual                    # QR_A v2 (nonce; ep=confirm if no --host)
-# optional LAN decide: mymesh pair dual --host http://<lan-ip>:17878
+# optional LAN HTTP decide (needs mymesh carrier on :17878 — dual --host only sets the QR hint):
+# mymesh carrier &
+# mymesh pair dual --host http://<lan-ip>:17878
 
 # Machine B (joiner)
 mymesh pair dual --join --resident <did-or-words-from-A>   # QR_B + iroh dial
 
 # Phone: scan QR_A then QR_B → L2 Accept/Deny
-#   host reachable → POST /pair/v2/decide
+#   host reachable (carrier up) → POST /pair/v2/decide
 #   else → confirm codes on phone; on A:
 mymesh pair confirm <CODE>          # Crockford 4-4; hyphens optional
 mymesh pair status                  # optional

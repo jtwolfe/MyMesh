@@ -33,11 +33,11 @@ Phone is **never** an iroh peer. Machines complete trust over existing iroh join
 ## CLI surface (implemented)
 
 ```text
-mymesh pair dual [--host <url>] [--ttl N]     # resident: arm + PairSession + QR_A v2
-mymesh pair dual --join --resident <id|words> # joiner: QR_B + dial join
-mymesh pair confirm <code> [--sid] [--joiner] # HMAC verify → JoinStore decision
-mymesh pair status [--sid]
-mymesh pair retry [sid]                       # expire + re-arm dual (confirm ep)
+mymesh pair dual [--host <url>] [--ttl N]              # resident: arm + PairSession + QR_A v2
+mymesh pair dual --join --resident <id|words>          # joiner: QR_B + dial join
+mymesh pair confirm <code> [--sid <sid>] [--joiner <did>]  # HMAC verify → JoinStore
+mymesh pair status [--sid <sid>]
+mymesh pair retry [sid]                                # expire + re-arm dual (confirm ep)
 ```
 
 | Command | Role |
@@ -48,7 +48,7 @@ mymesh pair retry [sid]                       # expire + re-arm dual (confirm ep
 | `pair status` | Active session phase, ep, joiner bind, pending joins. |
 | `pair retry` | Expire previous session; arm a fresh dual (confirm path). |
 
-Host process: **`mymesh serve`** (or user unit) must be running so join completes. Dual-scan decide does **not** require a separate `mymesh carrier` process — `pair *` is agent-integrated. Optional LAN HTTP facade: `mymesh carrier` (default port **17878**) for Path B / Path C.
+Host process: **`mymesh serve`** (or user unit) must be running so join completes. **Path A** decide (`mymesh pair confirm`) is agent-integrated and does **not** need `mymesh carrier`. **Path B** direct HTTP decide requires **`mymesh carrier`** on the same `Paths` (default port **17878**) — `pair dual --host` only puts the host hint in QR_A; it does not start HTTP.
 
 ---
 
@@ -121,7 +121,7 @@ mymesh pair status            # optional
 ### Exit checks
 
 - [ ] A: `mymesh serve` + `mymesh pair dual` emits **v2** QR with **nonce**  
-- [ ] B: `mymesh pair dual --join` dials A and shows QR_B  
+- [ ] B: `mymesh pair dual --join --resident <id>` dials A and shows QR_B  
 - [ ] Phone: dual-scan binds joiner; UI shows **both** fingerprints  
 - [ ] L2 Accept → confirm codes when no reachable host  
 - [ ] `mymesh pair confirm <accept-code>` → both sides **Trusted** (no CLI `requests accept`)  
@@ -151,14 +151,22 @@ Confirm-on-machine without Carrier is only practical if codes are computed by a 
 
 ## Path B — dual-scan + direct host (LAN optimization)
 
-Same as Path A through dual-scan bind, but QR_A includes a reachable `host=` (`ep=direct`).
+Same as Path A through dual-scan bind, but QR_A includes a reachable `host=` (`ep=direct`).  
+`/pair/v2/decide` is served by **`mymesh carrier`** (same agent `Paths` as `serve` / `pair dual`). `mymesh serve` and `pair dual --host` do **not** start HTTP; without carrier, the phone falls back to confirm codes (Path A).
 
 ```bash
-# Resident: optional host hint for phone HTTP to pair API
+# --- Machine A (resident) ---
+mymesh serve &
+mymesh firewall ufw allow          # TCP 17878 for phone LAN HTTP (explicit only)
+mymesh carrier                     # pair HTTP on :17878; same Paths as serve
 mymesh pair dual --host http://<lan-ip>:17878
-# Ensure pair HTTP is listening (mymesh carrier on 17878, or agent-integrated v2 if wired).
+# QR_A: ep=direct + host hint. Leave session armed.
 
-# Phone: after L2 Accept, Carrier tries POST /pair/v2/decide first (~2s).
+# --- Machine B (joiner) ---
+mymesh pair dual --join --resident <did_or_words_from_A>
+
+# --- Phone ---
+# Dual-scan as Path A; after L2 Accept, Carrier tries POST /pair/v2/decide (~2s).
 # On success: no confirm codes required.
 # On failure / timeout: falls back to confirm codes (Path A).
 ```
@@ -243,7 +251,7 @@ Do not demo mock Accept as the Wave A internet-first pair. For product demos use
 | Artifact | Producer | Contents |
 |----------|----------|----------|
 | QR_A | Resident `mymesh pair dual` | v2 with **required nonce**; `ep=confirm` or `direct` |
-| QR_B | Joiner `pair dual --join` | `mymesh://pair-peer?v=1&did&fp&label` (phone-only) |
+| QR_B | Joiner `pair dual --join --resident <id>` | `mymesh://pair-peer?v=1&did&fp&label` (phone-only) |
 | Confirm code | Phone local HMAC (or harness helper) | Crockford base32, display **4-4** |
 | JoinAccept / membership | Existing join loop | Member path full snapshot; guest: [GUEST.md](GUEST.md) |
 
