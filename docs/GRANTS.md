@@ -2,8 +2,8 @@
 
 | Field | Value |
 |-------|--------|
-| **Status** | Normative contract freeze (S0) · **store + `allows()` landed (C1)** |
-| **Slice** | S5: GrantStore + session enforcement (this doc); guest join wire delta in C1b |
+| **Status** | Normative contract freeze (S0) · **store + `allows()` (C1) · HTTP grants API (C2)** |
+| **Slice** | S5: GrantStore + session enforcement (this doc); guest join wire delta in C1b; mesh/v1 grants in C2 |
 | **Source** | [CARRIER-NEXT.md](CARRIER-NEXT.md) § grant model, §S5 |
 | **Related** | [GUEST.md](GUEST.md), [MASTER-KEY.md](MASTER-KEY.md), [JOIN.md](JOIN.md), [SECURITY.md](SECURITY.md) |
 
@@ -149,23 +149,50 @@ mymesh grant revoke <grant_id>
 - Guest grants **reject** `admin` capability (product policy).
 - `list` shows active grants by default; `--all` includes revoked/expired.
 
-### HTTP (C2)
+### HTTP (C2 — landed)
+
+Served on the carrier mesh API (`/mesh/v1/*`), same `Paths` / `GrantStore` as CLI.
 
 ```text
-POST /mesh/v1/grants
-GET  /mesh/v1/grants
-POST /mesh/v1/grants/{id}/revoke
+POST /mesh/v1/grants              # create guest grant
+GET  /mesh/v1/grants[?all=true]   # list (active only by default)
+POST /mesh/v1/grants/{id}/revoke  # set revoked_at
 ```
 
-### Authz for grant mutate
+All three require `Authorization: Bearer <mesh session>` (fail closed: 401 without session).
+
+**Create body:**
+
+```json
+{
+  "subject_device_id_hex": "<64-hex DeviceId>",
+  "object_device_id_hex": null,
+  "capabilities": ["terminal", "files"],
+  "days": 7
+}
+```
+
+- `object_device_id_hex` optional — defaults to **serving host**.
+- `capabilities`: subset of `terminal` | `files` | `desktop` | `tcp` (`admin` rejected).
+- `days` optional → `constraints.not_after`.
+- Response: grant object (201); `issued_by` reflects auth method (`person_id` | `master_key_proof` | `device_id`).
+
+**List:** `{ "grants": [ /* Grant */ ] }`. Active only unless `?all=true`.
+
+**Revoke:** returns grant with `revoked_at` set (idempotent if already revoked). 404 `grant_not_found` if missing.
+
+### Authz for grant mutate / list
 
 | Actor | Allowed |
 |-------|---------|
 | `person_owner` session | Yes |
 | `mrk_proof` | Yes |
 | `device_member` with Admin | Yes |
-| Host-local CLI | Yes |
-| Guest / unauthenticated | No |
+| Serving host `device_member` (agent identity) | Yes |
+| Host-local CLI | Yes (filesystem; not HTTP) |
+| `device_member` without Admin | No (`admin_required`) |
+| Guest (`mesh_role=guest`) | No (`guest_forbidden`) |
+| `pair_read` / unauthenticated | No |
 
 ---
 
