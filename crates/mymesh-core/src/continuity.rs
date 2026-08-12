@@ -417,6 +417,10 @@ mod tests {
         )
         .is_err());
 
+        // Unique plaintext markers for residual scan.
+        let secret_marker = br#"{"profile":"Ada"}"#;
+        assert_eq!(read_fields(&paths, pack_id).unwrap(), secret_marker);
+
         let st = wipe_pack(&paths, pack_id).unwrap();
         assert_eq!(st, ContinuityHostStatus::Wiped);
         assert_eq!(
@@ -424,7 +428,33 @@ mod tests {
             ContinuityHostStatus::Wiped
         );
         assert!(read_fields(&paths, pack_id).is_err());
-        assert!(!fields_path(&paths.continuity_pack_dir(pack_id)).exists());
+        let pdir = paths.continuity_pack_dir(pack_id);
+        assert!(!fields_path(&pdir).exists());
+        assert!(!pack_json_path(&pdir).exists());
+        // Residual scan: plaintext fields must not remain under pack dir / data_dir.
+        fn any_file_contains(dir: &std::path::Path, needle: &[u8]) -> bool {
+            let Ok(rd) = fs::read_dir(dir) else {
+                return false;
+            };
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if p.is_dir() {
+                    if any_file_contains(&p, needle) {
+                        return true;
+                    }
+                } else if let Ok(b) = fs::read(&p) {
+                    if b.windows(needle.len()).any(|w| w == needle) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        assert!(
+            !any_file_contains(&paths.data_dir, b"Ada"),
+            "wipe must remove plaintext field secrets from host storage"
+        );
+        assert!(!any_file_contains(&pdir, secret_marker));
 
         // Wipe absent → absent.
         let paths2 = tmp_paths();
