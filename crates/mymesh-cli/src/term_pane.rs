@@ -1,11 +1,11 @@
 //! TUI embedded shell: peer picker + vt100 screen with real cursor.
 use anyhow::Result;
 use crossterm::event::KeyCode;
+use mymesh_core::{Capability, Config};
 use mymesh_core::{DeviceStore, Paths, TrustState};
+use mymesh_crypto::Identity;
 use mymesh_protocol::{decode_msg, encode_msg, ChannelId, Frame, TerminalMessage};
 use mymesh_session::Session;
-use mymesh_core::{Capability, Config};
-use mymesh_crypto::Identity;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
@@ -230,7 +230,17 @@ pub async fn connect(paths: &Paths, term: &mut TermPane) -> Result<()> {
 
     tokio::spawn(async move {
         let err_tx = tx_in.clone();
-        match session_task(paths, peer, cols, rows, tx_in, &mut rx_out, &mut shutdown_rx).await {
+        match session_task(
+            paths,
+            peer,
+            cols,
+            rows,
+            tx_in,
+            &mut rx_out,
+            &mut shutdown_rx,
+        )
+        .await
+        {
             Ok(()) => {}
             Err(e) => {
                 let _ = err_tx.send(format!("\r\n[session error: {e}]\r\n").into_bytes());
@@ -515,8 +525,7 @@ pub fn draw(f: &mut TuiFrame, area: Rect, term: &mut TermPane) {
         let blank = " ".repeat(inner.width as usize);
         for row in 0..inner.height {
             f.render_widget(
-                Paragraph::new(blank.as_str())
-                    .style(Style::default().bg(Color::Black).fg(C_TEXT)),
+                Paragraph::new(blank.as_str()).style(Style::default().bg(Color::Black).fg(C_TEXT)),
                 Rect {
                     x: inner.x,
                     y: inner.y + row,
@@ -544,7 +553,11 @@ pub fn draw(f: &mut TuiFrame, area: Rect, term: &mut TermPane) {
                     } else {
                         // Keep single-width; drop combining/wide leftovers
                         let ch = s.chars().next().unwrap_or(' ');
-                        if ch.is_control() { ' ' } else { ch }
+                        if ch.is_control() {
+                            ' '
+                        } else {
+                            ch
+                        }
                     }
                 })
                 .unwrap_or(' ');
@@ -604,8 +617,7 @@ pub fn draw(f: &mut TuiFrame, area: Rect, term: &mut TermPane) {
         " n/[ ] choose system · Enter/c connect (peer agent must run)"
     };
     f.render_widget(
-        Paragraph::new(hint)
-            .style(Style::default().fg(C_MUTED).bg(Color::Rgb(18, 18, 24))),
+        Paragraph::new(hint).style(Style::default().fg(C_MUTED).bg(Color::Rgb(18, 18, 24))),
         chunks[2],
     );
 }

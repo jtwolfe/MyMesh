@@ -48,7 +48,10 @@ pub fn verify_membership(
     let pub_id = mymesh_crypto::IdentityPublic {
         verifying_key: *from_id.as_bytes(),
     };
-    pub_id.verify(&membership_material(mesh_id, from_id, ts, members), signature)?;
+    pub_id.verify(
+        &membership_material(mesh_id, from_id, ts, members),
+        signature,
+    )?;
     Ok(())
 }
 
@@ -62,12 +65,7 @@ pub fn kick_material(mesh_id: &str, target: &DeviceId, by: &DeviceId, ts: i64) -
     v
 }
 
-pub fn sign_kick(
-    identity: &Identity,
-    mesh_id: &str,
-    target: &DeviceId,
-    ts: i64,
-) -> [u8; 64] {
+pub fn sign_kick(identity: &Identity, mesh_id: &str, target: &DeviceId, ts: i64) -> [u8; 64] {
     identity.sign(&kick_material(mesh_id, target, &identity.device_id(), ts))
 }
 
@@ -94,7 +92,9 @@ pub fn members_from_store(
     out.push(MeshMemberWire {
         id: self_id,
         label: self_label.to_string(),
-        fingerprint: NodeFingerprint::from_device_id(&self_id).as_str().to_string(),
+        fingerprint: NodeFingerprint::from_device_id(&self_id)
+            .as_str()
+            .to_string(),
         capabilities: Capability::all(),
         linked_at_unix: Utc::now().timestamp(),
     });
@@ -179,7 +179,11 @@ pub fn apply_membership(
         if m.id == self_id {
             continue;
         }
-        if store.get(&m.id).map(|d| d.trust == TrustState::Trusted).unwrap_or(false) {
+        if store
+            .get(&m.id)
+            .map(|d| d.trust == TrustState::Trusted)
+            .unwrap_or(false)
+        {
             // refresh label/caps/mesh_id
             if let Some(existing) = store.get(&m.id).cloned() {
                 let mut r = existing;
@@ -212,8 +216,8 @@ pub fn apply_membership(
             last_seen: Some(Utc::now()),
             endpoint_hint: None,
             mesh_id: Some(mesh.mesh_id.clone()),
-                aliases: Vec::new(),
-                groups: Vec::new(),
+            aliases: Vec::new(),
+            groups: Vec::new(),
         };
         store.upsert(rec)?;
         added += 1;
@@ -293,7 +297,6 @@ pub fn apply_kick_notice_local(
     Ok(())
 }
 
-
 pub fn leave_ack_material(mesh_id: &str, target: &DeviceId, by: &DeviceId, ts: i64) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(b"mymesh-kick-leave-v1");
@@ -304,18 +307,8 @@ pub fn leave_ack_material(mesh_id: &str, target: &DeviceId, by: &DeviceId, ts: i
     v
 }
 
-pub fn sign_leave_ack(
-    identity: &Identity,
-    mesh_id: &str,
-    by: &DeviceId,
-    ts: i64,
-) -> [u8; 64] {
-    identity.sign(&leave_ack_material(
-        mesh_id,
-        &identity.device_id(),
-        by,
-        ts,
-    ))
+pub fn sign_leave_ack(identity: &Identity, mesh_id: &str, by: &DeviceId, ts: i64) -> [u8; 64] {
+    identity.sign(&leave_ack_material(mesh_id, &identity.device_id(), by, ts))
 }
 
 pub fn verify_leave_ack(

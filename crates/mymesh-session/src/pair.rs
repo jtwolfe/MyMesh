@@ -111,7 +111,7 @@ pub async fn run_host_pair(
                 last_seen: Some(Utc::now()),
                 endpoint_hint: None,
                 mesh_id: None,
-            
+
                 aliases: Vec::new(),
                 groups: Vec::new(),
             }
@@ -133,7 +133,6 @@ pub async fn run_host_pair(
         shared_confirm: secret.derive(b"mymesh/confirm"),
     })
 }
-
 
 /// Host ceremony with a pre-chosen pairing code (so the UI can print it first).
 pub async fn run_host_pair_code(
@@ -165,12 +164,7 @@ pub async fn run_host_pair_code(
 
     let vk = identity.verifying_key_bytes();
     let device_id = identity.device_id();
-    let sign_material = [
-        device_id.as_bytes().as_slice(),
-        label.as_bytes(),
-        &vk,
-    ]
-    .concat();
+    let sign_material = [device_id.as_bytes().as_slice(), label.as_bytes(), &vk].concat();
     let signature = identity.sign(&sign_material);
     let offer_binder = binder(&secret, &sign_material);
     rendezvous
@@ -207,9 +201,7 @@ pub async fn run_host_pair_code(
             if expect != peer_binder {
                 return Err(mymesh_core::Error::Pairing("binder mismatch".into()));
             }
-            let pub_id = mymesh_crypto::IdentityPublic {
-                verifying_key,
-            };
+            let pub_id = mymesh_crypto::IdentityPublic { verifying_key };
             pub_id.verify(&material, &signature)?;
             if pub_id.device_id() != peer_id {
                 return Err(mymesh_core::Error::Pairing("device id mismatch".into()));
@@ -217,14 +209,16 @@ pub async fn run_host_pair_code(
             DeviceRecord {
                 id: peer_id,
                 label: DeviceLabel::new(peer_label),
-                fingerprint: NodeFingerprint::from_device_id(&peer_id).as_str().to_string(),
+                fingerprint: NodeFingerprint::from_device_id(&peer_id)
+                    .as_str()
+                    .to_string(),
                 capabilities: accepted_capabilities,
                 trust: TrustState::Trusted,
                 linked_at: Utc::now(),
                 last_seen: Some(Utc::now()),
                 endpoint_hint: None,
                 mesh_id: None,
-            
+
                 aliases: Vec::new(),
                 groups: Vec::new(),
             }
@@ -310,7 +304,7 @@ pub async fn run_guest_pair(
                 last_seen: Some(Utc::now()),
                 endpoint_hint: None,
                 mesh_id: None,
-            
+
                 aliases: Vec::new(),
                 groups: Vec::new(),
             }

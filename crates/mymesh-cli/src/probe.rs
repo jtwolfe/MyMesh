@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 /// Single RTT probe via control Ping/Pong; records into metrics history.
 pub async fn probe_ping(paths: &Paths, device: &str) -> Result<u64> {
-    let (session, mut transport, peer) = crate::mesh_conn::open_trusted_session(paths, device).await?;
+    let (session, mut transport, peer) =
+        crate::mesh_conn::open_trusted_session(paths, device).await?;
     let conn = session.into_conn();
     let nonce = rand::random::<u64>();
     let t0 = Instant::now();
@@ -66,14 +67,17 @@ pub async fn probe_ping(paths: &Paths, device: &str) -> Result<u64> {
     });
     m.save(paths.metrics_dir())?;
     let _ = conn.close().await;
-    if let Some(t) = transport.take() { t.shutdown().await; }
+    if let Some(t) = transport.take() {
+        t.shutdown().await;
+    }
     Ok(rtt)
 }
 
 /// Push ~`bytes` of payload to peer via file channel temp path; measure throughput.
 pub async fn probe_bandwidth(paths: &Paths, device: &str, bytes: u64) -> Result<BandwidthResult> {
     let bytes = bytes.clamp(64 * 1024, 64 * 1024 * 1024);
-    let (session, mut transport, peer) = crate::mesh_conn::open_trusted_session(paths, device).await?;
+    let (session, mut transport, peer) =
+        crate::mesh_conn::open_trusted_session(paths, device).await?;
     let conn = session.into_conn();
     let remote = format!(".mymesh-bw-probe-{}", std::process::id());
     let chunk = vec![0xA5u8; 64 * 1024];
@@ -147,7 +151,9 @@ pub async fn probe_bandwidth(paths: &Paths, device: &str, bytes: u64) -> Result<
     m.last_bandwidth = Some(result.clone());
     m.save(paths.metrics_dir())?;
     let _ = conn.close().await;
-    if let Some(t) = transport.take() { t.shutdown().await; }
+    if let Some(t) = transport.take() {
+        t.shutdown().await;
+    }
     Ok(result)
 }
 
@@ -168,9 +174,9 @@ pub async fn probe_all(paths: &Paths) -> Result<Vec<(String, Result<u64, String>
     Ok(out)
 }
 
-
 pub async fn probe_host_metrics(paths: &Paths, device: &str) -> Result<HostStatsSnap> {
-    let (session, mut transport, peer) = crate::mesh_conn::open_trusted_session(paths, device).await?;
+    let (session, mut transport, peer) =
+        crate::mesh_conn::open_trusted_session(paths, device).await?;
     let conn = session.into_conn();
     let nonce = rand::random::<u64>();
     conn.send_frame(Frame {
@@ -182,7 +188,9 @@ pub async fn probe_host_metrics(paths: &Paths, device: &str) -> Result<HostStats
     let snap = loop {
         if Instant::now() > deadline {
             let _ = conn.close().await;
-            if let Some(t) = transport.take() { t.shutdown().await; }
+            if let Some(t) = transport.take() {
+                t.shutdown().await;
+            }
             bail!("metrics timeout");
         }
         let frame = tokio::time::timeout(Duration::from_secs(10), conn.recv_frame())
@@ -235,7 +243,9 @@ pub async fn probe_host_metrics(paths: &Paths, device: &str) -> Result<HostStats
     m.last_host = Some(snap.clone());
     m.save(paths.metrics_dir())?;
     let _ = conn.close().await;
-    if let Some(t) = transport.take() { t.shutdown().await; }
+    if let Some(t) = transport.take() {
+        t.shutdown().await;
+    }
     Ok(snap)
 }
 
@@ -257,7 +267,9 @@ pub async fn remote_list(
     loop {
         if Instant::now() > deadline {
             let _ = conn.close().await;
-            if let Some(t) = transport.take() { t.shutdown().await; }
+            if let Some(t) = transport.take() {
+                t.shutdown().await;
+            }
             bail!("list timeout");
         }
         let frame = tokio::time::timeout(Duration::from_secs(10), conn.recv_frame())
@@ -270,12 +282,16 @@ pub async fn remote_list(
         match msg {
             FileMessage::ListResult { entries } => {
                 let _ = conn.close().await;
-                if let Some(t) = transport.take() { t.shutdown().await; }
+                if let Some(t) = transport.take() {
+                    t.shutdown().await;
+                }
                 return Ok(entries);
             }
             FileMessage::Error { message } => {
                 let _ = conn.close().await;
-                if let Some(t) = transport.take() { t.shutdown().await; }
+                if let Some(t) = transport.take() {
+                    t.shutdown().await;
+                }
                 bail!("{message}");
             }
             _ => {}

@@ -1,9 +1,7 @@
 //! Alpha.3 magic: names, hosts, ssh config, tcp expose, DNS/socks status, carrier.
 use anyhow::{bail, Result};
 use console::style;
-use mymesh_core::{
-    mesh_ip_string, Config, DeviceLabel, DeviceStore, Paths, TrustState,
-};
+use mymesh_core::{mesh_ip_string, Config, DeviceLabel, DeviceStore, Paths, TrustState};
 use mymesh_crypto::{parse_device_id, Identity};
 use mymesh_session::{
     carrier_pending_path, client_bridge, run_join_as_guest, start_carrier, Session,
@@ -62,7 +60,10 @@ pub async fn cmd_hosts(paths: &Paths, group: Option<String>) -> Result<()> {
         "DNS {}  SOCKS5 {}  auto_ports {:?}",
         cfg.magic.dns_bind, cfg.magic.socks_bind, cfg.magic.auto_ports
     );
-    println!("Tip: point system DNS or resolv to {} for *.{domain}", cfg.magic.dns_bind);
+    println!(
+        "Tip: point system DNS or resolv to {} for *.{domain}",
+        cfg.magic.dns_bind
+    );
     println!("     or export ALL_PROXY=socks5://{}", cfg.magic.socks_bind);
     Ok(())
 }
@@ -83,7 +84,11 @@ pub async fn cmd_alias(paths: &Paths, device: &str, alias: &str, remove: bool) -
         println!("{} removed alias {alias}", style("ok").green().bold());
     } else {
         store.add_alias(&id, alias)?;
-        println!("{} alias {alias} → {}", style("ok").green().bold(), id.short());
+        println!(
+            "{} alias {alias} → {}",
+            style("ok").green().bold(),
+            id.short()
+        );
     }
     Ok(())
 }
@@ -96,7 +101,11 @@ pub async fn cmd_group(paths: &Paths, device: &str, group: &str, remove: bool) -
         println!("{} removed group {group}", style("ok").green().bold());
     } else {
         store.add_group(&id, group)?;
-        println!("{} group {group} → {}", style("ok").green().bold(), id.short());
+        println!(
+            "{} group {group} → {}",
+            style("ok").green().bold(),
+            id.short()
+        );
     }
     Ok(())
 }
@@ -106,7 +115,9 @@ pub async fn cmd_resolve(paths: &Paths, name: &str) -> Result<()> {
     let cfg = Config::load(paths.config_file())?;
     let local = Identity::load_or_create(paths.identity_file())?;
     let q = name.trim().trim_end_matches('.').to_lowercase();
-    let q = q.strip_suffix(&format!(".{}", cfg.magic.domain)).unwrap_or(&q);
+    let q = q
+        .strip_suffix(&format!(".{}", cfg.magic.domain))
+        .unwrap_or(&q);
     let id = if cfg.device_label.eq_ignore_ascii_case(q)
         || local.device_id().short().starts_with(q)
         || local.device_id().to_string().starts_with(q)
@@ -167,20 +178,24 @@ pub async fn cmd_proxy_ssh(paths: &Paths, host: &str) -> Result<()> {
     // All diagnostics go to stderr (tracing is also stderr + quiet for this cmd).
     let store = DeviceStore::open(paths.devices_file())?;
     let peer = resolve_device_pub(&store, host).map_err(|e| {
-        anyhow::anyhow!("proxy-ssh: resolve '{host}': {e} (is the device linked? try: mymesh hosts)")
+        anyhow::anyhow!(
+            "proxy-ssh: resolve '{host}': {e} (is the device linked? try: mymesh hosts)"
+        )
     })?;
     if !store.is_trusted(&peer) {
         bail!("proxy-ssh: {host} is not trusted");
     }
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file())?;
-    let (conn, transport) = crate::mesh_conn::connect_raw(&identity, &cfg, peer).await.map_err(|e| {
-        anyhow::anyhow!(
-            "proxy-ssh: mesh connect to {}: {e}
+    let (conn, transport) = crate::mesh_conn::connect_raw(&identity, &cfg, peer)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "proxy-ssh: mesh connect to {}: {e}
   (is local `mymesh serve` up? dial proxy required when agent owns the endpoint)",
-            peer.short()
-        )
-    })?;
+                peer.short()
+            )
+        })?;
     let session = Session::handshake_dialer(
         conn,
         &identity,
@@ -196,22 +211,16 @@ pub async fn cmd_proxy_ssh(paths: &Paths, host: &str) -> Result<()> {
     Ok(())
 }
 
-async fn ssh_stdio_bridge(
-    conn: Box<dyn mymesh_net::PeerConnection>,
-    port: u16,
-) -> Result<()> {
+async fn ssh_stdio_bridge(conn: Box<dyn mymesh_net::PeerConnection>, port: u16) -> Result<()> {
     use mymesh_protocol::{decode_msg, encode_msg, ChannelId, ChannelKind, Frame, TcpMessage};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let conn: Arc<dyn mymesh_net::PeerConnection> = Arc::from(conn);
     eprintln!("proxy-ssh: dialing peer localhost:{} via mesh…", port);
     conn.send_frame(Frame {
         channel: ChannelId::tcp(1),
-        payload: encode_msg(&TcpMessage::Dial {
-            port,
-            host: None,
-        })?,
+        payload: encode_msg(&TcpMessage::Dial { port, host: None })?,
     })
     .await?;
     let dial_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -220,14 +229,13 @@ async fn ssh_stdio_bridge(
             bail!(
                 "proxy-ssh: timeout waiting for TCP dial ok to peer:{}
                    peer needs `mymesh serve` (alpha.3+) and sshd listening on 127.0.0.1:{}",
-                port, port
+                port,
+                port
             );
         }
         let frame = tokio::time::timeout(std::time::Duration::from_secs(10), conn.recv_frame())
             .await
-            .map_err(|_| {
-                anyhow::anyhow!("proxy-ssh: recv timeout (connection stalled)")
-            })?
+            .map_err(|_| anyhow::anyhow!("proxy-ssh: recv timeout (connection stalled)"))?
             .map_err(|e| {
                 anyhow::anyhow!(
                     "proxy-ssh: connection lost before dial: {e}
@@ -309,8 +317,12 @@ async fn ssh_stdio_bridge(
     Ok(())
 }
 
-
-pub async fn cmd_expose(paths: &Paths, device: &str, port: u16, local_port: Option<u16>) -> Result<()> {
+pub async fn cmd_expose(
+    paths: &Paths,
+    device: &str,
+    port: u16,
+    local_port: Option<u16>,
+) -> Result<()> {
     let local_port = local_port.unwrap_or(port);
     let store = DeviceStore::open(paths.devices_file())?;
     let peer = resolve_device_pub(&store, device)?;
@@ -332,13 +344,14 @@ pub async fn cmd_expose(paths: &Paths, device: &str, port: u16, local_port: Opti
         let label = cfg.device_label.clone();
         let sock_path = std::path::PathBuf::from(&cfg.daemon.control_socket);
         tokio::spawn(async move {
-            let (conn, transport) = match mymesh_net::connect_mesh(&identity, peer, &sock_path).await {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("connect: {e}");
-                    return;
-                }
-            };
+            let (conn, transport) =
+                match mymesh_net::connect_mesh(&identity, peer, &sock_path).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("connect: {e}");
+                        return;
+                    }
+                };
             let session = match Session::handshake_dialer(
                 conn,
                 &identity,
@@ -379,9 +392,12 @@ pub async fn cmd_carrier(paths: &Paths, port: u16) -> Result<()> {
     .await?;
 
     println!("{}", style("connect by carrier").bold());
-    println!("  page  {}", handle.url);
-    println!("  scan this QR with your phone (same LAN as this machine):");
-    if let Ok(code) = QrCode::new(handle.url.as_bytes()) {
+    println!("  pair API  {}/pair/v1", handle.host_base);
+    println!("  page      {}  (deprecated HTML fallback)", handle.url);
+    println!();
+    println!("  scan this QR with Carrier (same LAN):");
+    println!("  {}", handle.pair_qr);
+    if let Ok(code) = QrCode::new(handle.pair_qr.as_bytes()) {
         let qr = code
             .render::<char>()
             .quiet_zone(false)
@@ -390,11 +406,9 @@ pub async fn cmd_carrier(paths: &Paths, port: u16) -> Result<()> {
         println!("{qr}");
     }
     println!();
-    println!("On the other machine: mymesh id --uri   (or show QR), scan/paste into the phone page.");
-    println!("Waiting for phone to submit the other device… (Ctrl+C to cancel)");
-
-    // also arm
-    let _ = mymesh_core::ArmState::arm(paths.arm_file(), 900);
+    println!("Join path: other machine runs  mymesh link <this-host-id>");
+    println!("Phone approves via pair/v1 (JoinStore). HTML paste path still works as fallback.");
+    println!("Waiting for join approval or phone paste… (Ctrl+C to cancel)");
 
     loop {
         if pend.exists() {
@@ -403,7 +417,10 @@ pub async fn cmd_carrier(paths: &Paths, port: u16) -> Result<()> {
             if uri.is_empty() {
                 continue;
             }
-            println!("{} got peer from phone — dialing join…", style("ok").green().bold());
+            println!(
+                "{} got peer from phone — dialing join…",
+                style("ok").green().bold()
+            );
             let host_id = parse_join_target(&uri)?;
             let mut store = DeviceStore::open(paths.devices_file())?;
             let sock = std::path::PathBuf::from(&cfg.daemon.control_socket);
@@ -484,7 +501,6 @@ Browser:
 "#
     );
 }
-
 
 /// Helpers that return strings for the TUI (no stdout dependency).
 pub fn ssh_config_text(paths: &Paths, domain: Option<String>) -> Result<String> {
@@ -574,12 +590,14 @@ pub fn magic_status_text(paths: &Paths) -> Result<String> {
     ))
 }
 
-/// Start carrier HTTP page; returns URL. Caller polls pending + join.
-pub async fn start_carrier_ui(paths: &Paths, port: u16) -> Result<String> {
+/// Start carrier HTTP + pair/v1; returns HTML page URL and pair QR deep link.
+pub async fn start_carrier_ui(paths: &Paths, port: u16) -> Result<(String, String)> {
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file())?;
     let pend = carrier_pending_path(paths);
     let _ = std::fs::remove_file(&pend);
+    // Arm *before* start so bootstrap token in pair_qr matches arm.until
+    let _ = mymesh_core::ArmState::arm(paths.arm_file(), 900);
     let handle = start_carrier(
         paths.clone(),
         Identity::from_secret_bytes(identity.to_secret_bytes()),
@@ -588,8 +606,7 @@ pub async fn start_carrier_ui(paths: &Paths, port: u16) -> Result<String> {
         None,
     )
     .await?;
-    let _ = mymesh_core::ArmState::arm(paths.arm_file(), 900);
-    Ok(handle.url)
+    Ok((handle.url, handle.pair_qr))
 }
 
 /// If phone posted a peer URI, complete join. Returns Some(msg) when done/attempted.
@@ -641,4 +658,3 @@ pub async fn poll_carrier_join(paths: &Paths) -> Result<Option<String>> {
         Err(e) => Ok(Some(format!("carrier connect failed: {e}"))),
     }
 }
-

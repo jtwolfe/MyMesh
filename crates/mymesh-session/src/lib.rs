@@ -2,8 +2,8 @@
 
 mod agent;
 mod carrier;
-mod join;
 mod host_metrics;
+mod join;
 mod magic;
 mod mesh_sync;
 mod pair;
@@ -11,7 +11,10 @@ mod session;
 mod tcp_tunnel;
 
 pub use agent::Agent;
-pub use carrier::{carrier_pending_path, start_carrier, CarrierHandle};
+pub use carrier::{
+    build_pair_qr, carrier_pending_path, start_carrier, CarrierHandle, PAIR_HTTP_PORT,
+    PAIR_V1_PREFIX,
+};
 pub use host_metrics::sample_metrics;
 pub use join::{handle_join_as_host, run_join_as_guest};
 pub use magic::MagicPlane;

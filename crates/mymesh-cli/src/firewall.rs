@@ -236,7 +236,10 @@ pub fn ufw_deny() -> Result<()> {
         .context("ufw delete")?;
     if !st.success() {
         eprintln!("delete by port may have failed; check: sudo ufw status numbered");
-        bail!("ufw delete failed ({st})\n{}", root_required_msg("ufw deny"));
+        bail!(
+            "ufw delete failed ({st})\n{}",
+            root_required_msg("ufw deny")
+        );
     }
     println!(
         "{} removed allow {CARRIER_TCP}/tcp (if present)",
