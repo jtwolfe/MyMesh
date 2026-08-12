@@ -6,7 +6,9 @@
 //! - HKDF session key derivation after pairing / handshake
 //! - Mesh master key (MMK): Argon2id wrap of mesh root key (MRK)
 //! - Owner claim preimage + sealed person backup (S4)
+//! - Continuity pack v1 seal/open (S8 host unwrap)
 
+mod continuity;
 mod identity;
 mod master_key;
 mod owner;
@@ -14,6 +16,16 @@ mod pairing;
 mod word_id;
 mod words;
 
+pub use continuity::{
+    ed25519_pk_to_x25519, ed25519_seed_to_x25519, open_continuity_pack,
+    open_continuity_pack_for_device, parse_continuity_pack_json, seal_continuity_pack,
+    validate_pack_id, verify_wipe_token, verify_wipe_token_for_pack, wipe_token_hash,
+    ContinuityError, ContinuityManifest, ContinuityPack, ContinuityStatus, SealContinuityInput,
+    SealedContinuity, CONTINUITY_MAX_CIPHERTEXT_BYTES, CONTINUITY_NONCE_LEN,
+    CONTINUITY_PACK_KEY_LEN, CONTINUITY_PACK_VERSION, CONTINUITY_PAYLOAD_ALG,
+    CONTINUITY_WIPE_DOMAIN, CONTINUITY_WIPE_TOKEN_LEN, CONTINUITY_WRAP_ALG, CONTINUITY_WRAP_DOMAIN,
+    CONTINUITY_X25519_PK_LEN,
+};
 pub use identity::{Identity, IdentityPublic};
 pub use master_key::{
     admin_mac_key, admin_signing_key, admin_verifying_key_bytes, derive_wrap_key,

@@ -1,4 +1,5 @@
-//! Mesh API v1 — auth challenge (Issue 4) + topology + owner claim (S4/B4) + grants (C2/C4).
+//! Mesh API v1 — auth challenge (Issue 4) + topology + owner claim (S4/B4) + grants (C2/C4)
+//! + continuity materialize/wipe/status (S8/E4).
 //!
 //! Routes (served on the carrier HTTP process, same Paths as serve):
 //!
@@ -14,6 +15,9 @@
 //! POST /mesh/v1/grants           # create guest grant (authz matrix)
 //! GET  /mesh/v1/grants           # list grants
 //! POST /mesh/v1/grants/{id}/revoke
+//! POST /mesh/v1/continuity/materialize  # unwrap pack sealed to host pubkey
+//! POST /mesh/v1/continuity/wipe         # wipe_token or owner/mrk
+//! GET  /mesh/v1/continuity/status       # present | wiped | absent
 //! ```
 //!
 //! Auth methods (S0 freeze / CARRIER-NEXT Issue 4):
@@ -49,13 +53,18 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use mymesh_core::{
-    RateLimitState,
-    LimitKind,
-    record_mesh_auth_challenge,
     client_ip_key,
+    load_state as load_continuity_state,
+    materialize_pack,
     not_after_days,
     parse_capabilities,
+    record_mesh_auth_challenge,
+    status_pack as continuity_status_pack,
+    wipe_pack as continuity_wipe_pack,
     Capability,
+    ContinuityHostManifest,
+    ContinuityHostStatus,
+    MaterializeInput,
     DeviceId,
     DeviceRecord,
     DeviceStore,
@@ -66,17 +75,20 @@ use mymesh_core::{
     GrantRole,
     GrantStore,
     IssuedBy,
+    LimitKind,
     MeshState,
     NodeFingerprint,
     PairPhase,
     PairSessionStore,
     Paths,
+    RateLimitState,
     TrustState,
 };
 use mymesh_crypto::{
-    accept_owner_claim, check_claim_authorized, resolve_claim_fingerprint, ClaimAuthMethod,
+    accept_owner_claim, check_claim_authorized, open_continuity_pack_for_device,
+    resolve_claim_fingerprint, verify_wipe_token, ClaimAuthMethod, ContinuityPack, ContinuityStatus,
     Identity, IdentityPublic, MeshMasterFile, MeshOwnerFile, MmkRuntime, Mrk, OwnerBackupSealed,
-    OwnerClaimRequest, HKDF_ADMIN_SIGN,
+    OwnerClaimRequest, CONTINUITY_MAX_CIPHERTEXT_BYTES, CONTINUITY_PACK_VERSION, HKDF_ADMIN_SIGN,
 };
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -278,6 +290,12 @@ pub fn mesh_v1_routes(st: MeshApiState) -> Router {
         )
         .route("/mesh/v1/grants", post(grants_create).get(grants_list))
         .route("/mesh/v1/grants/{id}/revoke", post(grants_revoke))
+        .route(
+            "/mesh/v1/continuity/materialize",
+            post(continuity_materialize),
+        )
+        .route("/mesh/v1/continuity/wipe", post(continuity_wipe))
+        .route("/mesh/v1/continuity/status", get(continuity_status))
         .with_state(st)
 }
 
@@ -1706,6 +1724,310 @@ async fn grants_revoke(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
             format!("revoke grant: {e}"),
+        ),
+    }
+}
+
+// ── Continuity materialize / wipe / status (S8 / E4) ────────────────────────
+
+/// Authz for continuity materialize + status (and wipe when not using wipe_token).
+///
+/// Allow: `person_owner` | `mrk_proof` | `device_member` when subject is **this host**
+/// (object host only). Deny: pair_read, remote non-host members, guests, unauthenticated.
+fn require_continuity_host_authz(
+    st: &MeshApiState,
+    session: &MeshSession,
+) -> Result<(), Response> {
+    match session.auth_mode {
+        AuthMethod::PersonOwner | AuthMethod::MrkProof => Ok(()),
+        AuthMethod::DeviceMember => {
+            let device_id = session.subject_device_id.ok_or_else(|| {
+                mesh_err(
+                    StatusCode::FORBIDDEN,
+                    "forbidden",
+                    "device_member session missing subject device",
+                )
+            })?;
+            let host_id = host_identity(&st.secret).device_id();
+            if device_id == host_id {
+                return Ok(());
+            }
+            Err(mesh_err(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "continuity materialize/status requires object host device_member",
+            ))
+        }
+        AuthMethod::PairRead => Err(mesh_err(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "pair_read cannot access continuity",
+        )),
+    }
+}
+
+#[derive(Serialize)]
+struct ContinuityMaterializeResponse {
+    pack_id: String,
+    status: ContinuityStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path_hint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContinuityWipeBody {
+    pack_id: String,
+    /// Hex wipe token (32B). Optional when caller has person_owner | mrk_proof.
+    #[serde(default)]
+    wipe_token: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ContinuityWipeResponse {
+    pack_id: String,
+    status: ContinuityStatus,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContinuityStatusQuery {
+    pack_id: String,
+}
+
+#[derive(Serialize)]
+struct ContinuityStatusResponse {
+    pack_id: String,
+    status: ContinuityStatus,
+}
+
+fn host_status_to_wire(s: ContinuityHostStatus) -> ContinuityStatus {
+    match s {
+        ContinuityHostStatus::Present => ContinuityStatus::Present,
+        ContinuityHostStatus::Wiped => ContinuityStatus::Wiped,
+        ContinuityHostStatus::Absent => ContinuityStatus::Absent,
+    }
+}
+
+async fn continuity_materialize(
+    State(st): State<MeshApiState>,
+    headers: HeaderMap,
+    Json(pack): Json<ContinuityPack>,
+) -> Response {
+    let session = match require_mesh_session(&st, &headers).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_continuity_host_authz(&st, &session) {
+        return r;
+    }
+
+    if pack.version != CONTINUITY_PACK_VERSION {
+        return mesh_err(
+            StatusCode::BAD_REQUEST,
+            "bad_pack",
+            format!("unsupported continuity pack version {}", pack.version),
+        );
+    }
+    if let Err(e) = mymesh_crypto::validate_pack_id(&pack.pack_id) {
+        return mesh_err(StatusCode::BAD_REQUEST, "bad_pack", e.to_string());
+    }
+
+    // Size budget fail-closed before crypto work.
+    let ct_len = base64::engine::general_purpose::STANDARD
+        .decode(pack.ciphertext.trim())
+        .map(|b| b.len())
+        .unwrap_or(usize::MAX);
+    if ct_len > CONTINUITY_MAX_CIPHERTEXT_BYTES {
+        return mesh_err(
+            StatusCode::BAD_REQUEST,
+            "too_large",
+            format!("ciphertext {ct_len} exceeds max {CONTINUITY_MAX_CIPHERTEXT_BYTES}"),
+        );
+    }
+
+    let host = host_identity(&st.secret);
+    let host_id = host.device_id().to_string();
+    let seed = host.to_secret_bytes();
+    let fields = match open_continuity_pack_for_device(&seed, &host_id, &pack) {
+        Ok(f) => f,
+        Err(e) => {
+            return mesh_err(
+                StatusCode::BAD_REQUEST,
+                "unwrap_failed",
+                // No pack_key in message — ContinuityError is already redacted.
+                e.to_string(),
+            );
+        }
+    };
+
+    let envelope = match serde_json::to_vec(&pack) {
+        Ok(b) => b,
+        Err(e) => {
+            return mesh_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("pack serialize: {e}"),
+            );
+        }
+    };
+
+    let manifest = ContinuityHostManifest {
+        label: pack.manifest.label.clone(),
+        created_at: pack.manifest.created_at.clone(),
+        person_id: pack.manifest.person_id.clone(),
+        facet_id: pack.manifest.facet_id.clone(),
+        fields_summary: pack.manifest.fields_summary.clone(),
+        byte_length: pack.manifest.byte_length,
+    };
+
+    match materialize_pack(
+        &st.paths,
+        MaterializeInput {
+            pack_id: &pack.pack_id,
+            version: pack.version,
+            wipe_token_hash: &pack.wipe_token_hash,
+            host_device_id_hex: &pack.host_device_id_hex,
+            manifest,
+            fields_json: &fields,
+            pack_envelope_json: &envelope,
+        },
+    ) {
+        Ok(r) => Json(ContinuityMaterializeResponse {
+            pack_id: r.pack_id,
+            status: ContinuityStatus::Present,
+            path_hint: Some(r.path_hint),
+        })
+        .into_response(),
+        Err(Error::Config(msg)) if msg.contains("already present") => mesh_err(
+            StatusCode::CONFLICT,
+            "conflict",
+            msg,
+        ),
+        Err(Error::Config(msg)) => mesh_err(StatusCode::BAD_REQUEST, "bad_pack", msg),
+        Err(e) => mesh_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("materialize: {e}"),
+        ),
+    }
+}
+
+async fn continuity_wipe(
+    State(st): State<MeshApiState>,
+    headers: HeaderMap,
+    Json(body): Json<ContinuityWipeBody>,
+) -> Response {
+    if let Err(e) = mymesh_crypto::validate_pack_id(&body.pack_id) {
+        return mesh_err(StatusCode::BAD_REQUEST, "bad_pack", e.to_string());
+    }
+
+    // Auth: wipe_token match **or** person_owner / mrk_proof session.
+    // (device_member object host alone is not enough without wipe_token.)
+    let mut authorized = false;
+
+    if let Some(token) = body.wipe_token.as_deref().filter(|t| !t.trim().is_empty()) {
+        match load_continuity_state(&st.paths, &body.pack_id) {
+            Ok(Some(state)) if !state.wipe_token_hash.is_empty() => {
+                if verify_wipe_token(&state.wipe_token_hash, token).is_ok() {
+                    authorized = true;
+                }
+            }
+            Ok(None) | Ok(Some(_)) => {
+                // Absent / no hash: token alone cannot authorize; fall through.
+            }
+            Err(e) => {
+                return mesh_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    format!("continuity state: {e}"),
+                );
+            }
+        }
+    }
+
+    if !authorized {
+        match require_mesh_session(&st, &headers).await {
+            Ok(session) => match session.auth_mode {
+                AuthMethod::PersonOwner | AuthMethod::MrkProof => {
+                    authorized = true;
+                }
+                AuthMethod::DeviceMember => {
+                    // Object host may wipe only with valid wipe_token (already checked).
+                    return mesh_err(
+                        StatusCode::FORBIDDEN,
+                        "forbidden",
+                        "device_member wipe requires valid wipe_token",
+                    );
+                }
+                AuthMethod::PairRead => {
+                    return mesh_err(
+                        StatusCode::FORBIDDEN,
+                        "forbidden",
+                        "pair_read cannot wipe continuity",
+                    );
+                }
+            },
+            Err(r) => {
+                // No session and no valid wipe_token.
+                if body.wipe_token.as_deref().filter(|t| !t.trim().is_empty()).is_some() {
+                    return mesh_err(
+                        StatusCode::FORBIDDEN,
+                        "wipe_token_invalid",
+                        "wipe token mismatch or pack absent",
+                    );
+                }
+                return r;
+            }
+        }
+    }
+
+    if !authorized {
+        return mesh_err(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "wipe requires wipe_token or owner/mrk session",
+        );
+    }
+
+    match continuity_wipe_pack(&st.paths, &body.pack_id) {
+        Ok(st_status) => Json(ContinuityWipeResponse {
+            pack_id: body.pack_id,
+            status: host_status_to_wire(st_status),
+        })
+        .into_response(),
+        Err(e) => mesh_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("wipe: {e}"),
+        ),
+    }
+}
+
+async fn continuity_status(
+    State(st): State<MeshApiState>,
+    headers: HeaderMap,
+    Query(q): Query<ContinuityStatusQuery>,
+) -> Response {
+    let session = match require_mesh_session(&st, &headers).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_continuity_host_authz(&st, &session) {
+        return r;
+    }
+    if let Err(e) = mymesh_crypto::validate_pack_id(&q.pack_id) {
+        return mesh_err(StatusCode::BAD_REQUEST, "bad_pack", e.to_string());
+    }
+
+    match continuity_status_pack(&st.paths, &q.pack_id) {
+        Ok(s) => Json(ContinuityStatusResponse {
+            pack_id: q.pack_id,
+            status: host_status_to_wire(s),
+        })
+        .into_response(),
+        Err(e) => mesh_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("status: {e}"),
         ),
     }
 }
@@ -4277,5 +4599,370 @@ mod tests {
 
         let counters = mymesh_core::EventCounters::load(&metrics).unwrap();
         assert!(counters.mesh_auth_challenge_total > limit as u64);
+    }
+
+    // ── Continuity materialize / wipe / status (S8 / E4) ───────────────────
+
+    fn seal_for_host(host: &Identity, fields: &str) -> mymesh_crypto::SealedContinuity {
+        let pk_hex = hex::encode(host.verifying_key_bytes());
+        let did = host.device_id().to_string();
+        mymesh_crypto::seal_continuity_pack(mymesh_crypto::SealContinuityInput {
+            host_device_public_key_hex: &pk_hex,
+            host_device_id_hex: &did,
+            person_id: "01CONTINUITYPERSON00000000",
+            facet_id: Some("personal"),
+            label: "hotel bag",
+            fields_json: fields,
+            fields_summary: vec!["profile".into()],
+            pack_id: Some("01CONTTESTPACK0000000000000"),
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn continuity_materialize_wipe_status_roundtrip() {
+        let paths = tmp_paths();
+        let secret = [0xA1u8; 32];
+        let host = Identity::from_secret_bytes(secret);
+        let mesh = MeshState::new_mesh();
+        mesh.save(paths.mesh_file()).unwrap();
+
+        let person = Identity::generate();
+        let person_id = "01CONTPERSON000000000000000";
+        MeshOwnerFile {
+            mesh_id: mesh.mesh_id.clone(),
+            person_id: person_id.into(),
+            person_public_key_hex: hex::encode(person.verifying_key_bytes()),
+            display_name: "Cont Owner".into(),
+            claimed_at: Utc::now(),
+            claim_ts_unix: Utc::now().timestamp(),
+            claimed_from_device_id: None,
+            mrk_fingerprint: "fp".into(),
+            mrk_epoch: 0,
+            claim_sig_hex: "00".repeat(64),
+            backup_stored_at: None,
+        }
+        .save(paths.mesh_owner_file())
+        .unwrap();
+
+        let fields = r#"{"profile":{"name":"Ada"}}"#;
+        let sealed = seal_for_host(&host, fields);
+
+        let st = test_state(paths.clone(), secret, "host");
+        let app = mesh_v1_routes(st);
+        let token = mint_person_owner_token(&app, &mesh.mesh_id, &person, person_id).await;
+
+        // Unauthenticated materialize → 401
+        let body = serde_json::to_string(&sealed.pack).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/continuity/materialize")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Status absent before materialize
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/mesh/v1/continuity/status?pack_id={}",
+                        sealed.pack.pack_id
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await["status"], "absent");
+
+        // Materialize
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/continuity/materialize")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mat = json_body(resp).await;
+        assert_eq!(mat["status"], "present");
+        assert_eq!(mat["pack_id"], sealed.pack.pack_id);
+        assert!(mat["path_hint"].as_str().unwrap().contains("continuity/"));
+
+        // Fields written on disk
+        let fields_path = paths
+            .continuity_pack_dir(&sealed.pack.pack_id)
+            .join("fields.json");
+        assert!(fields_path.exists());
+        assert_eq!(std::fs::read(&fields_path).unwrap(), fields.as_bytes());
+
+        // Status present
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/mesh/v1/continuity/status?pack_id={}",
+                        sealed.pack.pack_id
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_body(resp).await["status"], "present");
+
+        // Wrong wipe_token without owner would fail — use wrong token + no owner path via
+        // wipe with bad token and no auth.
+        let bad = serde_json::json!({
+            "pack_id": sealed.pack.pack_id,
+            "wipe_token": "00".repeat(32),
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/continuity/wipe")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(bad.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(fields_path.exists(), "bad wipe must not remove secrets");
+
+        // Good wipe_token (no session required)
+        let wipe_body = serde_json::json!({
+            "pack_id": sealed.pack.pack_id,
+            "wipe_token": sealed.wipe_token_hex(),
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/continuity/wipe")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(wipe_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await["status"], "wiped");
+        assert!(!fields_path.exists(), "wipe removes fields.json");
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/mesh/v1/continuity/status?pack_id={}",
+                        sealed.pack.pack_id
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_body(resp).await["status"], "wiped");
+    }
+
+    #[tokio::test]
+    async fn continuity_wrong_host_key_fails_closed() {
+        let paths = tmp_paths();
+        let secret = [0xA2u8; 32];
+        let host = Identity::from_secret_bytes(secret);
+        let other = Identity::from_secret_bytes([0xA3u8; 32]);
+        let mesh = MeshState::new_mesh();
+        mesh.save(paths.mesh_file()).unwrap();
+
+        // Pack sealed to *other* device, not host.
+        let sealed = seal_for_host(&other, r#"{"x":1}"#);
+
+        let st = test_state(paths, secret, "host");
+        let app = mesh_v1_routes(st);
+        let token = mint_device_member_token(&app, &mesh.mesh_id, &host, &host.device_id()).await;
+
+        let body = serde_json::to_string(&sealed.pack).unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/continuity/materialize")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = json_body(resp).await;
+        assert_eq!(err["code"], "unwrap_failed");
+        let err_s = err["error"].as_str().unwrap();
+        assert!(!err_s.contains("pack_key"));
+    }
+
+    #[tokio::test]
+    async fn continuity_pair_read_and_remote_member_denied() {
+        let paths = tmp_paths();
+        let secret = [0xA4u8; 32];
+        let host = Identity::from_secret_bytes(secret);
+        let mesh = MeshState::new_mesh();
+        mesh.save(paths.mesh_file()).unwrap();
+
+        let peer = Identity::from_secret_bytes([0xA5u8; 32]);
+        let mut store = DeviceStore::open(paths.devices_file()).unwrap();
+        store
+            .upsert(DeviceRecord {
+                id: peer.device_id(),
+                label: DeviceLabel::new("peer"),
+                fingerprint: NodeFingerprint::from_device_id(&peer.device_id())
+                    .as_str()
+                    .to_string(),
+                capabilities: Capability::all(),
+                trust: TrustState::Trusted,
+                linked_at: Utc::now(),
+                last_seen: None,
+                endpoint_hint: None,
+                mesh_id: Some(mesh.mesh_id.clone()),
+                aliases: vec![],
+                groups: vec![],
+                mesh_role: mymesh_core::MeshRole::Member,
+            })
+            .unwrap();
+
+        let sealed = seal_for_host(&host, r#"{"y":2}"#);
+        let st = test_state(paths, secret, "host");
+        let app = mesh_v1_routes(st);
+
+        let peer_tok =
+            mint_device_member_token(&app, &mesh.mesh_id, &peer, &peer.device_id()).await;
+        let body = serde_json::to_string(&sealed.pack).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/continuity/materialize")
+                    .header(header::AUTHORIZATION, format!("Bearer {peer_tok}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Host device_member may materialize (object host).
+        let host_tok =
+            mint_device_member_token(&app, &mesh.mesh_id, &host, &host.device_id()).await;
+        let body = serde_json::to_string(&sealed.pack).unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/continuity/materialize")
+                    .header(header::AUTHORIZATION, format!("Bearer {host_tok}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn continuity_owner_wipe_without_token() {
+        let paths = tmp_paths();
+        let secret = [0xA6u8; 32];
+        let host = Identity::from_secret_bytes(secret);
+        let mesh = MeshState::new_mesh();
+        mesh.save(paths.mesh_file()).unwrap();
+
+        let person = Identity::generate();
+        let person_id = "01CONTOWNERWIPE00000000000";
+        MeshOwnerFile {
+            mesh_id: mesh.mesh_id.clone(),
+            person_id: person_id.into(),
+            person_public_key_hex: hex::encode(person.verifying_key_bytes()),
+            display_name: "Wiper".into(),
+            claimed_at: Utc::now(),
+            claim_ts_unix: Utc::now().timestamp(),
+            claimed_from_device_id: None,
+            mrk_fingerprint: "fp".into(),
+            mrk_epoch: 0,
+            claim_sig_hex: "00".repeat(64),
+            backup_stored_at: None,
+        }
+        .save(paths.mesh_owner_file())
+        .unwrap();
+
+        let sealed = seal_for_host(&host, r#"{"z":3}"#);
+        let st = test_state(paths.clone(), secret, "host");
+        let app = mesh_v1_routes(st);
+        let token = mint_person_owner_token(&app, &mesh.mesh_id, &person, person_id).await;
+
+        let body = serde_json::to_string(&sealed.pack).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/continuity/materialize")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Owner wipe with empty wipe_token
+        let wipe_body = serde_json::json!({
+            "pack_id": sealed.pack.pack_id,
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/continuity/wipe")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(wipe_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await["status"], "wiped");
+        assert!(!paths
+            .continuity_pack_dir(&sealed.pack.pack_id)
+            .join("fields.json")
+            .exists());
     }
 }

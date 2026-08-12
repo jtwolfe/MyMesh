@@ -25,3 +25,5 @@ chrono = { workspace = true }
 argon2 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 hmac = { workspace = true }
+x25519-dalek = { workspace = true }
+curve25519-dalek = "4"

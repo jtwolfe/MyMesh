@@ -1,6 +1,7 @@
 //! Core types shared across the MyMesh stack.
 
 mod config;
+mod continuity;
 mod device;
 mod error;
 mod event_metrics;
@@ -17,6 +18,12 @@ mod rate_limit;
 mod tls_pin;
 
 pub use config::{Config, DaemonConfig, Limits, MagicConfig};
+pub use continuity::{
+    load_state, materialize_pack, read_fields, status_pack,
+    validate_pack_id as validate_continuity_pack_id, wipe_pack, wipe_token_hash_for,
+    ContinuityHostManifest, ContinuityHostState, ContinuityHostStatus, MaterializeInput,
+    MaterializeResult,
+};
 pub use device::{
     remote_admin_authority, AdminAuthority, Capability, DeviceRecord, DeviceStore, MeshRole,
     TrustState,
