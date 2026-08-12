@@ -49,7 +49,9 @@ pub use pair_session::{
 };
 pub use paths::Paths;
 pub use rate_limit::{
-    check as rate_limit_check, reset_for_tests as rate_limit_reset_for_tests, LimitKind, Policy,
-    RateLimitState, RateLimited, GRANT_MUTATE, HOST_LOCAL_SESSION, MESH_AUTH_CHALLENGE,
-    OWNER_BACKUP_UNWRAP, PAIR_DECIDE, PAIR_STATUS,
+    check as rate_limit_check, check_shared as rate_limit_check_shared,
+    clear_shared_for_tests as rate_limit_clear_shared_for_tests, client_ip_key,
+    metrics_dir_from_pair_sessions, reset_for_tests as rate_limit_reset_for_tests,
+    trust_proxy_enabled, LimitKind, Policy, RateLimitState, RateLimited, GRANT_MUTATE,
+    HOST_LOCAL_SESSION, MESH_AUTH_CHALLENGE, OWNER_BACKUP_UNWRAP, PAIR_DECIDE, PAIR_STATUS,
 };

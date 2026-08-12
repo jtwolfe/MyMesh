@@ -625,8 +625,10 @@ pub fn apply_pair_confirm(
         return Err(PairConfirmError::AlreadyDecided);
     }
 
-    // S9: decide + confirm share 10 / min / token (keyed by token_hash).
-    if let Err(rl) = crate::rate_limit::check(
+    // S9: decide + confirm share 10 / min / token (file-backed under metrics_dir).
+    let metrics_dir = crate::rate_limit::metrics_dir_from_pair_sessions(store.root());
+    if let Err(rl) = crate::rate_limit::check_shared(
+        &metrics_dir,
         crate::rate_limit::LimitKind::PairDecide,
         &sess.token_hash,
     ) {

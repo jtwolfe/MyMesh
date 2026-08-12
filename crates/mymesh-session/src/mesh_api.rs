@@ -25,17 +25,19 @@
 // axum Response as Err is intentional for early-return handler helpers (same as carrier).
 #![allow(clippy::result_large_err)]
 
-use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{ConnectInfo, FromRequestParts, State};
+use axum::http::{header, request::Parts, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use std::net::SocketAddr;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use mymesh_core::{
-    record_mesh_auth_challenge, Capability, DeviceId, DeviceRecord, DeviceStore, LimitKind,
-    MeshState, NodeFingerprint, PairPhase, PairSessionStore, Paths, RateLimitState, TrustState,
+    client_ip_key, record_mesh_auth_challenge, Capability, DeviceId, DeviceRecord, DeviceStore,
+    LimitKind, MeshState, NodeFingerprint, PairPhase, PairSessionStore, Paths, RateLimitState,
+    TrustState,
 };
 use mymesh_crypto::{
     accept_owner_claim, check_claim_authorized, resolve_claim_fingerprint, ClaimAuthMethod,
@@ -323,26 +325,31 @@ fn mesh_rate_limited(retry_after_secs: u64) -> Response {
     resp
 }
 
-/// Client key for IP-scoped limits: X-Forwarded-For → X-Real-IP → "unknown".
-fn client_ip_key(headers: &HeaderMap) -> String {
-    if let Some(xff) = headers
+/// Optional TCP peer (see carrier::OptionalPeer).
+struct OptionalPeer(Option<SocketAddr>);
+
+impl<S> FromRequestParts<S> for OptionalPeer
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0);
+        Ok(OptionalPeer(peer))
+    }
+}
+
+/// IP rate-limit key: peer primary; XFF only if `MYMESH_TRUST_PROXY`.
+fn rate_limit_ip(peer: Option<SocketAddr>, headers: &HeaderMap) -> String {
+    let xff = headers
         .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(first) = xff.split(',').next() {
-            let t = first.trim();
-            if !t.is_empty() {
-                return t.to_string();
-            }
-        }
-    }
-    if let Some(rip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        let t = rip.trim();
-        if !t.is_empty() {
-            return t.to_string();
-        }
-    }
-    "unknown".into()
+        .and_then(|v| v.to_str().ok());
+    let rip = headers.get("x-real-ip").and_then(|v| v.to_str().ok());
+    client_ip_key(peer, xff, rip)
 }
 
 fn extract_bearer(headers: &HeaderMap) -> Option<String> {
@@ -423,9 +430,13 @@ fn methods_allowed(paths: &Paths) -> Vec<&'static str> {
 
 // ── Handlers ────────────────────────────────────────────────────────────────
 
-async fn auth_challenge(State(st): State<MeshApiState>, headers: HeaderMap) -> Response {
-    // S9: 30 / min / ip
-    let ip = client_ip_key(&headers);
+async fn auth_challenge(
+    State(st): State<MeshApiState>,
+    OptionalPeer(peer): OptionalPeer,
+    headers: HeaderMap,
+) -> Response {
+    // S9: 30 / min / ip (TCP peer; XFF only with MYMESH_TRUST_PROXY)
+    let ip = rate_limit_ip(peer, &headers);
     if let Err(rl) = st.rate_limits.check(LimitKind::MeshAuthChallenge, &ip) {
         record_mesh_auth_challenge(st.paths.metrics_dir());
         return mesh_rate_limited(rl.retry_after_secs);
@@ -1444,6 +1455,7 @@ impl DeviceIdParse for DeviceId {
 mod tests {
     use super::*;
     use axum::body::Body;
+    use axum::extract::ConnectInfo;
     use axum::http::Request;
     use mymesh_core::{DeviceLabel, PairEndpointClass, PairSessionStore};
     use mymesh_crypto::{mesh_init, MmkRuntime};
@@ -2284,9 +2296,10 @@ mod tests {
         assert!(a.starts_with(AUTH_DOMAIN));
     }
 
-    /// S9: mesh auth challenge — 30 / min / ip → 429 + mesh_auth_challenge_total.
+    /// S9: mesh auth challenge — 30 / min / peer IP → 429 + Retry-After.
     #[tokio::test]
     async fn auth_challenge_rate_limit_per_ip() {
+        std::env::remove_var("MYMESH_TRUST_PROXY");
         let paths = tmp_paths();
         let secret = [0xD1u8; 32];
         MeshState::new_mesh().save(paths.mesh_file()).unwrap();
@@ -2294,47 +2307,39 @@ mod tests {
         let st = test_state(paths, secret, "host");
         let app = mesh_v1_routes(st);
 
-        let ip = "198.51.100.7";
+        let peer = std::net::SocketAddr::from(([198, 51, 100, 7], 40_000));
         let limit = mymesh_core::MESH_AUTH_CHALLENGE.max as usize;
         for i in 0..limit {
-            let resp = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri("/mesh/v1/auth/challenge")
-                        .header("x-forwarded-for", ip)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
+            let mut req = Request::builder()
+                .uri("/mesh/v1/auth/challenge")
+                .header("x-forwarded-for", "203.0.113.1") // ignored without trust proxy
+                .body(Body::empty())
                 .unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            let resp = app.clone().oneshot(req).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "hit {i}");
         }
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/mesh/v1/auth/challenge")
-                    .header("x-forwarded-for", ip)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
+        let mut req = Request::builder()
+            .uri("/mesh/v1/auth/challenge")
+            .body(Body::empty())
             .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().get(header::RETRY_AFTER).is_some());
         assert_eq!(json_body(resp).await["code"], "rate_limited");
 
-        // Other IP ok
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/mesh/v1/auth/challenge")
-                    .header("x-forwarded-for", "198.51.100.8")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
+        // Other peer ok
+        let mut req = Request::builder()
+            .uri("/mesh/v1/auth/challenge")
+            .body(Body::empty())
             .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(std::net::SocketAddr::from((
+                [198, 51, 100, 8],
+                40_001,
+            ))));
+        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
         let counters = mymesh_core::EventCounters::load(&metrics).unwrap();

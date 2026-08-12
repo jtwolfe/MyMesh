@@ -516,6 +516,17 @@ enum OwnerBackupCmd {
         #[arg(long)]
         hint: Option<String>,
     },
+    /// Attempt password unwrap of the stored sealed backup (S9 rate-limited).
+    ///
+    /// Prints person_id + seed hex on success. Wrong passwords count against
+    /// the 5 / 15 min / person_id budget.
+    Unwrap {
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+        /// Optional path to a sealed blob (default: on-disk owner-backup.sealed)
+        #[arg(long, value_name = "PATH")]
+        input: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -854,6 +865,10 @@ async fn main() -> Result<()> {
                     password_file,
                     hint,
                 } => cmd_owner_backup_store(&paths, &person_id, &seed_hex, password_file, hint)?,
+                OwnerBackupCmd::Unwrap {
+                    password_file,
+                    input,
+                } => cmd_owner_backup_unwrap(&paths, password_file, input)?,
             },
         },
         Commands::Kick {
@@ -1359,8 +1374,9 @@ fn cmd_grant_create(
     let _auth = mymesh_core::AdminAuthority::host_local();
     debug_assert!(_auth.may_mutate_local_store());
 
-    // S9: grant mutate 30 / min / session (host-local CLI uses fixed session key).
-    if let Err(rl) = mymesh_core::rate_limit_check(
+    // S9: grant mutate 30 / min / session (file-backed; host-local CLI key).
+    if let Err(rl) = mymesh_core::rate_limit_check_shared(
+        paths.metrics_dir(),
         mymesh_core::LimitKind::GrantMutate,
         mymesh_core::HOST_LOCAL_SESSION,
     ) {
@@ -1470,7 +1486,8 @@ fn cmd_grant_list(paths: &Paths, json: bool, all: bool) -> Result<()> {
 
 fn cmd_grant_revoke(paths: &Paths, grant_id: &str) -> Result<()> {
     let _auth = mymesh_core::AdminAuthority::host_local();
-    if let Err(rl) = mymesh_core::rate_limit_check(
+    if let Err(rl) = mymesh_core::rate_limit_check_shared(
+        paths.metrics_dir(),
         mymesh_core::LimitKind::GrantMutate,
         mymesh_core::HOST_LOCAL_SESSION,
     ) {
@@ -2486,15 +2503,19 @@ fn cmd_owner_backup_store(
 }
 
 /// S9: rate-limit backup unwrap attempts (5 / 15 min / person_id) and record metrics.
+///
+/// File-backed under metrics_dir so multiple CLI processes share the budget.
 fn rate_limited_unseal_owner_backup(
     paths: &Paths,
     person_id: &str,
     password: &[u8],
     sealed: &OwnerBackupSealed,
 ) -> Result<([u8; 32], String)> {
-    if let Err(rl) =
-        mymesh_core::rate_limit_check(mymesh_core::LimitKind::OwnerBackupUnwrap, person_id)
-    {
+    if let Err(rl) = mymesh_core::rate_limit_check_shared(
+        paths.metrics_dir(),
+        mymesh_core::LimitKind::OwnerBackupUnwrap,
+        person_id,
+    ) {
         mymesh_core::record_owner_backup_unwrap(paths.metrics_dir(), "rate_limited");
         bail!(
             "rate_limited: owner backup unwrap; retry after {}s",
@@ -2511,6 +2532,39 @@ fn rate_limited_unseal_owner_backup(
             Err(e.into())
         }
     }
+}
+
+/// Real password-attempt path for sealed owner backup (S9 unwrap rate limit).
+fn cmd_owner_backup_unwrap(
+    paths: &Paths,
+    password_file: Option<PathBuf>,
+    input: Option<PathBuf>,
+) -> Result<()> {
+    let sealed = if let Some(p) = input {
+        let raw = std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
+        serde_json::from_str::<OwnerBackupSealed>(&raw).context("parse sealed backup")?
+    } else {
+        OwnerBackupSealed::load(paths.owner_backup_file())
+            .with_context(|| format!("load {}", paths.owner_backup_file().display()))?
+    };
+    let password = if let Ok(env) = std::env::var("MYMESH_BACKUP_PASSWORD") {
+        if !env.is_empty() {
+            env
+        } else {
+            read_mmk_password(password_file.as_deref(), "Owner backup password", false)?
+        }
+    } else {
+        read_mmk_password(password_file.as_deref(), "Owner backup password", false)?
+    };
+    let (seed, person_id) =
+        rate_limited_unseal_owner_backup(paths, &sealed.person_id, password.as_bytes(), &sealed)?;
+    println!(
+        "{} person_id={}",
+        style("unwrapped").green().bold(),
+        person_id
+    );
+    println!("  seed_hex {}", hex::encode(seed));
+    Ok(())
 }
 
 /// Read MMK password from (in order): `--password-file`, `MYMESH_MMK_PASSWORD`, interactive prompt.

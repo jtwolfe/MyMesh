@@ -4,8 +4,8 @@
 //! under `/pair/v1` (status / pending / decide), `/pair/v2`, and `/mesh/v1`
 //! (auth challenge + topology) using the same `Paths` as serve.
 //! PairSessionStore is source of truth for v2 (PAIR-V2.md).
-use axum::extract::{Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{ConnectInfo, FromRequestParts, Query, State};
+use axum::http::{header, request::Parts, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -13,9 +13,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
 use mymesh_core::{
-    hash_pair_token, record_pair_decide, record_pair_status, ArmState, Config, DeviceId,
-    JoinDecision, JoinStore, LimitKind, MeshState, NodeFingerprint, PairEndpointClass, PairPhase,
-    PairSessionFile, PairSessionStore, Paths, PendingJoin, RateLimitState,
+    client_ip_key, hash_pair_token, record_pair_decide, record_pair_status, ArmState, Config,
+    DeviceId, JoinDecision, JoinStore, LimitKind, MeshState, NodeFingerprint, PairEndpointClass,
+    PairPhase, PairSessionFile, PairSessionStore, Paths, PendingJoin, RateLimitState,
 };
 use mymesh_crypto::{device_id_to_words, device_join_uri, Identity};
 use rand::rngs::OsRng;
@@ -201,7 +201,13 @@ pub async fn start_carrier(
     info!(%url, %host_base, "carrier + pair/v1 + mesh/v1 listening");
 
     tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+        // ConnectInfo peer IP for S9 IP-scoped rate limits (not client-spoofable XFF).
+        if let Err(e) = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        {
             tracing::warn!(%e, "carrier server exit");
         }
     });
@@ -541,26 +547,31 @@ fn pair_rate_limited(retry_after_secs: u64) -> Response {
     resp
 }
 
-/// Client key for IP-scoped limits: X-Forwarded-For → X-Real-IP → "unknown".
-fn client_ip_key(headers: &HeaderMap) -> String {
-    if let Some(xff) = headers
+/// Optional TCP peer (present when served with `into_make_service_with_connect_info`).
+struct OptionalPeer(Option<SocketAddr>);
+
+impl<S> FromRequestParts<S> for OptionalPeer
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0);
+        Ok(OptionalPeer(peer))
+    }
+}
+
+/// IP rate-limit key: peer addr primary; XFF only if `MYMESH_TRUST_PROXY` (see core).
+fn rate_limit_ip(peer: Option<SocketAddr>, headers: &HeaderMap) -> String {
+    let xff = headers
         .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(first) = xff.split(',').next() {
-            let t = first.trim();
-            if !t.is_empty() {
-                return t.to_string();
-            }
-        }
-    }
-    if let Some(rip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        let t = rip.trim();
-        if !t.is_empty() {
-            return t.to_string();
-        }
-    }
-    "unknown".into()
+        .and_then(|v| v.to_str().ok());
+    let rip = headers.get("x-real-ip").and_then(|v| v.to_str().ok());
+    client_ip_key(peer, xff, rip)
 }
 
 fn rfc3339(dt: DateTime<Utc>) -> String {
@@ -569,8 +580,12 @@ fn rfc3339(dt: DateTime<Utc>) -> String {
 
 // --- pair/v1 handlers ---
 
-async fn pair_status(State(st): State<CarrierState>, headers: HeaderMap) -> Response {
-    let ip = client_ip_key(&headers);
+async fn pair_status(
+    State(st): State<CarrierState>,
+    OptionalPeer(peer): OptionalPeer,
+    headers: HeaderMap,
+) -> Response {
+    let ip = rate_limit_ip(peer, &headers);
     if let Err(rl) = st.rate_limits.check(LimitKind::PairStatus, &ip) {
         record_pair_status(st.paths.metrics_dir());
         return pair_rate_limited(rl.retry_after_secs);
@@ -668,9 +683,13 @@ async fn pair_decide(
         Ok(t) => t,
         Err(resp) => return resp,
     };
-    // S9: 10 / min / token (process-global; shared with confirm / v2 decide).
+    // S9: 10 / min / token — file-backed so CLI confirm shares budget.
     let token_key = hash_pair_token(&token_raw);
-    if let Err(rl) = mymesh_core::rate_limit_check(LimitKind::PairDecide, &token_key) {
+    if let Err(rl) = mymesh_core::rate_limit_check_shared(
+        st.paths.metrics_dir(),
+        LimitKind::PairDecide,
+        &token_key,
+    ) {
         record_pair_decide(st.paths.metrics_dir(), "rate_limited");
         return pair_rate_limited(rl.retry_after_secs);
     }
@@ -904,10 +923,11 @@ fn resolve_status_session(
 
 async fn pair_v2_status(
     State(st): State<CarrierState>,
+    OptionalPeer(peer): OptionalPeer,
     headers: HeaderMap,
     Query(q): Query<StatusQuery>,
 ) -> Response {
-    let ip = client_ip_key(&headers);
+    let ip = rate_limit_ip(peer, &headers);
     if let Err(rl) = st.rate_limits.check(LimitKind::PairStatus, &ip) {
         record_pair_status(st.paths.metrics_dir());
         return pair_rate_limited(rl.retry_after_secs);
@@ -1023,9 +1043,13 @@ async fn pair_v2_decide(
         Ok(x) => x,
         Err(r) => return r,
     };
-    // S9: 10 / min / token (token_hash; shared with confirm).
+    // S9: 10 / min / token — file-backed under metrics_dir (shared with CLI confirm).
     let token_key = hash_pair_token(&raw);
-    if let Err(rl) = mymesh_core::rate_limit_check(LimitKind::PairDecide, &token_key) {
+    if let Err(rl) = mymesh_core::rate_limit_check_shared(
+        st.paths.metrics_dir(),
+        LimitKind::PairDecide,
+        &token_key,
+    ) {
         record_pair_decide(st.paths.metrics_dir(), "rate_limited");
         return pair_rate_limited(rl.retry_after_secs);
     }
@@ -1359,9 +1383,10 @@ pub fn carrier_pending_path(paths: &Paths) -> std::path::PathBuf {
 mod tests {
     use super::*;
     use axum::body::Body;
+    use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
     use chrono::Duration;
-    use mymesh_core::{Capability, DeviceId, NodeFingerprint};
+    use mymesh_core::{apply_pair_confirm, Capability, DeviceId, NodeFingerprint};
     use tower::ServiceExt;
 
     fn tmp_paths() -> Paths {
@@ -2074,9 +2099,16 @@ mod tests {
         assert_eq!(json_body(resp).await["protocol_version"], 1);
     }
 
-    /// S9: pair status unauth — 60 / min / ip → 429.
+    fn with_peer(mut req: Request<Body>, ip: [u8; 4]) -> Request<Body> {
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::from((ip, 50_000))));
+        req
+    }
+
+    /// S9: pair status unauth — 60 / min / peer IP → 429 + Retry-After.
+    /// X-Forwarded-For is ignored without MYMESH_TRUST_PROXY.
     #[tokio::test]
     async fn pair_status_rate_limit_per_ip() {
+        std::env::remove_var("MYMESH_TRUST_PROXY");
         let paths = tmp_paths();
         let secret = [0x81u8; 32];
         ArmState::arm(paths.arm_file(), 600).unwrap();
@@ -2085,21 +2117,19 @@ mod tests {
         let st = test_state(paths, secret, "host");
         let app = build_router(st);
 
-        let ip = "203.0.113.50";
+        let peer = [203, 0, 113, 50];
         let limit = mymesh_core::PAIR_STATUS.max as usize;
         for i in 0..limit {
-            let resp = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri("/pair/v2/status")
-                        .header("x-forwarded-for", ip)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            // No session → 404 counts as under limit (rate limit before work).
+            let req = with_peer(
+                Request::builder()
+                    .uri("/pair/v2/status")
+                    // Spoofed XFF must NOT bypass peer key when trust proxy is off.
+                    .header("x-forwarded-for", "198.51.100.1")
+                    .body(Body::empty())
+                    .unwrap(),
+                peer,
+            );
+            let resp = app.clone().oneshot(req).await.unwrap();
             assert!(
                 resp.status() == StatusCode::NOT_FOUND || resp.status() == StatusCode::OK,
                 "hit {i}: unexpected {}",
@@ -2108,28 +2138,33 @@ mod tests {
         }
         let resp = app
             .clone()
-            .oneshot(
+            .oneshot(with_peer(
                 Request::builder()
                     .uri("/pair/v2/status")
-                    .header("x-forwarded-for", ip)
+                    .header("x-forwarded-for", "198.51.100.1")
                     .body(Body::empty())
                     .unwrap(),
-            )
+                peer,
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            resp.headers().get(header::RETRY_AFTER).is_some(),
+            "429 must include Retry-After"
+        );
         let body = json_body(resp).await;
         assert_eq!(body["code"], "rate_limited");
 
-        // Different IP still allowed.
+        // Different peer still allowed.
         let resp = app
-            .oneshot(
+            .oneshot(with_peer(
                 Request::builder()
                     .uri("/pair/v2/status")
-                    .header("x-forwarded-for", "203.0.113.51")
                     .body(Body::empty())
                     .unwrap(),
-            )
+                [203, 0, 113, 51],
+            ))
             .await
             .unwrap();
         assert_ne!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -2138,11 +2173,11 @@ mod tests {
         assert!(counters.pair_status_total > limit as u64);
     }
 
-    /// S9: pair decide — 10 / min / token → 429; metrics pair_decide_total{result}.
+    /// S9: pair decide — 10 / min / token → 429 + Retry-After; metrics.
     #[tokio::test]
     async fn pair_v2_decide_rate_limit_per_token() {
-        mymesh_core::rate_limit_reset_for_tests();
         let paths = tmp_paths();
+        mymesh_core::rate_limit_clear_shared_for_tests(paths.metrics_dir());
         let secret = [0x82u8; 32];
         let id = Identity::from_secret_bytes(secret);
         ArmState::arm(paths.arm_file(), 600).unwrap();
@@ -2197,6 +2232,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().get(header::RETRY_AFTER).is_some());
         assert_eq!(json_body(resp).await["code"], "rate_limited");
 
         let counters = mymesh_core::EventCounters::load(&metrics).unwrap();
@@ -2204,5 +2240,78 @@ mod tests {
             counters.pair_decide_total.get("rate_limited").copied(),
             Some(1)
         );
+    }
+
+    /// S9: HTTP decide hits and CLI confirm share one file-backed token budget.
+    #[tokio::test]
+    async fn decide_and_confirm_share_token_budget() {
+        let paths = tmp_paths();
+        mymesh_core::rate_limit_clear_shared_for_tests(paths.metrics_dir());
+        let secret = [0x83u8; 32];
+        let id = Identity::from_secret_bytes(secret);
+        ArmState::arm(paths.arm_file(), 600).unwrap();
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        let (sid, token, nonce, _) =
+            arm_v2_session(&paths, id.device_id(), PairEndpointClass::Direct);
+
+        let st = test_state(paths.clone(), secret, "host");
+        let app = build_router(st);
+        let body = serde_json::json!({
+            "sid": sid,
+            "decision": "deny",
+            "joiner_device_id_hex": DeviceId::from_bytes([0x77u8; 32]).to_string(),
+            "resident_device_id_hex": id.device_id().to_string(),
+            "ts": rfc3339(Utc::now()),
+            "nonce": encode_pair_nonce(&nonce),
+        });
+        // Burn 9 of 10 via HTTP decide
+        for _ in 0..9 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/pair/v2/decide")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        // 10th via confirm (same token_hash / metrics_dir file store)
+        let store = PairSessionStore::open(paths.pair_sessions_dir()).unwrap();
+        let joins = JoinStore::open(paths.join_dir()).unwrap();
+        // First confirm attempt consumes last slot (may fail not_bound / bad_code)
+        let r1 = apply_pair_confirm(&store, &joins, "ZZZZ-ZZZZ", Some(&sid), None);
+        assert!(
+            !matches!(r1, Err(mymesh_core::PairConfirmError::RateLimited { .. })),
+            "10th attempt should still be allowed: {r1:?}"
+        );
+        // 11th → RateLimited
+        let r2 = apply_pair_confirm(&store, &joins, "ZZZZ-ZZZZ", Some(&sid), None);
+        match r2 {
+            Err(mymesh_core::PairConfirmError::RateLimited { retry_after_secs }) => {
+                assert!(retry_after_secs >= 1);
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        // HTTP also blocked
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/pair/v2/decide")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().get(header::RETRY_AFTER).is_some());
     }
 }
