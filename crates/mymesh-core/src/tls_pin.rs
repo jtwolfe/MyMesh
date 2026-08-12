@@ -366,6 +366,11 @@ mod tests {
             check_direct_host_tls_pin(Some(&pin), Some("https://x"), None).unwrap_err(),
             TlsPinError::Mismatch
         );
+        // pin + https + empty SPKI slice → mismatch (fail closed; no skip)
+        assert_eq!(
+            check_direct_host_tls_pin(Some(&pin), Some("https://x"), Some(&[])).unwrap_err(),
+            TlsPinError::Mismatch
+        );
         // pin + https + wrong spki
         assert_eq!(
             check_direct_host_tls_pin(
@@ -376,6 +381,31 @@ mod tests {
             .unwrap_err(),
             TlsPinError::Mismatch
         );
+        // pin + empty host string → https required
+        assert_eq!(
+            check_direct_host_tls_pin(Some(&pin), Some(""), Some(&spki)).unwrap_err(),
+            TlsPinError::HttpsRequired
+        );
+    }
+
+    #[test]
+    fn parse_uppercase_prefix_and_unpadded_standard_base64() {
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        use base64::Engine;
+
+        let spki = sample_spki(0x55);
+        let pin = TlsPin::from_spki_der(&spki);
+        // Documented accept: SHA256/ prefix
+        let upper = format!("SHA256/{}", URL_SAFE_NO_PAD.encode(pin.digest()));
+        assert_eq!(parse_tls_pin(&upper).unwrap(), pin);
+
+        // Unpadded standard base64 (not base64url): strip '=' from STANDARD encoding
+        let std_padded = STANDARD.encode(pin.digest());
+        let std_unpadded = std_padded.trim_end_matches('=');
+        // 32-byte digests always need padding under STANDARD
+        assert!(std_padded.ends_with('='));
+        let wire_unpadded = format!("sha256/{std_unpadded}");
+        assert_eq!(parse_tls_pin(&wire_unpadded).unwrap(), pin);
     }
 
     #[test]
@@ -383,6 +413,7 @@ mod tests {
         assert!(host_is_https("https://a"));
         assert!(host_is_https("HTTPS://A"));
         assert!(!host_is_https("http://a"));
+        assert!(!host_is_https(""));
         assert!(host_is_http_cleartext("http://a"));
         assert!(!host_is_http_cleartext("https://a"));
     }

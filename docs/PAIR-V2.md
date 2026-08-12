@@ -66,14 +66,14 @@ Optional certificate pin for **direct** HTTPS pair hosts (S9 / PR D2). Release c
 | Wire | `tlspin=sha256/<base64>` query param on v2 QR |
 | Digest | **SHA-256** over the DER-encoded **SubjectPublicKeyInfo (SPKI)** of the leaf (or pinned) certificate |
 | Base64 | Standard Base64 **or** base64url; padding optional. Emitters SHOULD use **base64url no padding** (URL-safe) |
-| Prefix | Case-sensitive algorithm label `sha256/` (accept `SHA256/` on parse) |
+| Prefix | Canonical prefix is lowercase `sha256/`; parsers SHOULD accept `SHA256/` |
 | Host | When `tlspin` is present, `host` **must** be `https://…`. Pin + cleartext / missing host → **fail closed** at emit and at client |
 | Client | Before sending the bootstrap Bearer token on direct ep, verify peer SPKI against pin; **mismatch → abort** (do not send token) |
 | Absent pin | No SPKI check; behaviour unchanged (TOFU `fp` still applies for host identity) |
 | Lab HTTP | `http://` host without pin remains valid for debug / LAN alpha |
 
 ```text
-# Example (synthetic)
+# Example shape only (illustrative — not a valid 32-byte digest encoding)
 tlspin=sha256/AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-abcde
 
 # Android Network Security Config style also accepted on parse:

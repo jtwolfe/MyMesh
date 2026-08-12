@@ -258,7 +258,8 @@ pub fn build_pair_qr(host_base: &str, token: &str, fp: &str, mesh: Option<&str>)
 /// Parameters for a v2 pair bootstrap QR (`carrier://pair?v=2&…`).
 ///
 /// `nonce` is **required** (16 raw bytes). `host` is optional — absent ⇒ `ep=confirm`.
-/// Optional `tlspin` (SPKI pin) requires HTTPS host (validated by caller / `build_pair_qr_v2`).
+/// Optional `tlspin` (SPKI pin) requires HTTPS host — validated by the **caller** or
+/// [`build_pair_qr_v2_checked`] (the unchecked builder does not enforce pin policy).
 #[derive(Clone, Debug)]
 pub struct PairQrV2Params<'a> {
     pub sid: &'a str,
@@ -1855,6 +1856,79 @@ mod tests {
             tlspin: None,
         })
         .is_ok());
+
+        // pin + empty host string → fail closed
+        let err = build_pair_qr_v2_checked(&PairQrV2Params {
+            sid: "s",
+            did: "d",
+            token: "t",
+            nonce: &nonce,
+            fp: "fp",
+            mesh: None,
+            host: Some(""),
+            ep: None,
+            relay: None,
+            tlspin: Some(&wire),
+        })
+        .unwrap_err();
+        assert_eq!(err, TlsPinError::HttpsRequired);
+
+        // bad pin format at checked emit
+        assert!(matches!(
+            build_pair_qr_v2_checked(&PairQrV2Params {
+                sid: "s",
+                did: "d",
+                token: "t",
+                nonce: &nonce,
+                fp: "fp",
+                mesh: None,
+                host: Some("https://h"),
+                ep: None,
+                relay: None,
+                tlspin: Some("md5/AAAA"),
+            })
+            .unwrap_err(),
+            TlsPinError::BadFormat(_)
+        ));
+        assert!(matches!(
+            build_pair_qr_v2_checked(&PairQrV2Params {
+                sid: "s",
+                did: "d",
+                token: "t",
+                nonce: &nonce,
+                fp: "fp",
+                mesh: None,
+                host: Some("https://h"),
+                ep: None,
+                relay: None,
+                tlspin: Some("sha256/AAAA"),
+            })
+            .unwrap_err(),
+            TlsPinError::BadDigest(_)
+        ));
+
+        // non-canonical input (Android standard base64) → QR emits canonical base64url no-pad
+        let android = pin.to_android_wire();
+        assert_ne!(android, wire);
+        let qr_canon = build_pair_qr_v2_checked(&PairQrV2Params {
+            sid: "s",
+            did: "d",
+            token: "t",
+            nonce: &nonce,
+            fp: "fp",
+            mesh: None,
+            host: Some("https://pair.example"),
+            ep: None,
+            relay: None,
+            tlspin: Some(&android),
+        })
+        .unwrap();
+        assert!(
+            qr_canon.contains(&percent_encode(&wire)) || qr_canon.contains(&wire),
+            "checked builder should re-emit canonical pin on QR"
+        );
+        // Android padded form should not appear raw on the wire
+        assert!(!qr_canon.contains(&percent_encode(&android)));
     }
 
     #[test]

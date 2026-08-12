@@ -12,8 +12,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use console::style;
 use mymesh_core::{
-    apply_pair_confirm, parse_tls_pin, ArmState, Config, JoinDecision, JoinStore, MeshState,
-    NodeFingerprint, PairEndpointClass, PairPhase, PairSessionStore, Paths,
+    apply_pair_confirm, parse_tls_pin, require_https_when_pinned, ArmState, Config, JoinDecision,
+    JoinStore, MeshState, NodeFingerprint, PairEndpointClass, PairPhase, PairSessionStore, Paths,
 };
 use mymesh_crypto::{parse_device_id, Identity};
 use mymesh_session::{build_pair_qr_v2_checked, run_join_as_guest, PairQrV2Params};
@@ -23,7 +23,7 @@ use crate::mesh_conn;
 
 /// Resident: arm join window, mint PairSession, print QR_A v2 (required nonce).
 ///
-/// Optional `--tlspin` (SPKI pin) requires `--host https://…` (fail closed).
+/// Optional `--tlspin` (SPKI pin) requires `--host https://…` (fail closed **before** arm).
 pub async fn cmd_pair_dual(
     paths: &Paths,
     host: Option<String>,
@@ -35,13 +35,17 @@ pub async fn cmd_pair_dual(
     let cfg = Config::load(paths.config_file()).unwrap_or_default();
     let ttl = ttl.unwrap_or(cfg.limits.arm_timeout_secs);
 
-    // Validate pin early (format + HTTPS policy) before arming.
-    let pin_wire = if let Some(raw) = tlspin.as_deref() {
-        let pin = parse_tls_pin(raw).map_err(|e| anyhow::anyhow!("{e}"))?;
-        Some(pin.to_wire())
-    } else {
-        None
+    // Fail closed before arming: pin format + HTTPS policy (no orphan session / arm TTL burn).
+    let pin_parsed = match tlspin.as_deref() {
+        Some(raw) if !raw.is_empty() => {
+            Some(parse_tls_pin(raw).map_err(|e| anyhow::anyhow!("{e}"))?)
+        }
+        Some(_) => bail!("tls pin is empty"),
+        None => None,
     };
+    require_https_when_pinned(pin_parsed.as_ref(), host.as_deref())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let pin_wire = pin_parsed.as_ref().map(|p| p.to_wire());
 
     // Arm join window so serve accepts JoinRequest.
     let arm = ArmState::arm(paths.arm_file(), ttl)?;
@@ -55,16 +59,12 @@ pub async fn cmd_pair_dual(
     };
     let mut armed = store.arm_new(mesh.mesh_id.clone(), identity.device_id(), ttl, ep)?;
 
-    if let Some(ref pin) = pin_wire {
-        armed.session.tls_pin = Some(pin.clone());
-        store.save(&armed.session)?;
-    }
-
     let token_b64 = URL_SAFE_NO_PAD.encode(armed.token_raw);
     let did = identity.device_id().to_string();
     let fp = NodeFingerprint::from_device_id(&identity.device_id())
         .as_str()
         .to_string();
+    // Checked emit (format already validated; re-checks HTTPS + emits canonical pin).
     let qr = build_pair_qr_v2_checked(&PairQrV2Params {
         sid: &armed.session.sid,
         did: &did,
@@ -78,6 +78,12 @@ pub async fn cmd_pair_dual(
         tlspin: pin_wire.as_deref(),
     })
     .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Persist pin only after successful QR emit (session advertises what the QR carried).
+    if let Some(ref pin) = pin_wire {
+        armed.session.tls_pin = Some(pin.clone());
+        store.save(&armed.session)?;
+    }
 
     println!("{}", style("pair dual — resident QR_A (v2)").bold());
     println!("  sid     {}", armed.session.sid);
