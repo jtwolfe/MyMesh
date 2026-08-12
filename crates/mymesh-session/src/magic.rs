@@ -1,7 +1,5 @@
 //! Magic LAN plane: mesh IPs (127.64/16), DNS for *.mym, SOCKS5, auto port forwards.
-use mymesh_core::{
-    mesh_ipv4, Config, DeviceId, DeviceStore, MagicConfig, Paths, TrustState,
-};
+use mymesh_core::{mesh_ipv4, Config, DeviceId, DeviceStore, MagicConfig, Paths, TrustState};
 use mymesh_crypto::Identity;
 use mymesh_net::{IrohTransport, Transport};
 use std::collections::{HashMap, HashSet};
@@ -408,12 +406,7 @@ fn build_dns_response(
     };
     let mut out = Vec::with_capacity(128);
     out.extend_from_slice(&req[0..2]);
-    out.extend_from_slice(&if ip.is_some() {
-        0x8180u16
-    } else {
-        0x8183u16
-    }
-    .to_be_bytes());
+    out.extend_from_slice(&if ip.is_some() { 0x8180u16 } else { 0x8183u16 }.to_be_bytes());
     out.extend_from_slice(&1u16.to_be_bytes());
     out.extend_from_slice(&(if ip.is_some() { 1u16 } else { 0 }).to_be_bytes());
     out.extend_from_slice(&0u16.to_be_bytes());

@@ -31,14 +31,9 @@ pub async fn open_to_peer(
     let _ = paths;
     let sock = std::path::PathBuf::from(&cfg.daemon.control_socket);
     let (conn, transport) = mymesh_net::connect_mesh(identity, peer, &sock).await?;
-    let session = Session::handshake_dialer(
-        conn,
-        identity,
-        &cfg.device_label,
-        store,
-        Capability::all(),
-    )
-    .await?;
+    let session =
+        Session::handshake_dialer(conn, identity, &cfg.device_label, store, Capability::all())
+            .await?;
     Ok((session, transport, peer))
 }
 

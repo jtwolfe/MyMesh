@@ -15,12 +15,12 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::join::handle_join_as_host;
-use crate::tcp_tunnel;
 use crate::mesh_sync::{
     apply_kick_notice_local, apply_kick_target, apply_membership, build_announce, build_snapshot,
     sign_leave_ack, verify_kick, verify_leave_ack, verify_membership,
 };
 use crate::session::Session;
+use crate::tcp_tunnel;
 
 const MESH_VALIDATE_SECS: u64 = 60;
 const DIRTY_POLL_SECS: u64 = 2;
@@ -147,10 +147,7 @@ impl Agent {
         }
     }
 
-    async fn handle_join(
-        &self,
-        conn: Box<dyn mymesh_net::PeerConnection>,
-    ) -> Result<()> {
+    async fn handle_join(&self, conn: Box<dyn mymesh_net::PeerConnection>) -> Result<()> {
         let identity = self.identity();
         handle_join_as_host(
             conn,
@@ -207,10 +204,7 @@ impl Agent {
         self.handle_session(conn).await
     }
 
-    async fn handle_session(
-        &self,
-        conn: Box<dyn mymesh_net::PeerConnection>,
-    ) -> Result<()> {
+    async fn handle_session(&self, conn: Box<dyn mymesh_net::PeerConnection>) -> Result<()> {
         let identity = self.identity();
         let store = self.store()?;
         let mut offered = Vec::new();
@@ -681,7 +675,10 @@ impl Agent {
             .map(|d| d.id)
             .collect();
         for peer in peers {
-            if let Err(e) = self.dial_request_membership(transport, &identity, peer).await {
+            if let Err(e) = self
+                .dial_request_membership(transport, &identity, peer)
+                .await
+            {
                 warn!(peer = %peer.short(), %e, "mesh validate peer failed");
             }
         }
@@ -702,14 +699,9 @@ impl Agent {
             return Ok(());
         }
         let conn = transport.connect(peer).await?;
-        let session = Session::handshake_dialer(
-            conn,
-            &identity,
-            &self.label,
-            &store,
-            Capability::all(),
-        )
-        .await?;
+        let session =
+            Session::handshake_dialer(conn, &identity, &self.label, &store, Capability::all())
+                .await?;
         let conn = session.into_conn();
         conn.send_frame(Frame {
             channel: ChannelId::control(),
@@ -729,14 +721,9 @@ impl Agent {
     ) -> Result<()> {
         let store = self.store()?;
         let conn = transport.connect(peer).await?;
-        let session = Session::handshake_dialer(
-            conn,
-            identity,
-            &self.label,
-            &store,
-            Capability::all(),
-        )
-        .await?;
+        let session =
+            Session::handshake_dialer(conn, identity, &self.label, &store, Capability::all())
+                .await?;
         let conn = session.into_conn();
         // push ours + request theirs
         let mesh = MeshState::load(&self.mesh_path)?;
@@ -766,8 +753,7 @@ impl Agent {
                         ..
                     } = msg
                     {
-                        if verify_membership(&from_id, &mesh_id, ts, &members, &signature).is_ok()
-                        {
+                        if verify_membership(&from_id, &mesh_id, ts, &members, &signature).is_ok() {
                             let mut store = self.store()?;
                             apply_membership(
                                 &mut store,
@@ -805,10 +791,13 @@ impl Agent {
                 force: kick.force,
                 signature: kick.signature,
             };
-            // connect without local trust check: temporarily re-add revoked? 
+            // connect without local trust check: temporarily re-add revoked?
             // Target was removed from our store. Need dial that skips trust.
             // Use special path: handshake with temporary trust insert.
-            if let Err(e) = self.dial_kick_notice(transport, kick.target_id, notice).await {
+            if let Err(e) = self
+                .dial_kick_notice(transport, kick.target_id, notice)
+                .await
+            {
                 warn!(target = %kick.target_id.short(), %e, "pending kick delivery deferred");
             } else {
                 let mut pk = self.pending()?;
@@ -843,23 +832,18 @@ impl Agent {
                     last_seen: None,
                     endpoint_hint: None,
                     mesh_id: Some(k.mesh_id),
-                
-                aliases: Vec::new(),
-                groups: Vec::new(),
-            })?;
+
+                    aliases: Vec::new(),
+                    groups: Vec::new(),
+                })?;
             }
         }
         let identity = self.identity();
         let store = self.store()?;
         let conn = transport.connect(target).await?;
-        let session = Session::handshake_dialer(
-            conn,
-            &identity,
-            &self.label,
-            &store,
-            Capability::all(),
-        )
-        .await?;
+        let session =
+            Session::handshake_dialer(conn, &identity, &self.label, &store, Capability::all())
+                .await?;
         let conn = session.into_conn();
         conn.send_frame(Frame {
             channel: ChannelId::control(),
@@ -916,7 +900,6 @@ impl Agent {
         Ok(())
     }
 }
-
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct LeaveOutbox {

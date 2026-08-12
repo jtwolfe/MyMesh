@@ -50,7 +50,12 @@ fn libc_geteuid() -> u32 {
     if let Ok(s) = fs::read_to_string("/proc/self/status") {
         for line in s.lines() {
             if let Some(rest) = line.strip_prefix("Uid:") {
-                let uid: u32 = rest.split_whitespace().next().unwrap_or("1").parse().unwrap_or(1);
+                let uid: u32 = rest
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("1")
+                    .parse()
+                    .unwrap_or(1);
                 return uid;
             }
         }
@@ -215,7 +220,10 @@ fn install_user(paths: &Paths) -> Result<()> {
     )?;
 
     try_run("systemctl", &["--user", "daemon-reload"]);
-    try_run("systemctl", &["--user", "enable", "--now", "mymesh.service"]);
+    try_run(
+        "systemctl",
+        &["--user", "enable", "--now", "mymesh.service"],
+    );
 
     println!(
         "{} user install as {}",
@@ -254,10 +262,22 @@ fn install_system(
         bail!("system install requires root (try: sudo mymesh install --system)");
     }
 
-    println!("{}", style("╔══════════════════════════════════════════════════════╗").red());
-    println!("{}", style("║  SYSTEM INSTALL — privileged operation               ║").red());
-    println!("{}", style("║  Default is user install without sudo.               ║").red());
-    println!("{}", style("╚══════════════════════════════════════════════════════╝").red());
+    println!(
+        "{}",
+        style("╔══════════════════════════════════════════════════════╗").red()
+    );
+    println!(
+        "{}",
+        style("║  SYSTEM INSTALL — privileged operation               ║").red()
+    );
+    println!(
+        "{}",
+        style("║  Default is user install without sudo.               ║").red()
+    );
+    println!(
+        "{}",
+        style("╚══════════════════════════════════════════════════════╝").red()
+    );
 
     let user = runtime_user.unwrap_or_else(|| "mymesh".into());
     if user == "root" && !accept_root_agent {
@@ -423,7 +443,12 @@ pub fn cmd_completions(shell: &str, out: Option<PathBuf>) -> Result<()> {
             let _ = fs::create_dir_all(parent);
         }
         fs::write(&path, &buf)?;
-        println!("{} wrote {} bytes → {}", style("ok").green().bold(), buf.len(), path.display());
+        println!(
+            "{} wrote {} bytes → {}",
+            style("ok").green().bold(),
+            buf.len(),
+            path.display()
+        );
     } else {
         io::stdout().write_all(&buf)?;
     }
@@ -488,7 +513,10 @@ pub fn cmd_uninstall(paths: &Paths, purge: bool) -> Result<()> {
             try_run("systemctl", &["daemon-reload"]);
         }
         Some(m) => {
-            try_run("systemctl", &["--user", "disable", "--now", "mymesh.service"]);
+            try_run(
+                "systemctl",
+                &["--user", "disable", "--now", "mymesh.service"],
+            );
             let _ = fs::remove_file(&m.unit_path);
             // only remove binary if it looks like our install path
             if m.binary_path.ends_with("mymesh") {
@@ -498,7 +526,10 @@ pub fn cmd_uninstall(paths: &Paths, purge: bool) -> Result<()> {
         }
         None => {
             // best effort user unit
-            try_run("systemctl", &["--user", "disable", "--now", "mymesh.service"]);
+            try_run(
+                "systemctl",
+                &["--user", "disable", "--now", "mymesh.service"],
+            );
             let _ = fs::remove_file(user_unit_dir().join("mymesh.service"));
         }
     }
@@ -514,7 +545,11 @@ pub fn cmd_uninstall(paths: &Paths, purge: bool) -> Result<()> {
     println!(
         "{} uninstalled{}",
         style("ok").green().bold(),
-        if purge { " (purged data)" } else { " (data kept)" }
+        if purge {
+            " (purged data)"
+        } else {
+            " (data kept)"
+        }
     );
     Ok(())
 }
@@ -551,7 +586,10 @@ pub fn cmd_reset(paths: &Paths, links: bool, identity: bool) -> Result<()> {
         let _ = fs::remove_dir_all(paths.join_dir());
         let _ = fs::remove_dir_all(paths.metrics_dir());
         let _ = store; // opened to ensure path ok
-        println!("{} cleared device links + join/metrics state", style("ok").green().bold());
+        println!(
+            "{} cleared device links + join/metrics state",
+            style("ok").green().bold()
+        );
     }
     if identity {
         let id_path = paths.identity_file();

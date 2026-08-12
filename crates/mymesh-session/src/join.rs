@@ -65,7 +65,9 @@ pub async fn run_join_as_guest(
                     let _ = conn.close().await;
                     return Ok(rec);
                 }
-                return Err(mymesh_core::Error::Other("join timed out waiting for host".into()));
+                return Err(mymesh_core::Error::Other(
+                    "join timed out waiting for host".into(),
+                ));
             }
         };
         let msg: ControlMessage = decode_msg(&frame.payload)?;
@@ -95,17 +97,19 @@ pub async fn run_join_as_guest(
                 let rec = DeviceRecord {
                     id: host_id,
                     label: DeviceLabel::new(host_label),
-                    fingerprint: NodeFingerprint::from_device_id(&host_id).as_str().to_string(),
+                    fingerprint: NodeFingerprint::from_device_id(&host_id)
+                        .as_str()
+                        .to_string(),
                     capabilities,
                     trust: TrustState::Trusted,
                     linked_at: Utc::now(),
                     last_seen: Some(Utc::now()),
                     endpoint_hint: None,
                     mesh_id: None,
-                
-                aliases: Vec::new(),
-                groups: Vec::new(),
-            };
+
+                    aliases: Vec::new(),
+                    groups: Vec::new(),
+                };
                 store.upsert(rec.clone())?;
                 host_rec = Some(rec);
             }
@@ -225,9 +229,7 @@ pub async fn handle_join_as_host(
     }
 
     let material = sign_material(&joiner_id, &joiner_label, ts);
-    let pub_id = mymesh_crypto::IdentityPublic {
-        verifying_key: vk,
-    };
+    let pub_id = mymesh_crypto::IdentityPublic { verifying_key: vk };
     if let Err(e) = pub_id.verify(&material, &sig) {
         warn!(%e, "join signature invalid");
         let deny = ControlMessage::JoinDeny {
@@ -264,7 +266,9 @@ pub async fn handle_join_as_host(
         label: joiner_label.clone(),
         capabilities: caps.clone(),
         received_at: Utc::now(),
-        fingerprint: NodeFingerprint::from_device_id(&joiner_id).as_str().to_string(),
+        fingerprint: NodeFingerprint::from_device_id(&joiner_id)
+            .as_str()
+            .to_string(),
     })?;
 
     info!(
@@ -279,10 +283,7 @@ pub async fn handle_join_as_host(
         payload: encode_msg(&ControlMessage::JoinPending {
             host_id: identity.device_id(),
             host_label: label.to_string(),
-            message: format!(
-                "approve with: mymesh requests accept {}",
-                joiner_id.short()
-            ),
+            message: format!("approve with: mymesh requests accept {}", joiner_id.short()),
         })?,
     })
     .await?;
@@ -316,7 +317,9 @@ pub async fn handle_join_as_host(
             let rec = DeviceRecord {
                 id: joiner_id,
                 label: DeviceLabel::new(joiner_label.clone()),
-                fingerprint: NodeFingerprint::from_device_id(&joiner_id).as_str().to_string(),
+                fingerprint: NodeFingerprint::from_device_id(&joiner_id)
+                    .as_str()
+                    .to_string(),
                 capabilities: if caps.is_empty() {
                     Capability::all()
                 } else {
@@ -327,7 +330,8 @@ pub async fn handle_join_as_host(
                 last_seen: Some(Utc::now()),
                 endpoint_hint: None,
                 mesh_id: Some(mesh.mesh_id.clone()),
-            aliases: Vec::new(), groups: Vec::new(),
+                aliases: Vec::new(),
+                groups: Vec::new(),
             };
             store.upsert(rec)?;
 

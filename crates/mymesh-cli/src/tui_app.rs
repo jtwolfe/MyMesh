@@ -1,4 +1,5 @@
 //! Polished MyMesh TUI — button bar, mouse hit-testing, file browser, terminal, metrics.
+use crate::term_pane::{self, TermPane};
 use anyhow::Result;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -8,7 +9,10 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use mymesh_core::{TrustState, ArmState, Config, DeviceStore, JoinStore, MeshState, Paths, PeerMetrics, PendingKickStore};
+use mymesh_core::{
+    ArmState, Config, DeviceStore, JoinStore, MeshState, Paths, PeerMetrics, PendingKickStore,
+    TrustState,
+};
 use mymesh_crypto::{device_id_to_words, device_join_uri, Identity};
 use mymesh_protocol::FileEntry;
 use qrcode::QrCode;
@@ -20,7 +24,6 @@ use ratatui::{Frame as TuiFrame, Terminal};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use crate::term_pane::{self, TermPane};
 use tokio::sync::mpsc;
 
 // ─── theme ───────────────────────────────────────────────────────────
@@ -482,7 +485,6 @@ fn bar_ratio(used: u64, total: u64) -> f64 {
     }
 }
 
-
 /// Record a size observation. Resets the debounce clock when size changes.
 fn note_pending_size(app: &mut App, w: u16, h: u16) {
     if w == 0 || h == 0 {
@@ -604,7 +606,8 @@ async fn run_loop(
             match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => {
                     // Ctrl+C quits only when NOT focused in remote shell
-                    let shell_focus = app.tab == Tab::Term && app.term.active && !app.term.pick_peer;
+                    let shell_focus =
+                        app.tab == Tab::Term && app.term.active && !app.term.pick_peer;
                     if k.modifiers.contains(KeyModifiers::CONTROL)
                         && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('C'))
                         && !shell_focus
@@ -618,7 +621,10 @@ async fn run_loop(
                     if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
                         handle_click(app, m.column, m.row).await;
                     }
-                    if matches!(m.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+                    if matches!(
+                        m.kind,
+                        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                    ) {
                         let up = matches!(m.kind, MouseEventKind::ScrollUp);
                         if app.tab == Tab::Files {
                             handle_files_scroll(app, m.column, m.row, up);
@@ -676,7 +682,10 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             app.should_quit = true;
             return;
         }
-        KeyCode::Char('1') if !mods.contains(KeyModifiers::CONTROL) && !(app.tab == Tab::Term && app.term.active) => {
+        KeyCode::Char('1')
+            if !mods.contains(KeyModifiers::CONTROL)
+                && !(app.tab == Tab::Term && app.term.active) =>
+        {
             app.tab = Tab::Home;
             return;
         }
@@ -733,7 +742,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                     return;
                 }
                 KeyCode::Char(c) => {
-                    let b = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a').wrapping_add(1);
+                    let b = (c.to_ascii_lowercase() as u8)
+                        .wrapping_sub(b'a')
+                        .wrapping_add(1);
                     if (1..=26).contains(&b) {
                         app.term.send(&[b]);
                     }
@@ -756,7 +767,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 app.term.scroll = app.term.scroll.saturating_sub(app.term.rows / 2);
             }
             other => {
-                if let Some(bytes) = term_pane::key_to_bytes(other, app.term.parser.screen().application_cursor()) {
+                if let Some(bytes) =
+                    term_pane::key_to_bytes(other, app.term.parser.screen().application_cursor())
+                {
                     app.term.send(&bytes);
                     app.term.scroll = 0;
                 }
@@ -764,7 +777,6 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         }
         return;
     }
-
 
     match app.tab {
         Tab::Home => match code {
@@ -789,9 +801,11 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             ),
             KeyCode::Char('C') => start_carrier(app).await,
             KeyCode::Char('h') => {
-                app.detail = crate::magic_cmd::hosts_text(&app.paths)
-                    .unwrap_or_else(|e| e.to_string());
-                app.status = "hosts listed in status detail — switch to Status or see Home right panel".into();
+                app.detail =
+                    crate::magic_cmd::hosts_text(&app.paths).unwrap_or_else(|e| e.to_string());
+                app.status =
+                    "hosts listed in status detail — switch to Status or see Home right panel"
+                        .into();
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 app.req_sel = app.req_sel.saturating_sub(1);
@@ -802,136 +816,142 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             _ => {}
         },
         Tab::Peers => {
-          if app.kick.active {
-            match code {
-                KeyCode::Esc => {
-                    app.kick = KickWizard::default();
-                    app.status = "kick cancelled".into();
-                }
-                KeyCode::Char(c) => {
-                    app.kick.buf.push(c);
-                    app.status = format!("confirm: {}", app.kick.buf);
-                }
-                KeyCode::Backspace => { app.kick.buf.pop(); }
-                KeyCode::Enter => {
-                    let need = if app.kick.step == 0 { "KICK FROM MESH" } else { "I AM SURE" };
-                    if app.kick.buf.trim() == need {
-                        if app.kick.step == 0 {
-                            app.kick.step = 1;
-                            app.kick.buf.clear();
-                            app.status = "type I AM SURE then Enter".into();
+            if app.kick.active {
+                match code {
+                    KeyCode::Esc => {
+                        app.kick = KickWizard::default();
+                        app.status = "kick cancelled".into();
+                    }
+                    KeyCode::Char(c) => {
+                        app.kick.buf.push(c);
+                        app.status = format!("confirm: {}", app.kick.buf);
+                    }
+                    KeyCode::Backspace => {
+                        app.kick.buf.pop();
+                    }
+                    KeyCode::Enter => {
+                        let need = if app.kick.step == 0 {
+                            "KICK FROM MESH"
                         } else {
-                            let force = app.kick.force;
-                            let tgt = app.kick.target.clone();
-                            app.kick = KickWizard::default();
-                            if let Some(id) = tgt {
-                                app.status = "kicking…".into();
-                                match run_kick(&app.paths, &id, force).await {
-                                    Ok(msg) => app.status = msg,
-                                    Err(e) => app.status = format!("kick: {e}"),
+                            "I AM SURE"
+                        };
+                        if app.kick.buf.trim() == need {
+                            if app.kick.step == 0 {
+                                app.kick.step = 1;
+                                app.kick.buf.clear();
+                                app.status = "type I AM SURE then Enter".into();
+                            } else {
+                                let force = app.kick.force;
+                                let tgt = app.kick.target.clone();
+                                app.kick = KickWizard::default();
+                                if let Some(id) = tgt {
+                                    app.status = "kicking…".into();
+                                    match run_kick(&app.paths, &id, force).await {
+                                        Ok(msg) => app.status = msg,
+                                        Err(e) => app.status = format!("kick: {e}"),
+                                    }
                                 }
                             }
+                        } else {
+                            app.status = format!("expected exactly `{need}`");
+                            app.kick.buf.clear();
                         }
-                    } else {
-                        app.status = format!("expected exactly `{need}`");
-                        app.kick.buf.clear();
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            match code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.peer_sel = app.peer_sel.saturating_add(1);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.peer_sel = app.peer_sel.saturating_sub(1);
+                }
+                KeyCode::Enter | KeyCode::Char('o') => {
+                    if let Some(id) = selected_peer_id(app) {
+                        term_pane::refresh_peers(&app.paths, &mut app.term);
+                        if let Some(i) = app.term.peers.iter().position(|p| p.id == id) {
+                            app.term.peer_idx = i;
+                        }
+                        if let Some(idx) = app.files.nodes.iter().position(|n| match n {
+                            BrowserNode::Peer { id: pid, .. } => pid == &id,
+                            _ => false,
+                        }) {
+                            app.files.dst_node = idx;
+                        }
+                        app.status = format!("peer {id} · use Term tab for shell");
                     }
                 }
-                _ => {}
-            }
-            return;
-          }
-          match code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                app.peer_sel = app.peer_sel.saturating_add(1);
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                app.peer_sel = app.peer_sel.saturating_sub(1);
-            }
-            KeyCode::Enter | KeyCode::Char('o') => {
-                if let Some(id) = selected_peer_id(app) {
-                    term_pane::refresh_peers(&app.paths, &mut app.term);
-                    if let Some(i) = app.term.peers.iter().position(|p| p.id == id) {
-                        app.term.peer_idx = i;
-                    }
-                    if let Some(idx) = app.files.nodes.iter().position(|n| match n {
-                        BrowserNode::Peer { id: pid, .. } => pid == &id,
-                        _ => false,
-                    }) {
-                        app.files.dst_node = idx;
-                    }
-                    app.status = format!("peer {id} · use Term tab for shell");
-                }
-            }
-            KeyCode::Char('p') => ping_sel(app).await,
-            KeyCode::Char('b') => bw_sel(app).await,
-            KeyCode::Char('m') => metrics_sel(app).await,
-            KeyCode::Char('t') => {
-                app.poll.enabled = !app.poll.enabled;
-                if app.poll.enabled {
-                    app.poll.started = Instant::now();
-                    app.poll.last = Instant::now() - app.poll.interval;
-                    app.status =
+                KeyCode::Char('p') => ping_sel(app).await,
+                KeyCode::Char('b') => bw_sel(app).await,
+                KeyCode::Char('m') => metrics_sel(app).await,
+                KeyCode::Char('t') => {
+                    app.poll.enabled = !app.poll.enabled;
+                    if app.poll.enabled {
+                        app.poll.started = Instant::now();
+                        app.poll.last = Instant::now() - app.poll.interval;
+                        app.status =
                         "metrics poll ON · 10s interval · auto-off 5m (client; host answers each request)"
                             .into();
-                } else {
-                    app.status = "metrics poll OFF".into();
-                }
-            }
-            KeyCode::Char('g') => {
-                app.status = "mesh sync…".into();
-                match mesh_sync_all(&app.paths).await {
-                    Ok(n) => app.status = format!("mesh sync ok (+{n})"),
-                    Err(e) => app.status = format!("sync: {e}"),
-                }
-            }
-            KeyCode::Char('K') => start_kick_wizard(app, false),
-            KeyCode::Char('F') => start_kick_wizard(app, true),
-            KeyCode::Char('U') => start_unlink(app),
-            KeyCode::Char('L') => start_prompt(
-                app,
-                PromptKind::Label,
-                "Rename peer label",
-                "new label for selected peer",
-            ),
-            KeyCode::Char('a') => start_prompt(
-                app,
-                PromptKind::Alias,
-                "Add alias",
-                "alias for selected peer (e.g. laptop)",
-            ),
-            KeyCode::Char('G') => start_prompt(
-                app,
-                PromptKind::Group,
-                "Add group",
-                "group tag for selected peer",
-            ),
-            KeyCode::Char('P') => {
-                app.status = "probe-all…".into();
-                match crate::probe::probe_all(&app.paths).await {
-                    Ok(rows) => {
-                        let n = rows.len();
-                        let mut s = String::from("probe-all:\n");
-                        for (l, r) in rows {
-                            match r {
-                                Ok(ms) => s.push_str(&format!("  {l}: {ms} ms\n")),
-                                Err(e) => s.push_str(&format!("  {l}: ERR {e}\n")),
-                            }
-                        }
-                        app.detail = s;
-                        app.status = format!("probe-all done ({n} peers)");
+                    } else {
+                        app.status = "metrics poll OFF".into();
                     }
-                    Err(e) => app.status = format!("probe-all: {e}"),
                 }
+                KeyCode::Char('g') => {
+                    app.status = "mesh sync…".into();
+                    match mesh_sync_all(&app.paths).await {
+                        Ok(n) => app.status = format!("mesh sync ok (+{n})"),
+                        Err(e) => app.status = format!("sync: {e}"),
+                    }
+                }
+                KeyCode::Char('K') => start_kick_wizard(app, false),
+                KeyCode::Char('F') => start_kick_wizard(app, true),
+                KeyCode::Char('U') => start_unlink(app),
+                KeyCode::Char('L') => start_prompt(
+                    app,
+                    PromptKind::Label,
+                    "Rename peer label",
+                    "new label for selected peer",
+                ),
+                KeyCode::Char('a') => start_prompt(
+                    app,
+                    PromptKind::Alias,
+                    "Add alias",
+                    "alias for selected peer (e.g. laptop)",
+                ),
+                KeyCode::Char('G') => start_prompt(
+                    app,
+                    PromptKind::Group,
+                    "Add group",
+                    "group tag for selected peer",
+                ),
+                KeyCode::Char('P') => {
+                    app.status = "probe-all…".into();
+                    match crate::probe::probe_all(&app.paths).await {
+                        Ok(rows) => {
+                            let n = rows.len();
+                            let mut s = String::from("probe-all:\n");
+                            for (l, r) in rows {
+                                match r {
+                                    Ok(ms) => s.push_str(&format!("  {l}: {ms} ms\n")),
+                                    Err(e) => s.push_str(&format!("  {l}: ERR {e}\n")),
+                                }
+                            }
+                            app.detail = s;
+                            app.status = format!("probe-all done ({n} peers)");
+                        }
+                        Err(e) => app.status = format!("probe-all: {e}"),
+                    }
+                }
+                KeyCode::Char('e') => start_prompt(
+                    app,
+                    PromptKind::ExposePort,
+                    "Expose remote port",
+                    "port number on selected peer (e.g. 8080)",
+                ),
+                _ => {}
             }
-            KeyCode::Char('e') => start_prompt(
-                app,
-                PromptKind::ExposePort,
-                "Expose remote port",
-                "port number on selected peer (e.g. 8080)",
-            ),
-            _ => {}
-          }
         }
         Tab::Files => match code {
             KeyCode::Down | KeyCode::Char('j') => files_move_sel(app, 1),
@@ -1061,33 +1081,27 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                     }
                 }
             }
-            KeyCode::Char('S') => {
-                match crate::magic_cmd::ssh_config_text(&app.paths, None) {
-                    Ok(txt) => {
-                        app.detail = txt;
-                        app.status = "ssh config in detail (copy from terminal if needed)".into();
-                    }
-                    Err(e) => app.status = format!("ssh-config: {e}"),
+            KeyCode::Char('S') => match crate::magic_cmd::ssh_config_text(&app.paths, None) {
+                Ok(txt) => {
+                    app.detail = txt;
+                    app.status = "ssh config in detail (copy from terminal if needed)".into();
                 }
-            }
-            KeyCode::Char('m') => {
-                match crate::magic_cmd::magic_status_text(&app.paths) {
-                    Ok(txt) => {
-                        app.detail = txt;
-                        app.status = "magic plane status".into();
-                    }
-                    Err(e) => app.status = format!("magic: {e}"),
+                Err(e) => app.status = format!("ssh-config: {e}"),
+            },
+            KeyCode::Char('m') => match crate::magic_cmd::magic_status_text(&app.paths) {
+                Ok(txt) => {
+                    app.detail = txt;
+                    app.status = "magic plane status".into();
                 }
-            }
-            KeyCode::Char('h') => {
-                match crate::magic_cmd::hosts_text(&app.paths) {
-                    Ok(txt) => {
-                        app.detail = txt;
-                        app.status = "hosts".into();
-                    }
-                    Err(e) => app.status = format!("hosts: {e}"),
+                Err(e) => app.status = format!("magic: {e}"),
+            },
+            KeyCode::Char('h') => match crate::magic_cmd::hosts_text(&app.paths) {
+                Ok(txt) => {
+                    app.detail = txt;
+                    app.status = "hosts".into();
                 }
-            }
+                Err(e) => app.status = format!("hosts: {e}"),
+            },
             KeyCode::Char('i') => {
                 app.status = "reinstall user unit…".into();
                 match crate::install::cmd_install(&app.paths, false, false, None) {
@@ -1095,12 +1109,10 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                     Err(e) => app.status = format!("install: {e}"),
                 }
             }
-            KeyCode::Char('j') => {
-                match crate::magic_cmd::hosts_text(&app.paths) {
-                    Ok(txt) => app.detail = format!("devices/hosts\n{txt}"),
-                    Err(e) => app.detail = e.to_string(),
-                }
-            }
+            KeyCode::Char('j') => match crate::magic_cmd::hosts_text(&app.paths) {
+                Ok(txt) => app.detail = format!("devices/hosts\n{txt}"),
+                Err(e) => app.detail = e.to_string(),
+            },
             _ => {}
         },
     }
@@ -1141,7 +1153,10 @@ async fn handle_click(app: &mut App, col: u16, row: u16) {
 }
 
 fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
-    col >= r.x && col < r.x.saturating_add(r.width) && row >= r.y && row < r.y.saturating_add(r.height)
+    col >= r.x
+        && col < r.x.saturating_add(r.width)
+        && row >= r.y
+        && row < r.y.saturating_add(r.height)
 }
 
 async fn click_button(app: &mut App, id: &str) {
@@ -1193,14 +1208,20 @@ async fn click_button(app: &mut App, id: &str) {
             app.status = "probe-all…".into();
             match crate::probe::probe_all(&app.paths).await {
                 Ok(rows) => {
-                    let mut s = String::from("probe-all:
-");
+                    let mut s = String::from(
+                        "probe-all:
+",
+                    );
                     for (l, r) in rows {
                         match r {
-                            Ok(ms) => s.push_str(&format!("  {l}: {ms} ms
-")),
-                            Err(e) => s.push_str(&format!("  {l}: ERR {e}
-")),
+                            Ok(ms) => s.push_str(&format!(
+                                "  {l}: {ms} ms
+"
+                            )),
+                            Err(e) => s.push_str(&format!(
+                                "  {l}: ERR {e}
+"
+                            )),
                         }
                     }
                     app.detail = s;
@@ -1213,7 +1234,12 @@ async fn click_button(app: &mut App, id: &str) {
         "alias" => start_prompt(app, PromptKind::Alias, "Add alias", "alias name"),
         "group" => start_prompt(app, PromptKind::Group, "Add group", "group tag"),
         "unlink" => start_unlink(app),
-        "expose" => start_prompt(app, PromptKind::ExposePort, "Expose port", "remote port number"),
+        "expose" => start_prompt(
+            app,
+            PromptKind::ExposePort,
+            "Expose port",
+            "remote port number",
+        ),
         "copy_lr" => transfer_selected(app).await,
         "clear_sel" => {
             app.files.selected.clear();
@@ -1274,39 +1300,31 @@ async fn click_button(app: &mut App, id: &str) {
                 }
             }
         }
-        "ssh_cfg" => {
-            match crate::magic_cmd::ssh_config_text(&app.paths, None) {
-                Ok(txt) => {
-                    app.detail = txt;
-                    app.status = "ssh config".into();
-                }
-                Err(e) => app.status = format!("ssh-config: {e}"),
+        "ssh_cfg" => match crate::magic_cmd::ssh_config_text(&app.paths, None) {
+            Ok(txt) => {
+                app.detail = txt;
+                app.status = "ssh config".into();
             }
-        }
-        "magic" => {
-            match crate::magic_cmd::magic_status_text(&app.paths) {
-                Ok(txt) => {
-                    app.detail = txt;
-                    app.status = "magic".into();
-                }
-                Err(e) => app.status = format!("magic: {e}"),
+            Err(e) => app.status = format!("ssh-config: {e}"),
+        },
+        "magic" => match crate::magic_cmd::magic_status_text(&app.paths) {
+            Ok(txt) => {
+                app.detail = txt;
+                app.status = "magic".into();
             }
-        }
-        "hosts" => {
-            match crate::magic_cmd::hosts_text(&app.paths) {
-                Ok(txt) => {
-                    app.detail = txt;
-                    app.status = "hosts".into();
-                }
-                Err(e) => app.status = format!("hosts: {e}"),
+            Err(e) => app.status = format!("magic: {e}"),
+        },
+        "hosts" => match crate::magic_cmd::hosts_text(&app.paths) {
+            Ok(txt) => {
+                app.detail = txt;
+                app.status = "hosts".into();
             }
-        }
-        "install" => {
-            match crate::install::cmd_install(&app.paths, false, false, None) {
-                Ok(()) => app.status = "install ok".into(),
-                Err(e) => app.status = format!("install: {e}"),
-            }
-        }
+            Err(e) => app.status = format!("hosts: {e}"),
+        },
+        "install" => match crate::install::cmd_install(&app.paths, false, false, None) {
+            Ok(()) => app.status = "install ok".into(),
+            Err(e) => app.status = format!("install: {e}"),
+        },
         "quit" => app.should_quit = true,
         _ => {}
     }
@@ -1372,11 +1390,13 @@ fn show_uri(app: &mut App) {
 async fn start_carrier(app: &mut App) {
     app.status = "starting carrier…".into();
     match crate::magic_cmd::start_carrier_ui(&app.paths, 17878).await {
-        Ok(url) => {
+        Ok((url, pair_qr)) => {
             app.carrier_url = Some(url.clone());
             app.detail = format!(
-                "Connect-by-carrier\n\nOpen on phone (same LAN):\n  {url}\n\n\
-Other machine: mymesh id --uri (or show QR) → paste/scan on phone page.\n\
+                "Connect-by-carrier (pair/v1)\n\n\
+Carrier QR (scan with app):\n  {pair_qr}\n\n\
+HTML fallback:\n  {url}\n\n\
+Other machine: mymesh link <host-id>  then approve on phone.\n\
 Firewall: if phone times out, Status → [F] Open or:\n  {}\n",
                 crate::firewall::sudo_firewall_cmd("ufw allow")
             );
@@ -1548,7 +1568,6 @@ fn load_peers(paths: &Paths) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-
 async fn ping_sel(app: &mut App) {
     if let Some(id) = selected_peer_id(app) {
         app.status = format!("ping {id}…");
@@ -1597,11 +1616,7 @@ fn selected_peer_id(app: &App) -> Option<String> {
 
 fn files_view_h(app: &App) -> usize {
     // list area height approx: content minus node row (3) and borders
-    app.files
-        .src_list_rect
-        .height
-        .saturating_sub(2)
-        .max(3) as usize
+    app.files.src_list_rect.height.saturating_sub(2).max(3) as usize
 }
 
 fn files_move_sel(app: &mut App, delta: i32) {
@@ -1693,7 +1708,8 @@ fn handle_files_scroll(app: &mut App, col: u16, row: u16, up: bool) {
         app.files.focus = FilesFocus::SrcList;
         let len = app.files.src.len().max(1);
         let vh = files_view_h(app);
-        let next = (app.files.src_scroll as i32 + delta).clamp(0, (len.saturating_sub(1)) as i32) as usize;
+        let next =
+            (app.files.src_scroll as i32 + delta).clamp(0, (len.saturating_sub(1)) as i32) as usize;
         app.files.src_scroll = next;
         // keep selection in view naturally
         if app.files.src_sel < app.files.src_scroll {
@@ -1708,7 +1724,8 @@ fn handle_files_scroll(app: &mut App, col: u16, row: u16, up: bool) {
         app.files.focus = FilesFocus::DstList;
         let len = app.files.dst.len().max(1);
         let vh = files_view_h(app);
-        let next = (app.files.dst_scroll as i32 + delta).clamp(0, (len.saturating_sub(1)) as i32) as usize;
+        let next =
+            (app.files.dst_scroll as i32 + delta).clamp(0, (len.saturating_sub(1)) as i32) as usize;
         app.files.dst_scroll = next;
         if app.files.dst_sel < app.files.dst_scroll {
             app.files.dst_sel = app.files.dst_scroll;
@@ -1910,10 +1927,19 @@ async fn load_peer_entries(
 
 async fn files_go_up(app: &mut App) {
     let (node_i, cwd) = match app.files.focus {
-        FilesFocus::SrcList | FilesFocus::SrcNode => (app.files.src_node, app.files.src_cwd.clone()),
-        FilesFocus::DstList | FilesFocus::DstNode => (app.files.dst_node, app.files.dst_cwd.clone()),
+        FilesFocus::SrcList | FilesFocus::SrcNode => {
+            (app.files.src_node, app.files.src_cwd.clone())
+        }
+        FilesFocus::DstList | FilesFocus::DstNode => {
+            (app.files.dst_node, app.files.dst_cwd.clone())
+        }
     };
-    let node = app.files.nodes.get(node_i).cloned().unwrap_or(BrowserNode::Local);
+    let node = app
+        .files
+        .nodes
+        .get(node_i)
+        .cloned()
+        .unwrap_or(BrowserNode::Local);
     let new_cwd = match node {
         BrowserNode::Local => PathBuf::from(&cwd)
             .parent()
@@ -2006,8 +2032,18 @@ async fn transfer_selected(app: &mut App) {
         return;
     }
 
-    let src = app.files.nodes.get(app.files.src_node).cloned().unwrap_or(BrowserNode::Local);
-    let dst = app.files.nodes.get(app.files.dst_node).cloned().unwrap_or(BrowserNode::Local);
+    let src = app
+        .files
+        .nodes
+        .get(app.files.src_node)
+        .cloned()
+        .unwrap_or(BrowserNode::Local);
+    let dst = app
+        .files
+        .nodes
+        .get(app.files.dst_node)
+        .cloned()
+        .unwrap_or(BrowserNode::Local);
     if src.id_key() == dst.id_key() && matches!(src, BrowserNode::Local) {
         // local to local
         for e in &paths {
@@ -2030,11 +2066,7 @@ async fn transfer_selected(app: &mut App) {
                 let remote = if app.files.dst_cwd == "." || app.files.dst_cwd == "~" {
                     e.name.clone()
                 } else {
-                    format!(
-                        "{}/{}",
-                        app.files.dst_cwd.trim_end_matches('/'),
-                        e.name
-                    )
+                    format!("{}/{}", app.files.dst_cwd.trim_end_matches('/'), e.name)
                 };
                 push_file_helper(&app.paths, Path::new(&e.path), id, &remote).await
             }
@@ -2049,11 +2081,7 @@ async fn transfer_selected(app: &mut App) {
                         let remote = if app.files.dst_cwd == "." || app.files.dst_cwd == "~" {
                             e.name.clone()
                         } else {
-                            format!(
-                                "{}/{}",
-                                app.files.dst_cwd.trim_end_matches('/'),
-                                e.name
-                            )
+                            format!("{}/{}", app.files.dst_cwd.trim_end_matches('/'), e.name)
                         };
                         let r = push_file_helper(&app.paths, &tmp, did, &remote).await;
                         let _ = std::fs::remove_file(&tmp);
@@ -2232,10 +2260,7 @@ fn ui(f: &mut TuiFrame, app: &mut App) {
     app.content = content;
     // Clear content region so panels never leave trails from previous tab/size.
     f.render_widget(Clear, content);
-    f.render_widget(
-        Block::default().style(Style::default().bg(C_BG)),
-        content,
-    );
+    f.render_widget(Block::default().style(Style::default().bg(C_BG)), content);
 
     match app.tab {
         Tab::Home => draw_home(f, content, app),
@@ -2277,10 +2302,7 @@ fn draw_header(f: &mut TuiFrame, area: Rect, app: &mut App) {
     }
 
     // Fill inner solid so no gaps under wide terminals.
-    f.render_widget(
-        Block::default().style(Style::default().bg(C_PANEL)),
-        inner,
-    );
+    f.render_widget(Block::default().style(Style::default().bg(C_PANEL)), inner);
 
     let brand_w = 11u16.min(inner.width);
     let ver_w = 12u16.min(inner.width.saturating_sub(brand_w));
@@ -2310,9 +2332,7 @@ fn draw_header(f: &mut TuiFrame, area: Rect, app: &mut App) {
             Span::styled(" * ", Style::default().fg(C_ACCENT2)),
             Span::styled(
                 "MyMesh",
-                Style::default()
-                    .fg(C_ACCENT)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
             ),
         ]))
         .style(Style::default().bg(C_PANEL)),
@@ -2369,10 +2389,7 @@ fn push_btn(app: &mut App, f: &mut TuiFrame, id: &'static str, label: &str, rect
     if rect.width == 0 || rect.height == 0 {
         return;
     }
-    app.buttons.push(Btn {
-        id,
-        rect,
-    });
+    app.buttons.push(Btn { id, rect });
     let style = if hot {
         Style::default()
             .fg(Color::White)
@@ -2404,10 +2421,7 @@ fn draw_action_bar(f: &mut TuiFrame, area: Rect, app: &mut App) {
     f.render_widget(block, area);
     // Solid fill entire inner (ultrawide gap prevention)
     if inner.width > 0 && inner.height > 0 {
-        f.render_widget(
-            Block::default().style(Style::default().bg(C_PANEL)),
-            inner,
-        );
+        f.render_widget(Block::default().style(Style::default().bg(C_PANEL)), inner);
     }
 
     let specs: Vec<(&str, &str)> = match app.tab {
@@ -2500,8 +2514,6 @@ fn draw_action_bar(f: &mut TuiFrame, area: Rect, app: &mut App) {
     }
 }
 
-
-
 fn draw_prompt_overlay(f: &mut TuiFrame, app: &App) {
     if app.prompt.kind == PromptKind::None {
         return;
@@ -2510,9 +2522,7 @@ fn draw_prompt_overlay(f: &mut TuiFrame, app: &App) {
     f.render_widget(Clear, area);
     let text = format!(
         "{}\n{}\n\n> {}\n\nEnter confirm · Esc cancel",
-        app.prompt.title,
-        app.prompt.hint,
-        app.prompt.buf
+        app.prompt.title, app.prompt.hint, app.prompt.buf
     );
     f.render_widget(
         Paragraph::new(text)
@@ -2562,9 +2572,7 @@ fn draw_home(f: &mut TuiFrame, area: Rect, app: &App) {
             Span::styled("Device  ", Style::default().fg(C_MUTED)),
             Span::styled(
                 cfg.device_label.clone(),
-                Style::default()
-                    .fg(C_TEXT)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(C_TEXT).add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
@@ -2716,11 +2724,7 @@ fn draw_peers(f: &mut TuiFrame, area: Rect, app: &App) {
                     .map(|ms| format!("{ms}ms"))
                     .unwrap_or_else(|| "—".into());
                 let mark = if sel { "▸ " } else { "  " };
-                let line = format!(
-                    "{mark}{}  {}  rtt {rtt}",
-                    d.label,
-                    d.id.short()
-                );
+                let line = format!("{mark}{}  {}  rtt {rtt}", d.label, d.id.short());
                 ListItem::new(Line::from(Span::styled(
                     line,
                     if sel {
@@ -2786,7 +2790,9 @@ fn draw_peers(f: &mut TuiFrame, area: Rect, app: &App) {
             if let Some(bw) = &m.last_bandwidth {
                 lines.push(Line::from(format!(
                     "Bandwidth  {:.2} Mbps ({} in {}ms)",
-                    bw.mbps, human_bytes(bw.bytes), bw.elapsed_ms
+                    bw.mbps,
+                    human_bytes(bw.bytes),
+                    bw.elapsed_ms
                 )));
             }
             if let Some(h) = &m.last_host {
@@ -2851,7 +2857,10 @@ fn draw_peers(f: &mut TuiFrame, area: Rect, app: &App) {
             Style::default().fg(C_ACCENT2),
         )));
         lines.push(Line::from(Span::styled(
-            format!("gen {}  last_sync {:?}", mesh.roster_generation, mesh.last_sync),
+            format!(
+                "gen {}  last_sync {:?}",
+                mesh.roster_generation, mesh.last_sync
+            ),
             Style::default().fg(C_MUTED),
         )));
     }
@@ -2878,7 +2887,11 @@ fn draw_peers(f: &mut TuiFrame, area: Rect, app: &App) {
     if app.kick.active {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            if app.kick.force { "FORCE KICK CONFIRM" } else { "KICK CONFIRM" },
+            if app.kick.force {
+                "FORCE KICK CONFIRM"
+            } else {
+                "KICK CONFIRM"
+            },
             Style::default().fg(C_ERR).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(format!(
@@ -2961,24 +2974,38 @@ fn draw_files(f: &mut TuiFrame, area: Rect, app: &mut App) {
     let dst_node_hot = matches!(app.files.focus, FilesFocus::DstNode);
     f.render_widget(
         Paragraph::new(format!("SEND FROM  [ {src_node} ]  · n/[ ] cycle · click"))
-            .style(Style::default().fg(if src_node_hot { Color::Black } else { C_TEXT }).bg(if src_node_hot { C_ACCENT } else { C_BTN }))
+            .style(
+                Style::default()
+                    .fg(if src_node_hot { Color::Black } else { C_TEXT })
+                    .bg(if src_node_hot { C_ACCENT } else { C_BTN }),
+            )
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(if src_node_hot { C_ACCENT } else { C_BORDER }))
+                    .border_style(Style::default().fg(if src_node_hot {
+                        C_ACCENT
+                    } else {
+                        C_BORDER
+                    }))
                     .title(Span::styled(" source node ", Style::default().fg(C_MUTED))),
             ),
         left[0],
     );
     f.render_widget(
-        Paragraph::new(format!("RECEIVE TO  [ {dst_node} ]  · N/{{ }} cycle · click"))
-            .style(Style::default().fg(if dst_node_hot { Color::Black } else { C_TEXT }).bg(if dst_node_hot { C_ACCENT2 } else { C_BTN }))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(if dst_node_hot { C_ACCENT2 } else { C_BORDER }))
-                    .title(Span::styled(" dest node ", Style::default().fg(C_MUTED))),
-            ),
+        Paragraph::new(format!(
+            "RECEIVE TO  [ {dst_node} ]  · N/{{ }} cycle · click"
+        ))
+        .style(
+            Style::default()
+                .fg(if dst_node_hot { Color::Black } else { C_TEXT })
+                .bg(if dst_node_hot { C_ACCENT2 } else { C_BTN }),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(if dst_node_hot { C_ACCENT2 } else { C_BORDER }))
+                .title(Span::styled(" dest node ", Style::default().fg(C_MUTED))),
+        ),
         right[0],
     );
 
@@ -3015,15 +3042,31 @@ fn draw_files(f: &mut TuiFrame, area: Rect, app: &mut App) {
     let src_title = format!(
         " {}  sel:{}  {} {}",
         app.files.src_cwd,
-        app.files.selected.iter().filter(|k| k.starts_with("src:")).count(),
-        if matches!(app.files.focus, FilesFocus::SrcList) { "◀" } else { "" },
+        app.files
+            .selected
+            .iter()
+            .filter(|k| k.starts_with("src:"))
+            .count(),
+        if matches!(app.files.focus, FilesFocus::SrcList) {
+            "◀"
+        } else {
+            ""
+        },
         src_busy
     );
     let dst_title = format!(
         " {}  sel:{}  {} {}",
         app.files.dst_cwd,
-        app.files.selected.iter().filter(|k| k.starts_with("dst:")).count(),
-        if matches!(app.files.focus, FilesFocus::DstList) { "◀" } else { "" },
+        app.files
+            .selected
+            .iter()
+            .filter(|k| k.starts_with("dst:"))
+            .count(),
+        if matches!(app.files.focus, FilesFocus::DstList) {
+            "◀"
+        } else {
+            ""
+        },
         dst_busy
     );
 
@@ -3143,10 +3186,7 @@ fn draw_status_line(f: &mut TuiFrame, area: Rect, app: &App) {
         return;
     }
     // Explicit full-width fill then text (avoids trailing empty cells looking "cut off")
-    f.render_widget(
-        Block::default().style(Style::default().bg(C_PANEL)),
-        inner,
-    );
+    f.render_widget(Block::default().style(Style::default().bg(C_PANEL)), inner);
     let msg = format!(" {}", app.status);
     f.render_widget(
         Paragraph::new(msg)
@@ -3155,7 +3195,6 @@ fn draw_status_line(f: &mut TuiFrame, area: Rect, app: &App) {
         inner,
     );
 }
-
 
 fn start_kick_wizard(app: &mut App, force: bool) {
     let Some(id) = selected_peer_id(app) else {
@@ -3201,7 +3240,10 @@ async fn run_kick(_paths: &Paths, device: &str, force: bool) -> anyhow::Result<S
     }
     let out = cmd.output()?;
     if !out.status.success() {
-        anyhow::bail!(String::from_utf8_lossy(&out.stderr).to_string() + &String::from_utf8_lossy(&out.stdout));
+        anyhow::bail!(
+            String::from_utf8_lossy(&out.stderr).to_string()
+                + &String::from_utf8_lossy(&out.stdout)
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -3224,10 +3266,11 @@ async fn mesh_sync_all(paths: &Paths) -> anyhow::Result<usize> {
     let mut added = 0usize;
     for peer in peers {
         let store = DeviceStore::open(paths.devices_file())?;
-        let (session, transport, _) = match crate::mesh_conn::open_to_peer(paths, &identity, &cfg, &store, peer).await {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+        let (session, transport, _) =
+            match crate::mesh_conn::open_to_peer(paths, &identity, &cfg, &store, peer).await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
         let conn = session.into_conn();
         let ann = build_announce(&identity, &cfg.device_label, &store, &mesh);
         let _ = conn

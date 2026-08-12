@@ -1,11 +1,11 @@
 //! MyMesh CLI + TUI entrypoint.
-mod install;
 mod firewall;
-mod mesh_conn;
+mod install;
 mod magic_cmd;
+mod mesh_conn;
 mod probe;
-mod tui_app;
 mod term_pane;
+mod tui_app;
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -13,19 +13,15 @@ use console::style;
 use mymesh_core::{
     ArmState, Capability, Config, DeviceStore, JoinDecision, JoinStore, MeshState, Paths,
 };
-use mymesh_crypto::{
-    device_id_to_words, device_join_uri, parse_device_id, Identity,
-};
+use mymesh_crypto::{device_id_to_words, device_join_uri, parse_device_id, Identity};
 use mymesh_net::{
     run_mailbox_server, FsMailbox, HttpMailbox, IrohTransport, LocalFabric, LocalRendezvous,
     Rendezvous, Transport,
 };
-use mymesh_protocol::{
-    decode_msg, encode_msg, ChannelId, FileMessage, Frame, TerminalMessage,
-};
+use mymesh_protocol::{decode_msg, encode_msg, ChannelId, FileMessage, Frame, TerminalMessage};
 use mymesh_session::{
-    apply_kick_target, apply_membership, build_announce, run_guest_pair,
-    run_host_pair_code, run_join_as_guest, sign_kick, Agent, Session,
+    apply_kick_target, apply_membership, build_announce, run_guest_pair, run_host_pair_code,
+    run_join_as_guest, sign_kick, Agent, Session,
 };
 use mymesh_terminal::TerminalClient;
 use std::net::SocketAddr;
@@ -480,7 +476,11 @@ async fn main() -> Result<()> {
             mailbox,
             local,
         } => {
-            if code.is_some() || mailbox_dir.is_some() || mailbox.is_some() || local || nameplate.is_some()
+            if code.is_some()
+                || mailbox_dir.is_some()
+                || mailbox.is_some()
+                || local
+                || nameplate.is_some()
             {
                 if let Some(c) = code {
                     cmd_link_spake_guest(&paths, &c, mailbox_dir, mailbox, local).await?;
@@ -577,18 +577,24 @@ async fn main() -> Result<()> {
         Commands::InstallNotes => print_install_notes(),
         Commands::Hosts { group } => magic_cmd::cmd_hosts(&paths, group).await?,
         Commands::Label { device, name } => magic_cmd::cmd_label(&paths, &device, &name).await?,
-        Commands::Alias { device, name, remove } => {
-            magic_cmd::cmd_alias(&paths, &device, &name, remove).await?
-        }
-        Commands::Group { device, name, remove } => {
-            magic_cmd::cmd_group(&paths, &device, &name, remove).await?
-        }
+        Commands::Alias {
+            device,
+            name,
+            remove,
+        } => magic_cmd::cmd_alias(&paths, &device, &name, remove).await?,
+        Commands::Group {
+            device,
+            name,
+            remove,
+        } => magic_cmd::cmd_group(&paths, &device, &name, remove).await?,
         Commands::Resolve { name } => magic_cmd::cmd_resolve(&paths, &name).await?,
         Commands::SshConfig { domain } => magic_cmd::cmd_ssh_config(&paths, domain)?,
         Commands::ProxySsh { host } => magic_cmd::cmd_proxy_ssh(&paths, &host).await?,
-        Commands::Expose { device, port, local } => {
-            magic_cmd::cmd_expose(&paths, &device, port, local).await?
-        }
+        Commands::Expose {
+            device,
+            port,
+            local,
+        } => magic_cmd::cmd_expose(&paths, &device, port, local).await?,
         Commands::Carrier { port } => magic_cmd::cmd_carrier(&paths, port).await?,
         Commands::Magic => magic_cmd::print_magic_help(),
         Commands::Firewall { action } => match action {
@@ -668,7 +674,11 @@ async fn cmd_id(paths: &Paths, qr: bool, words_only: bool, uri: bool) -> Result<
     println!("  uri     {}", device_join_uri(&did)?);
     if qr {
         if let Ok(code) = qrcode::QrCode::new(device_join_uri(&did)?.as_bytes()) {
-            let qr = code.render::<char>().quiet_zone(false).module_dimensions(1, 1).build();
+            let qr = code
+                .render::<char>()
+                .quiet_zone(false)
+                .module_dimensions(1, 1)
+                .build();
             println!("\n{qr}");
         }
     }
@@ -738,11 +748,7 @@ pub(crate) async fn cmd_arm(paths: &Paths, secs: Option<u64>) -> Result<()> {
     let state = ArmState::arm(paths.arm_file(), ttl)?;
     let id = Identity::load_or_create(paths.identity_file())?;
     let words = device_id_to_words(&id.device_id())?;
-    println!(
-        "{} until {:?}",
-        style("ARMED").green().bold(),
-        state.until
-    );
+    println!("{} until {:?}", style("ARMED").green().bold(), state.until);
     println!("  hex   {}", id.device_id());
     println!("  words {words}");
     Ok(())
@@ -766,12 +772,7 @@ pub(crate) async fn cmd_requests_list(paths: &Paths) -> Result<()> {
         return Ok(());
     }
     for p in list {
-        println!(
-            "{}  {}  fp={}",
-            p.device_id.short(),
-            p.label,
-            p.fingerprint
-        );
+        println!("{}  {}  fp={}", p.device_id.short(), p.label, p.fingerprint);
         println!("    {}", p.device_id);
     }
     Ok(())
@@ -801,10 +802,7 @@ pub(crate) async fn cmd_requests_decide(
     Ok(())
 }
 
-fn resolve_pending(
-    pending: &[mymesh_core::PendingJoin],
-    q: &str,
-) -> Result<mymesh_core::DeviceId> {
+fn resolve_pending(pending: &[mymesh_core::PendingJoin], q: &str) -> Result<mymesh_core::DeviceId> {
     if let Ok(id) = parse_device_id(q) {
         return Ok(id);
     }
@@ -977,12 +975,7 @@ async fn cmd_devices(paths: &Paths, json: bool) -> Result<()> {
             .and_then(|x| x.latest_rtt())
             .map(|ms| format!("{ms}ms"))
             .unwrap_or_else(|| "—".into());
-        println!(
-            "{}  {}  {:?}  rtt={rtt}",
-            d.id.short(),
-            d.label,
-            d.trust
-        );
+        println!("{}  {}  {:?}  rtt={rtt}", d.id.short(), d.label, d.trust);
         println!("    {}", d.id);
     }
     Ok(())
@@ -1004,9 +997,7 @@ pub(crate) fn resolve_device_pub(store: &DeviceStore, q: &str) -> Result<mymesh_
     if let Ok(id) = parse_device_id(q) {
         return Ok(id);
     }
-    store
-        .resolve_query(q)
-        .map_err(|e| anyhow::anyhow!("{e}"))
+    store.resolve_query(q).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 async fn cmd_serve(paths: &Paths) -> Result<()> {
@@ -1056,9 +1047,7 @@ async fn cmd_serve(paths: &Paths) -> Result<()> {
     if cfg.magic.enabled {
         println!(
             "  magic DNS {}  SOCKS5 {}  domain *.{}",
-            cfg.magic.dns_bind,
-            cfg.magic.socks_bind,
-            cfg.magic.domain
+            cfg.magic.dns_bind, cfg.magic.socks_bind, cfg.magic.domain
         );
     }
     agent.run(transport.as_ref()).await?;
@@ -1071,7 +1060,6 @@ async fn open_session_to(
 ) -> Result<(Session, Option<IrohTransport>, mymesh_core::DeviceId)> {
     mesh_conn::open_trusted_session(paths, device).await
 }
-
 
 async fn cmd_shell(paths: &Paths, device: &str, shell: Option<String>) -> Result<()> {
     let (session, transport, _) = open_session_to(paths, device).await?;
@@ -1340,10 +1328,10 @@ async fn demo_session() -> Result<()> {
         last_seen: Some(now),
         endpoint_hint: None,
         mesh_id: None,
-    
-                aliases: Vec::new(),
-                groups: Vec::new(),
-            })?;
+
+        aliases: Vec::new(),
+        groups: Vec::new(),
+    })?;
     guest_store.upsert(mymesh_core::DeviceRecord {
         id: host_id.device_id(),
         label: mymesh_core::DeviceLabel::new("host"),
@@ -1356,22 +1344,17 @@ async fn demo_session() -> Result<()> {
         last_seen: Some(now),
         endpoint_hint: None,
         mesh_id: None,
-    
-                aliases: Vec::new(),
-                groups: Vec::new(),
-            })?;
+
+        aliases: Vec::new(),
+        groups: Vec::new(),
+    })?;
     let host_ep = fabric.endpoint(host_id.device_id());
     let guest_ep = fabric.endpoint(guest_id.device_id());
     let accept = tokio::spawn(async move { host_ep.accept().await });
     let guest_conn = guest_ep.connect(host_id.device_id()).await?;
     let host_conn = accept.await??;
-    let host_hs = Session::handshake_acceptor(
-        host_conn,
-        &host_id,
-        "host",
-        &host_store,
-        Capability::all(),
-    );
+    let host_hs =
+        Session::handshake_acceptor(host_conn, &host_id, "host", &host_store, Capability::all());
     let guest_hs = Session::handshake_dialer(
         guest_conn,
         &guest_id,
@@ -1407,7 +1390,11 @@ async fn cmd_mesh_status(paths: &Paths) -> Result<()> {
     let id = Identity::load_or_create(paths.identity_file())?;
     println!("{}", style("Mesh").bold());
     println!("  mesh id   {}", mesh.mesh_id);
-    println!("  self      {} ({})", id.device_id().short(), Config::load(paths.config_file())?.device_label);
+    println!(
+        "  self      {} ({})",
+        id.device_id().short(),
+        Config::load(paths.config_file())?.device_label
+    );
     if let Some(k) = &mesh.last_kick_notice {
         println!(
             "  last kick notice: you were kicked by {} — {}",
@@ -1490,14 +1477,9 @@ async fn sync_with_peer(
     use mymesh_protocol::{decode_msg, encode_msg, ChannelId, ControlMessage, Frame};
     let store = DeviceStore::open(paths.devices_file())?;
     let (conn, transport) = mesh_conn::connect_raw(identity, cfg, peer).await?;
-    let session = Session::handshake_dialer(
-        conn,
-        identity,
-        &cfg.device_label,
-        &store,
-        Capability::all(),
-    )
-    .await?;
+    let session =
+        Session::handshake_dialer(conn, identity, &cfg.device_label, &store, Capability::all())
+            .await?;
     let conn = session.into_conn();
     // request their roster
     conn.send_frame(Frame {
@@ -1724,15 +1706,10 @@ async fn notify_peer(
     use mymesh_protocol::{encode_msg, ChannelId, Frame};
     let store = DeviceStore::open(paths.devices_file())?;
     let (conn, transport) = mesh_conn::connect_raw(identity, cfg, peer).await?;
-    let session = Session::handshake_dialer(
-        conn,
-        identity,
-        &cfg.device_label,
-        &store,
-        Capability::all(),
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("session handshake failed: {e}"))?;
+    let session =
+        Session::handshake_dialer(conn, identity, &cfg.device_label, &store, Capability::all())
+            .await
+            .map_err(|e| anyhow::anyhow!("session handshake failed: {e}"))?;
     let conn = session.into_conn();
     conn.send_frame(Frame {
         channel: ChannelId::control(),
@@ -1744,7 +1721,6 @@ async fn notify_peer(
     mesh_conn::shutdown_opt(transport).await;
     Ok(())
 }
-
 
 fn print_install_notes() {
     println!(
