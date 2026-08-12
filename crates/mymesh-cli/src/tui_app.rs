@@ -10,8 +10,8 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use mymesh_core::{
-    ArmState, Config, DeviceStore, JoinStore, MeshState, NodeFingerprint, Paths, PeerMetrics,
-    PendingKickStore, TrustState,
+    apply_pair_confirm, record_pair_decide, ArmState, Config, DeviceStore, JoinStore, MeshState,
+    NodeFingerprint, PairSessionStore, Paths, PeerMetrics, PendingKickStore, TrustState,
 };
 use mymesh_crypto::{device_id_to_words, device_join_uri, Identity};
 use mymesh_protocol::FileEntry;
@@ -202,6 +202,7 @@ enum PromptKind {
     #[allow(dead_code)]
     DenyRequest,
     ExposePort,
+    PairConfirm,
 }
 
 impl Default for PromptKind {
@@ -238,6 +239,9 @@ struct App {
     detail: String,
     /// Pending join list selection index on Home
     req_sel: usize,
+    /// Resident pair/v2 QR_A shown on Home (Carrier scans this first).
+    pair_qr_a: Option<String>,
+    pair_sid: Option<String>,
     /// Last *applied* terminal size (backend buffer).
     term_size: (u16, u16),
     /// Most recent size observed from the OS (may be mid-animation).
@@ -308,10 +312,13 @@ pub async fn run_tui(paths: Paths) -> Result<()> {
         carrier_url: None,
         detail: String::new(),
         req_sel: 0,
+        pair_qr_a: None,
+        pair_sid: None,
         term_size: (0, 0),
         pending_size: None,
         pending_since: None,
     };
+    ensure_pair_qr_a(&mut app);
 
     let res = run_loop(&mut terminal, &mut app).await;
 
@@ -420,6 +427,18 @@ fn node_cwd_default(node: &BrowserNode, home: &Path) -> String {
     match node {
         BrowserNode::Local => home.display().to_string(),
         BrowserNode::Peer { .. } => ".".into(),
+    }
+}
+
+fn ensure_pair_qr_a(app: &mut App) {
+    match crate::pair_cmd::mint_pair_dual_qr(&app.paths, None, None, None) {
+        Ok((qr, sid, _)) => {
+            app.pair_qr_a = Some(qr);
+            app.pair_sid = Some(sid);
+            app.status =
+                "pair QR armed — scan this first on Carrier, then scan the other machine".into();
+        }
+        Err(e) => app.status = format!("pair QR: {e}"),
     }
 }
 
@@ -814,6 +833,13 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 "paste hex id or 24 words, then Enter",
             ),
             KeyCode::Char('C') => start_carrier(app).await,
+            KeyCode::Char('P') => ensure_pair_qr_a(app),
+            KeyCode::Char('f') => start_prompt(
+                app,
+                PromptKind::PairConfirm,
+                "Pair confirm code",
+                "4-4 code from Carrier after Accept (hyphens optional)",
+            ),
             KeyCode::Char('h') => {
                 app.detail =
                     crate::magic_cmd::hosts_text(&app.paths).unwrap_or_else(|e| e.to_string());
@@ -1192,6 +1218,13 @@ async fn click_button(app: &mut App, id: &str) {
             "hex or 24 words",
         ),
         "carrier" => start_carrier(app).await,
+        "pair_qr" => ensure_pair_qr_a(app),
+        "pair_confirm" => start_prompt(
+            app,
+            PromptKind::PairConfirm,
+            "Pair confirm code",
+            "4-4 code from Carrier after Accept",
+        ),
         "copy_id" => copy_id(app),
         "words" => show_words(app),
         "ping" => ping_sel(app).await,
@@ -1543,6 +1576,33 @@ async fn submit_prompt(app: &mut App) {
         }
         PromptKind::DenyRequest => {
             deny_selected_request(app).await;
+        }
+        PromptKind::PairConfirm => {
+            let store = match PairSessionStore::open(app.paths.pair_sessions_dir()) {
+                Ok(s) => s,
+                Err(e) => {
+                    app.status = format!("pair confirm: {e}");
+                    return;
+                }
+            };
+            let joins = match JoinStore::open(app.paths.join_dir()) {
+                Ok(j) => j,
+                Err(e) => {
+                    app.status = format!("pair confirm: {e}");
+                    return;
+                }
+            };
+            match apply_pair_confirm(&store, &joins, &buf, app.pair_sid.as_deref(), None) {
+                Ok(res) => {
+                    let kind = match res.decision {
+                        mymesh_core::JoinDecision::Accept => "accept",
+                        mymesh_core::JoinDecision::Deny { .. } => "deny",
+                    };
+                    record_pair_decide(app.paths.metrics_dir(), kind);
+                    app.status = format!("pair confirm {kind} — join can complete Trusted");
+                }
+                Err(e) => app.status = format!("pair confirm: {e}"),
+            }
         }
         PromptKind::ExposePort => {
             let peers = load_peers(&app.paths);
@@ -2448,6 +2508,8 @@ fn draw_action_bar(f: &mut TuiFrame, area: Rect, app: &mut App) {
             ("deny", "[n] Deny"),
             ("link", "[l] Link"),
             ("carrier", "[C] Carrier"),
+            ("pair_qr", "[P] Pair QR"),
+            ("pair_confirm", "[f] Confirm"),
             ("copy_id", "[c] ID"),
             ("words", "[w] Words"),
             ("quit", "[q] Quit"),
@@ -2685,18 +2747,34 @@ fn draw_home(f: &mut TuiFrame, area: Rect, app: &App) {
         cols[0],
     );
 
-    // QR panel — pair-peer so Carrier can scan this node as the *second* machine.
+    // QR panel: resident pair/v2 first (Carrier scan 1), pair-peer is the other-machine QR.
     let mut qr_lines = vec![Line::from(Span::styled(
-        "Scan this node (Carrier: second machine)",
+        "Carrier: scan this QR first (pair dual)",
         Style::default().fg(C_MUTED),
     ))];
-    if let Some(id) = id {
-        let peer = pair_peer_uri(&id, &app.paths);
+    if let Some(qr) = &app.pair_qr_a {
         qr_lines.push(Line::from(Span::styled(
-            peer.clone(),
+            qr.clone(),
             Style::default().fg(C_ACCENT),
         )));
         qr_lines.push(Line::from(""));
+        for row in qr_half_block_lines(qr) {
+            qr_lines.push(Line::from(Span::styled(
+                row,
+                Style::default().fg(C_TEXT).bg(C_PANEL),
+            )));
+        }
+        qr_lines.push(Line::from(""));
+        qr_lines.push(Line::from(Span::styled(
+            "[f] paste confirm code after phone Accept",
+            Style::default().fg(C_MUTED),
+        )));
+    } else if let Some(id) = id {
+        let peer = pair_peer_uri(&id, &app.paths);
+        qr_lines.push(Line::from(Span::styled(
+            "fallback joiner QR (other machine)",
+            Style::default().fg(C_MUTED),
+        )));
         for row in qr_half_block_lines(&peer) {
             qr_lines.push(Line::from(Span::styled(
                 row,
@@ -2706,7 +2784,7 @@ fn draw_home(f: &mut TuiFrame, area: Rect, app: &App) {
     }
     f.render_widget(
         Paragraph::new(qr_lines)
-            .block(panel("QR · half-block"))
+            .block(panel("QR · pair this machine"))
             .wrap(Wrap { trim: false }),
         cols[1],
     );

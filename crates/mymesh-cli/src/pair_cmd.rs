@@ -22,21 +22,18 @@ use qrcode::QrCode;
 
 use crate::mesh_conn;
 
-/// Resident: arm join window, mint PairSession, print QR_A v2 (required nonce).
-///
-/// Optional `--tlspin` (SPKI pin) requires `--host https://…` (fail closed **before** arm).
-pub async fn cmd_pair_dual(
+/// Mint a resident pair/v2 session and QR_A (also used by the TUI).
+pub(crate) fn mint_pair_dual_qr(
     paths: &Paths,
     host: Option<String>,
     ttl: Option<u64>,
     tlspin: Option<String>,
-) -> Result<()> {
+) -> Result<(String, String, String)> {
     paths.ensure()?;
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file()).unwrap_or_default();
     let ttl = ttl.unwrap_or(cfg.limits.arm_timeout_secs);
 
-    // Fail closed before arming: pin format + HTTPS policy (no orphan session / arm TTL burn).
     let pin_parsed = match tlspin.as_deref() {
         Some(raw) if !raw.is_empty() => {
             Some(parse_tls_pin(raw).map_err(|e| anyhow::anyhow!("{e}"))?)
@@ -48,8 +45,7 @@ pub async fn cmd_pair_dual(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let pin_wire = pin_parsed.as_ref().map(|p| p.to_wire());
 
-    // Arm join window so serve accepts JoinRequest.
-    let arm = ArmState::arm(paths.arm_file(), ttl)?;
+    let _arm = ArmState::arm(paths.arm_file(), ttl)?;
     let mesh = MeshState::load(paths.mesh_file())?;
     let store = PairSessionStore::open(paths.pair_sessions_dir())?;
 
@@ -65,7 +61,6 @@ pub async fn cmd_pair_dual(
     let fp = NodeFingerprint::from_device_id(&identity.device_id())
         .as_str()
         .to_string();
-    // Checked emit (format already validated; re-checks HTTPS + emits canonical pin).
     let qr = build_pair_qr_v2_checked(&PairQrV2Params {
         sid: &armed.session.sid,
         did: &did,
@@ -80,19 +75,39 @@ pub async fn cmd_pair_dual(
     })
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Persist pin only after successful QR emit (session advertises what the QR carried).
     if let Some(ref pin) = pin_wire {
         armed.session.tls_pin = Some(pin.clone());
         store.save(&armed.session)?;
     }
+    Ok((qr, armed.session.sid.clone(), identity.device_id().to_string()))
+}
+
+/// Resident: arm join window, mint PairSession, print QR_A v2 (required nonce).
+///
+/// Optional `--tlspin` (SPKI pin) requires `--host https://…` (fail closed **before** arm).
+pub async fn cmd_pair_dual(
+    paths: &Paths,
+    host: Option<String>,
+    ttl: Option<u64>,
+    tlspin: Option<String>,
+) -> Result<()> {
+    let (qr, sid, did) = mint_pair_dual_qr(paths, host.clone(), ttl, tlspin.clone())?;
+    let identity = Identity::load_or_create(paths.identity_file())?;
+    let store = PairSessionStore::open(paths.pair_sessions_dir())?;
+    let sess = store.load(&sid)?.ok_or_else(|| anyhow::anyhow!("session gone"))?;
+    let arm = ArmState::load(paths.arm_file()).unwrap_or_default();
+    let fp = NodeFingerprint::from_device_id(&identity.device_id())
+        .as_str()
+        .to_string();
+    let _ = did;
 
     println!("{}", style("pair dual — resident QR_A (v2)").bold());
-    println!("  sid     {}", armed.session.sid);
+    println!("  sid     {sid}");
     println!("  did     {}", identity.device_id().short());
     println!("  fp      {fp}");
-    println!("  ep      {}", ep.as_str());
+    println!("  ep      {}", sess.ep.as_str());
     println!("  until   {:?}", arm.until);
-    println!("  phase   {}", armed.session.phase.as_str());
+    println!("  phase   {}", sess.phase.as_str());
     if let Some(h) = &host {
         println!("  host    {h}");
     } else {
@@ -100,7 +115,7 @@ pub async fn cmd_pair_dual(
             "  mode    confirm-on-machine (no host) — after joiner dials: mymesh pair confirm <code>"
         );
     }
-    if let Some(ref pin) = pin_wire {
+    if let Some(ref pin) = sess.tls_pin {
         println!("  tlspin  {pin}");
     }
     println!();
