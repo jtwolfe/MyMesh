@@ -79,7 +79,7 @@ Normative IDs from [CARRIER-NEXT.md](CARRIER-NEXT.md) §S9. Status reflects **th
 | **C1** | Session fixation | Bootstrap **token** (hash-only on disk) + **sid** + 16B **nonce** + arm **TTL** | **Implemented** (pair v2) | `mymesh-core` `PairSessionStore`, [PAIR-V2.md](PAIR-V2.md) |
 | **C2** | Wrong joiner accept | Bind **joiner_did** before decide; confirm code = HMAC over sid + joiner + resident + nonce | **Implemented** | `pair_confirm.rs`, `apply_pair_confirm` / `not_bound` fail-closed |
 | **C3** | Backup theft | Password **Argon2id** → AEAD (XChaCha20-Poly1305) over person seed; MRK not required to decrypt | **Implemented** | `mymesh-crypto` `seal_owner_backup` / `owner-backup.sealed`; MMK wrap is separate Argon2id (S3) |
-| **C4** | Guest residual | **Grant revoke** (store + wire) + **continuity wipe** on leave | **Partial** | Revoke: `GrantStore::revoke`, `GrantRevoke` gossip — **done**. Continuity pack wipe (S8) — **planned** Wave E |
+| **C4** | Guest residual | **Grant revoke** (store + wire) + **continuity wipe** on leave | **Partial** | Revoke: `GrantStore::revoke`, `GrantRevoke` gossip — **done**. Continuity pack wipe host path (S8/E4) — **done** (materialize/wipe/status + best-effort erase). Carrier leave UX is E5 |
 | **C5** | Topology MITM | Topology only over **mesh-auth** session; optional host **snapshot_sig** | **Partial** | Challenge + Bearer session + filtered topology — **done** (`mesh_api.rs`). `snapshot_sig_hex` always `null` until optional S9 pin |
 | **C6** | Facet bleed | Identity facet + location **allowlists** enforced on grants | **Planned** (S7) | Fields exist on `GrantConstraints`; **not enforced** until Wave E / PR E2 |
 | **C7** | Decide brute force | Rate limits on decide/confirm, mesh auth challenge, backup unwrap, grant mutate | **Planned** (S9 / PR D1) | Defaults below; metrics names reserved in design — **not wired** in this tree yet |
@@ -128,7 +128,7 @@ Normative IDs from [CARRIER-NEXT.md](CARRIER-NEXT.md) §S9. Status reflects **th
 | Session `allows()` denies revoked/expired guest caps | Implemented |
 | `GrantRevoke` control message | Implemented |
 | Guest join without full membership snapshot | Implemented (S5 / C1b path) |
-| Continuity materialize + wipe_token wipe | **Not in this tree** (S8 / Wave E) |
+| Continuity materialize + wipe_token wipe | **Implemented** (S8 / E4): `POST /mesh/v1/continuity/materialize|wipe`, `GET .../status`; host store under `continuity/<pack_id>/`; best-effort zero+unlink |
 
 ### C5 — Topology MITM (detail)
 

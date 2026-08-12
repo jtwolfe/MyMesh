@@ -111,4 +111,14 @@ impl Paths {
     pub fn grants_file(&self) -> PathBuf {
         self.data_dir.join("grants.json")
     }
+
+    /// Continuity packs root: `continuity/<pack_id>/` mode 0700 (S8).
+    pub fn continuity_dir(&self) -> PathBuf {
+        self.data_dir.join("continuity")
+    }
+
+    /// Single pack directory under continuity root.
+    pub fn continuity_pack_dir(&self, pack_id: &str) -> PathBuf {
+        self.continuity_dir().join(pack_id)
+    }
 }

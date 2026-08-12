@@ -12,7 +12,8 @@ use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use console::style;
 use mymesh_core::{
-    not_after_days, parse_capabilities, ArmState, Capability, Config, DeviceStore, GrantStore,
+    not_after_days, parse_capabilities, status_pack as continuity_status_pack,
+    wipe_pack as continuity_wipe_pack, ArmState, Capability, Config, DeviceStore, GrantStore,
     IssuedBy, JoinDecision, JoinStore, MeshState, Paths,
 };
 use mymesh_crypto::{
@@ -127,6 +128,11 @@ enum Commands {
     Grant {
         #[command(subcommand)]
         action: GrantCmd,
+    },
+    /// Continuity pack status / wipe (S8; host-local)
+    Continuity {
+        #[command(subcommand)]
+        action: ContinuityCmd,
     },
     /// Revoke trust for a linked device
     Unlink {
@@ -400,6 +406,26 @@ enum GrantCmd {
     Revoke {
         #[arg(value_name = "GRANT_ID")]
         grant_id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ContinuityCmd {
+    /// Show pack status: present | wiped | absent
+    Status {
+        #[arg(value_name = "PACK_ID")]
+        pack_id: String,
+        /// Machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Wipe pack secrets (host-local; no wipe_token required — filesystem trust)
+    Wipe {
+        #[arg(value_name = "PACK_ID")]
+        pack_id: String,
+        /// Confirm wipe (required)
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -770,6 +796,12 @@ async fn main() -> Result<()> {
             }
             GrantCmd::List { json, all } => cmd_grant_list(&paths, json, all)?,
             GrantCmd::Revoke { grant_id } => cmd_grant_revoke(&paths, &grant_id)?,
+        },
+        Commands::Continuity { action } => match action {
+            ContinuityCmd::Status { pack_id, json } => {
+                cmd_continuity_status(&paths, &pack_id, json)?
+            }
+            ContinuityCmd::Wipe { pack_id, yes } => cmd_continuity_wipe(&paths, &pack_id, yes)?,
         },
         Commands::Unlink { device } => cmd_unlink(&paths, &device).await?,
         Commands::Shell { device, shell } => cmd_shell(&paths, &device, shell).await?,
@@ -1490,6 +1522,41 @@ fn cmd_grant_list(paths: &Paths, json: bool, all: bool) -> Result<()> {
             g.role.as_str()
         );
     }
+    Ok(())
+}
+
+fn cmd_continuity_status(paths: &Paths, pack_id: &str, json: bool) -> Result<()> {
+    let status = continuity_status_pack(paths, pack_id.trim()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "pack_id": pack_id.trim(),
+                "status": status.as_str(),
+            })
+        );
+    } else {
+        println!(
+            "{} continuity {}  {}",
+            style("ok").green().bold(),
+            pack_id.trim(),
+            status.as_str()
+        );
+    }
+    Ok(())
+}
+
+fn cmd_continuity_wipe(paths: &Paths, pack_id: &str, yes: bool) -> Result<()> {
+    if !yes {
+        bail!("refusing to wipe without --yes (removes continuity pack secrets)");
+    }
+    let status = continuity_wipe_pack(paths, pack_id.trim()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!(
+        "{} wiped continuity {} → {}",
+        style("ok").green().bold(),
+        pack_id.trim(),
+        status.as_str()
+    );
     Ok(())
 }
 

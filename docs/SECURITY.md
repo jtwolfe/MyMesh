@@ -45,7 +45,7 @@ Full detail, threat narratives, and honest status: **[THREATS.md](THREATS.md)**.
 | **C1** | Session fixation | token + sid + nonce + TTL | **Implemented** (pair v2) |
 | **C2** | Wrong joiner accept | bind joiner_did + confirm HMAC | **Implemented** |
 | **C3** | Backup theft | password Argon2id AEAD | **Implemented** (owner sealed backup; MMK wrap separate) |
-| **C4** | Guest residual | wipe + grant revoke | **Partial** — revoke done; continuity wipe planned (S8) |
+| **C4** | Guest residual | wipe + grant revoke | **Partial** — revoke done; continuity host wipe (S8/E4) done; Carrier leave UX (E5) pending |
 | **C5** | Topology MITM | mesh-auth session; optional sig | **Partial** — mesh session enforced; `snapshot_sig` not yet |
 | **C6** | Facet bleed | allowlists enforced S7 | **Planned** (schema only today) |
 | **C7** | Decide brute force | rate limits | **Planned** (PR D1) |
@@ -88,7 +88,7 @@ Prefer private disclosure for exploitable bugs until a security contact is forma
 - Formal verification or third-party audit
 - Online rate limits for pair decide / backup unwrap (**C7** — planned)
 - Multi-identity facet isolation (**C6** — planned S7)
-- Continuity wipe-on-leave for guest residual data (**C4** complete path — planned S8)
+- Continuity wipe-on-leave for guest residual data (**C4**): MyMesh host materialize/wipe/status landed (S8/E4); full leave path completes with Carrier E5
 
 ## Magic plane & SSH (alpha.3)
 
