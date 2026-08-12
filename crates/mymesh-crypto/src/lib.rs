@@ -14,10 +14,14 @@ mod words;
 
 pub use identity::{Identity, IdentityPublic};
 pub use master_key::{
-    derive_wrap_key, find_recovery_code, generate_recovery_codes, mesh_init, mesh_recover_with_code,
-    mesh_rotate_password, mesh_unlock_password, mrk_fingerprint, unwrap_mrk, wrap_mrk, KdfParams,
-    MeshInitResult, MeshMasterFile, MmkRuntime, Mrk, RecoveryCode, WrappedMrk, DEFAULT_M_KIB,
-    DEFAULT_P, DEFAULT_T, HKDF_ADMIN_MAC, HKDF_ADMIN_SIGN, RECOVERY_CODE_COUNT,
+    admin_mac_key, admin_signing_key, admin_verifying_key_bytes, derive_wrap_key,
+    find_recovery_code, generate_recovery_codes, mesh_init, mesh_recover_with_code,
+    mesh_rotate_password, mesh_unlock_password, mrk_fingerprint, mrk_proof_preimage,
+    sign_mrk_proof_ed25519, sign_mrk_proof_hmac, unwrap_mrk, verify_mrk_admin_proof,
+    verify_mrk_proof_ed25519, verify_mrk_proof_ed25519_with_vk, verify_mrk_proof_hmac, wrap_mrk,
+    KdfParams, MeshInitResult, MeshMasterFile, MmkRuntime, Mrk, MrkAdminProof, MrkProofMethod,
+    RecoveryCode, WrappedMrk, DEFAULT_M_KIB, DEFAULT_P, DEFAULT_T, HKDF_ADMIN_MAC,
+    HKDF_ADMIN_SIGN, MRK_PROOF_DOMAIN, RECOVERY_CODE_COUNT,
 };
 pub use pairing::{PairingRole, PairingSession, SharedSecret};
 pub use word_id::{device_id_to_words, device_join_uri, parse_device_id};

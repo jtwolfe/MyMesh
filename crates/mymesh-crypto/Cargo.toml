@@ -24,3 +24,4 @@ bip39 = { workspace = true }
 chrono = { workspace = true }
 argon2 = { workspace = true }
 chacha20poly1305 = { workspace = true }
+hmac = { workspace = true }

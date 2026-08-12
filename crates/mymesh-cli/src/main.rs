@@ -15,8 +15,9 @@ use mymesh_core::{
     ArmState, Capability, Config, DeviceStore, JoinDecision, JoinStore, MeshState, Paths,
 };
 use mymesh_crypto::{
-    device_id_to_words, device_join_uri, mesh_init, mesh_recover_with_code, mesh_rotate_password,
-    mesh_unlock_password, parse_device_id, Identity, MeshMasterFile, MmkRuntime, RecoveryCode,
+    admin_verifying_key_bytes, device_id_to_words, device_join_uri, mesh_init,
+    mesh_recover_with_code, mesh_rotate_password, mesh_unlock_password, parse_device_id,
+    sign_mrk_proof_ed25519, Identity, MeshMasterFile, MmkRuntime, RecoveryCode,
 };
 use mymesh_net::{
     run_mailbox_server, FsMailbox, HttpMailbox, IrohTransport, LocalFabric, LocalRendezvous,
@@ -111,9 +112,11 @@ enum Commands {
         #[command(subcommand)]
         action: RequestsCmd,
     },
-    /// List linked devices
+    /// List linked devices / manage remote Admin capability (KD15)
     Devices {
-        /// Machine-readable JSON
+        #[command(subcommand)]
+        action: Option<DevicesCmd>,
+        /// Machine-readable JSON (list mode)
         #[arg(long)]
         json: bool,
     },
@@ -336,6 +339,22 @@ impl CompletionShell {
 }
 
 #[derive(Subcommand, Debug)]
+enum DevicesCmd {
+    /// Grant remote Admin capability to a Trusted member (host-local CLI; KD15)
+    #[command(name = "grant-admin")]
+    GrantAdmin {
+        #[arg(value_name = "DEVICE")]
+        device: String,
+    },
+    /// Revoke remote Admin capability (host-local CLI)
+    #[command(name = "revoke-admin")]
+    RevokeAdmin {
+        #[arg(value_name = "DEVICE")]
+        device: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum MeshCmd {
     /// Initialize mesh master key (password wrap + recovery codes once)
     Init {
@@ -357,6 +376,12 @@ enum MeshCmd {
     Status,
     /// Pull/push membership with all trusted peers (gossip sync)
     Sync,
+    /// Sign an MRK admin proof over a challenge (requires unlock; B2 / mesh API prep)
+    Prove {
+        /// Challenge as hex (random 32 bytes if omitted)
+        #[arg(long)]
+        challenge: Option<String>,
+    },
     /// Re-wrap MRK with a new password (requires current password)
     #[command(name = "rotate-master")]
     RotateMaster {
@@ -598,7 +623,11 @@ async fn main() -> Result<()> {
                 cmd_requests_decide(&paths, &device, false, &reason).await?
             }
         },
-        Commands::Devices { json } => cmd_devices(&paths, json).await?,
+        Commands::Devices { action, json } => match action {
+            None => cmd_devices(&paths, json).await?,
+            Some(DevicesCmd::GrantAdmin { device }) => cmd_grant_admin(&paths, &device)?,
+            Some(DevicesCmd::RevokeAdmin { device }) => cmd_revoke_admin(&paths, &device)?,
+        },
         Commands::Unlink { device } => cmd_unlink(&paths, &device).await?,
         Commands::Shell { device, shell } => cmd_shell(&paths, &device, shell).await?,
         Commands::Cp { src, dst } => cmd_cp(&paths, &src, &dst).await?,
@@ -659,6 +688,7 @@ async fn main() -> Result<()> {
             MeshCmd::Lock => cmd_mesh_lock(&paths)?,
             MeshCmd::Status => cmd_mesh_status(&paths).await?,
             MeshCmd::Sync => cmd_mesh_sync(&paths).await?,
+            MeshCmd::Prove { challenge } => cmd_mesh_prove(&paths, challenge)?,
             MeshCmd::RotateMaster {
                 password_file,
                 new_password_file,
@@ -1089,6 +1119,8 @@ async fn cmd_devices(paths: &Paths, json: bool) -> Result<()> {
     }
     if store.list().is_empty() {
         println!("No linked devices.");
+        println!("  host-local admin: always (this node)");
+        println!("  remote Admin: mymesh devices grant-admin <id>");
         return Ok(());
     }
     for d in store.list() {
@@ -1098,9 +1130,54 @@ async fn cmd_devices(paths: &Paths, json: bool) -> Result<()> {
             .and_then(|x| x.latest_rtt())
             .map(|ms| format!("{ms}ms"))
             .unwrap_or_else(|| "—".into());
-        println!("{}  {}  {:?}  rtt={rtt}", d.id.short(), d.label, d.trust);
+        let admin = if d.capabilities.contains(&Capability::Admin) {
+            " admin"
+        } else {
+            ""
+        };
+        println!(
+            "{}  {}  {:?}{admin}  rtt={rtt}",
+            d.id.short(),
+            d.label,
+            d.trust
+        );
         println!("    {}", d.id);
     }
+    Ok(())
+}
+
+/// Host-local CLI: grant remote Admin on a Trusted peer (KD15).
+fn cmd_grant_admin(paths: &Paths, device: &str) -> Result<()> {
+    let mut store = DeviceStore::open(paths.devices_file())?;
+    let id = resolve_device(&store, device)?;
+    // Host-local authority: data dir access is sufficient (no Admin required on caller).
+    let _auth = mymesh_core::AdminAuthority::host_local();
+    debug_assert!(_auth.may_mutate_local_store());
+    store.grant_admin(&id)?;
+    let rec = store
+        .get(&id)
+        .ok_or_else(|| anyhow::anyhow!("device vanished after grant"))?;
+    println!(
+        "{} granted remote Admin to {} ({})",
+        style("ok").green().bold(),
+        rec.label,
+        id.short()
+    );
+    println!("  host-local CLI always administers this node without Admin cap");
+    println!("  remote/API admin now allowed for this Trusted member");
+    Ok(())
+}
+
+/// Host-local CLI: revoke remote Admin.
+fn cmd_revoke_admin(paths: &Paths, device: &str) -> Result<()> {
+    let mut store = DeviceStore::open(paths.devices_file())?;
+    let id = resolve_device(&store, device)?;
+    store.revoke_admin(&id)?;
+    println!(
+        "{} revoked remote Admin from {}",
+        style("ok").green().bold(),
+        id.short()
+    );
     Ok(())
 }
 
@@ -1507,8 +1584,16 @@ async fn cmd_mesh_status(paths: &Paths) -> Result<()> {
         id.device_id().short(),
         Config::load(paths.config_file())?.device_label
     );
+    if let Some(c) = &mesh.creator_device_id {
+        let mark = if *c == id.device_id() { " (this node)" } else { "" };
+        println!("  creator   {}{mark}", c.short());
+    }
+    if let Some(fp) = &mesh.mrk_fingerprint {
+        println!("  mesh fp   {fp} (from mesh.json mirror)");
+    }
     // Mesh master key (MMK / MRK)
     print_mmk_status(paths)?;
+    println!("  admin     host-local=yes  remote=Admin cap | MRK proof | owner (S4)");
     if let Some(k) = &mesh.last_kick_notice {
         println!(
             "  last kick notice: you were kicked by {} — {}",
@@ -1525,7 +1610,17 @@ async fn cmd_mesh_status(paths: &Paths) -> Result<()> {
         println!("    (none yet — link devices to form a mesh)");
     } else {
         for d in trusted {
-            println!("    {}  {}  {:?}", d.id.short(), d.label, d.mesh_id);
+            let admin = if d.capabilities.contains(&Capability::Admin) {
+                " Admin"
+            } else {
+                ""
+            };
+            println!(
+                "    {}  {}  {:?}{admin}",
+                d.id.short(),
+                d.label,
+                d.mesh_id
+            );
             println!("      {}", d.id);
         }
     }
@@ -1555,7 +1650,9 @@ fn print_mmk_status(paths: &Paths) -> Result<()> {
             println!("  unlock    policy=re-prompt (default; no OS keyring)");
         }
         Some(mf) => {
-            let unlocked = MmkRuntime::load(paths.mmk_runtime_file())?
+            let rt = MmkRuntime::load(paths.mmk_runtime_file())?;
+            let unlocked = rt
+                .as_ref()
                 .map(|r| r.mrk_fingerprint == mf.mrk_fingerprint)
                 .unwrap_or(false);
             println!(
@@ -1571,6 +1668,17 @@ fn print_mmk_status(paths: &Paths) -> Result<()> {
                     style("locked").yellow()
                 }
             );
+            if unlocked {
+                if let Some(rt) = rt {
+                    if let Ok(mrk) = rt.to_mrk() {
+                        let vk = admin_verifying_key_bytes(&mrk);
+                        println!(
+                            "  admin-vk  {}…  (MRK proof ready; mymesh mesh prove)",
+                            hex::encode(&vk[..4])
+                        );
+                    }
+                }
+            }
             if let Some(rot) = mf.rotated_at {
                 println!("  rotated   {}", rot.to_rfc3339());
             }
@@ -1591,16 +1699,44 @@ fn cmd_mesh_init(paths: &Paths, password_file: Option<PathBuf>, force: bool) -> 
     let password = read_mmk_password(password_file.as_deref(), "New mesh master password", true)?;
     let init = mesh_init(password.as_bytes(), None)?;
     init.file.save(&path)?;
-    // Ensure mesh.json exists for this node.
-    let _ = MeshState::load(paths.mesh_file())?;
+
+    // Migration (KD15): record creator + fingerprint. Existing Trusted peers keep
+    // stored capabilities (no Admin auto-grant). Host-local CLI always node-admin.
+    let identity = Identity::load_or_create(paths.identity_file())?;
+    let mut mesh = MeshState::load(paths.mesh_file())?;
+    mesh.mrk_fingerprint = Some(init.file.mrk_fingerprint.clone());
+    mesh.creator_device_id = Some(identity.device_id());
+    mesh.save(paths.mesh_file())?;
+
+    // Existing Trusted devices: leave capabilities as stored (no Admin auto-grant).
+    let store = DeviceStore::open(paths.devices_file())?;
+    let trusted_no_admin: usize = store
+        .list()
+        .into_iter()
+        .filter(|d| {
+            matches!(d.trust, mymesh_core::TrustState::Trusted)
+                && !d.capabilities.contains(&Capability::Admin)
+        })
+        .count();
+
     // Default re-prompt: do not leave runtime unlocked unless user runs unlock.
     let _ = MmkRuntime::clear(paths.mmk_runtime_file());
 
     println!("{}", style("Mesh master key initialized").green().bold());
     println!("  file          {}", path.display());
     println!("  fingerprint   {}", init.file.mrk_fingerprint);
+    println!(
+        "  creator       {} (host-local admin on this node)",
+        identity.device_id().short()
+    );
     println!("  kdf           argon2id m={} t={} p={}", init.file.kdf_params.m, init.file.kdf_params.t, init.file.kdf_params.p);
     println!("  unlock policy re-prompt (default; OS keyring not enabled)");
+    println!("  remote Admin  not auto-granted to existing peers (default grant has no Admin)");
+    if trusted_no_admin > 0 {
+        println!(
+            "  note          {trusted_no_admin} Trusted peer(s) without Admin — use: mymesh devices grant-admin <id>"
+        );
+    }
     println!();
     println!(
         "{}",
@@ -1613,7 +1749,43 @@ fn cmd_mesh_init(paths: &Paths, password_file: Option<PathBuf>, force: bool) -> 
         println!("  {:2}.  {}", i + 1, code.display_hex());
     }
     println!();
-    println!("Next: mymesh mesh unlock   # then use host-local admin / future mesh API");
+    println!("Next: mymesh mesh unlock   # then mymesh mesh prove  (admin proof)");
+    println!("      mymesh devices grant-admin <id>   # remote Admin for a Trusted peer");
+    Ok(())
+}
+
+/// Sign challenge with unlocked MRK (Ed25519 admin proof). Demonstrates B2 without Carrier.
+fn cmd_mesh_prove(paths: &Paths, challenge_hex: Option<String>) -> Result<()> {
+    let file = MeshMasterFile::load(paths.mesh_master_file())?;
+    let rt = MmkRuntime::load(paths.mmk_runtime_file())?.ok_or_else(|| {
+        anyhow::anyhow!("MMK locked — run `mymesh mesh unlock` first")
+    })?;
+    if rt.mrk_fingerprint != file.mrk_fingerprint {
+        bail!("runtime fingerprint mismatch — re-run mesh unlock");
+    }
+    let mrk = rt.to_mrk()?;
+    let challenge = if let Some(h) = challenge_hex {
+        hex::decode(h.trim()).context("challenge hex")?
+    } else {
+        let mut b = [0u8; 32];
+        use rand::RngCore;
+        rand::rngs::OsRng.fill_bytes(&mut b);
+        b.to_vec()
+    };
+    let proof = sign_mrk_proof_ed25519(&mrk, &challenge);
+    let ok = mymesh_crypto::verify_mrk_admin_proof(&mrk, &challenge, &proof);
+    if !ok {
+        bail!("internal: admin proof failed self-verify");
+    }
+    println!("{}", style("mrk_proof").green().bold());
+    println!("  method      ed25519");
+    println!("  challenge   {}", hex::encode(&challenge));
+    println!(
+        "  public_key  {}",
+        proof.public_key_hex.as_deref().unwrap_or("")
+    );
+    println!("  signature   {}", proof.proof_hex);
+    println!("  verify      ok (agent-local; mesh/v1 challenge auth is B3)");
     Ok(())
 }
 

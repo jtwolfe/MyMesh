@@ -11,7 +11,9 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use chrono::{DateTime, Utc};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use mymesh_core::{Error, Result};
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -19,6 +21,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// S0 default Argon2id memory cost (KiB) — within 64_000–256_000.
 pub const DEFAULT_M_KIB: u32 = 65_536;
@@ -38,6 +42,9 @@ pub const RECOVERY_CODE_COUNT: usize = 8;
 pub const HKDF_ADMIN_SIGN: &[u8] = b"mymesh/mrk/admin-sign";
 /// HKDF info for admin MAC key.
 pub const HKDF_ADMIN_MAC: &[u8] = b"mymesh/mrk/admin-mac";
+
+/// Domain separation for MRK admin proof challenge preimage (B2 / mesh auth).
+pub const MRK_PROOF_DOMAIN: &[u8] = b"mymesh-mrk-proof-v1";
 
 const KDF_NAME: &str = "argon2id";
 const WRAP_ALG: &str = "xchacha20poly1305";
@@ -133,6 +140,165 @@ impl Mrk {
 pub fn mrk_fingerprint(mrk: &[u8; MRK_LEN]) -> String {
     let dig = Sha256::digest(mrk);
     hex::encode(&dig[..4])
+}
+
+// ── MRK admin proof (B2 / KD15) ──────────────────────────────────────────────
+//
+// Remote mesh API admin uses `mrk_proof`: challenge signed with MRK-derived
+// admin Ed25519 **or** HMAC-SHA256 (S0). Host-local CLI does **not** need this
+// (filesystem trust). Never derive person-seed material from MRK.
+
+/// Which proof method produced an [`MrkAdminProof`].
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MrkProofMethod {
+    /// Ed25519 over domain-separated challenge (preferred for wire auth).
+    Ed25519,
+    /// HMAC-SHA256 over domain-separated challenge (requires MRK on verifier).
+    Hmac,
+}
+
+/// Detached admin proof over a challenge (agent-local or mesh API).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MrkAdminProof {
+    pub method: MrkProofMethod,
+    /// Hex-encoded signature (64B Ed25519) or MAC (32B HMAC-SHA256).
+    pub proof_hex: String,
+    /// Hex-encoded Ed25519 verifying key (32B). Present for [`MrkProofMethod::Ed25519`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key_hex: Option<String>,
+}
+
+/// Canonical preimage: `mymesh-mrk-proof-v1 || challenge`.
+pub fn mrk_proof_preimage(challenge: &[u8]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(MRK_PROOF_DOMAIN.len() + challenge.len());
+    m.extend_from_slice(MRK_PROOF_DOMAIN);
+    m.extend_from_slice(challenge);
+    m
+}
+
+/// Derive Ed25519 admin signing key from MRK (`mymesh/mrk/admin-sign`).
+pub fn admin_signing_key(mrk: &Mrk) -> SigningKey {
+    let seed = mrk.derive(HKDF_ADMIN_SIGN);
+    SigningKey::from_bytes(&seed)
+}
+
+/// Derive Ed25519 admin verifying key bytes (32) from MRK.
+pub fn admin_verifying_key_bytes(mrk: &Mrk) -> [u8; 32] {
+    admin_signing_key(mrk).verifying_key().to_bytes()
+}
+
+/// Derive 32-byte HMAC admin key from MRK (`mymesh/mrk/admin-mac`).
+pub fn admin_mac_key(mrk: &Mrk) -> [u8; 32] {
+    mrk.derive(HKDF_ADMIN_MAC)
+}
+
+/// Sign challenge with MRK-derived admin Ed25519 key.
+pub fn sign_mrk_proof_ed25519(mrk: &Mrk, challenge: &[u8]) -> MrkAdminProof {
+    let sk = admin_signing_key(mrk);
+    let pre = mrk_proof_preimage(challenge);
+    let sig: Signature = sk.sign(&pre);
+    MrkAdminProof {
+        method: MrkProofMethod::Ed25519,
+        proof_hex: hex::encode(sig.to_bytes()),
+        public_key_hex: Some(hex::encode(sk.verifying_key().to_bytes())),
+    }
+}
+
+/// Verify Ed25519 admin proof using the MRK (re-derives verifying key).
+pub fn verify_mrk_proof_ed25519(mrk: &Mrk, challenge: &[u8], proof: &MrkAdminProof) -> bool {
+    if proof.method != MrkProofMethod::Ed25519 {
+        return false;
+    }
+    let vk = admin_verifying_key_bytes(mrk);
+    verify_mrk_proof_ed25519_with_vk(&vk, challenge, proof)
+}
+
+/// Verify Ed25519 admin proof with an external verifying key (no MRK needed).
+pub fn verify_mrk_proof_ed25519_with_vk(
+    verifying_key: &[u8; 32],
+    challenge: &[u8],
+    proof: &MrkAdminProof,
+) -> bool {
+    if proof.method != MrkProofMethod::Ed25519 {
+        return false;
+    }
+    if let Some(pk_hex) = &proof.public_key_hex {
+        let Ok(pk_bytes) = hex::decode(pk_hex) else {
+            return false;
+        };
+        if pk_bytes.as_slice() != verifying_key.as_slice() {
+            return false;
+        }
+    }
+    let Ok(sig_bytes) = hex::decode(&proof.proof_hex) else {
+        return false;
+    };
+    if sig_bytes.len() != 64 {
+        return false;
+    }
+    let mut sig_arr = [0u8; 64];
+    sig_arr.copy_from_slice(&sig_bytes);
+    let Ok(sig) = Signature::from_slice(&sig_arr) else {
+        return false;
+    };
+    let Ok(vk) = VerifyingKey::from_bytes(verifying_key) else {
+        return false;
+    };
+    let pre = mrk_proof_preimage(challenge);
+    vk.verify(&pre, &sig).is_ok()
+}
+
+/// HMAC-SHA256 admin proof over challenge (verifier must hold MRK).
+pub fn sign_mrk_proof_hmac(mrk: &Mrk, challenge: &[u8]) -> MrkAdminProof {
+    let key = admin_mac_key(mrk);
+    let pre = mrk_proof_preimage(challenge);
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(&key)
+        .expect("HMAC-SHA256 accepts 32-byte key");
+    mac.update(&pre);
+    let tag = mac.finalize().into_bytes();
+    MrkAdminProof {
+        method: MrkProofMethod::Hmac,
+        proof_hex: hex::encode(tag),
+        public_key_hex: None,
+    }
+}
+
+/// Verify HMAC admin proof (constant-time tag compare).
+pub fn verify_mrk_proof_hmac(mrk: &Mrk, challenge: &[u8], proof: &MrkAdminProof) -> bool {
+    if proof.method != MrkProofMethod::Hmac {
+        return false;
+    }
+    let Ok(got) = hex::decode(&proof.proof_hex) else {
+        return false;
+    };
+    if got.len() != 32 {
+        return false;
+    }
+    let expected = sign_mrk_proof_hmac(mrk, challenge);
+    let Ok(want) = hex::decode(&expected.proof_hex) else {
+        return false;
+    };
+    ct_eq_bytes(&got, &want)
+}
+
+/// Verify any supported [`MrkAdminProof`] method using the MRK.
+pub fn verify_mrk_admin_proof(mrk: &Mrk, challenge: &[u8], proof: &MrkAdminProof) -> bool {
+    match proof.method {
+        MrkProofMethod::Ed25519 => verify_mrk_proof_ed25519(mrk, challenge, proof),
+        MrkProofMethod::Hmac => verify_mrk_proof_hmac(mrk, challenge, proof),
+    }
+}
+
+fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut v = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        v |= x ^ y;
+    }
+    v == 0
 }
 
 // ── Wrap / unwrap ───────────────────────────────────────────────────────────
@@ -763,5 +929,58 @@ mod tests {
         let spaced = format!("{} {}", &disp[..32], &disp[32..]);
         let parsed2 = RecoveryCode::parse(&spaced).unwrap();
         assert_eq!(parsed2.as_raw(), c.as_raw());
+    }
+
+    #[test]
+    fn mrk_admin_proof_ed25519_roundtrip() {
+        let mrk = Mrk::from_bytes([0x11; 32]);
+        let challenge = b"mesh-auth-challenge-v1-test";
+        let proof = sign_mrk_proof_ed25519(&mrk, challenge);
+        assert_eq!(proof.method, MrkProofMethod::Ed25519);
+        assert!(proof.public_key_hex.is_some());
+        assert!(verify_mrk_proof_ed25519(&mrk, challenge, &proof));
+        assert!(verify_mrk_admin_proof(&mrk, challenge, &proof));
+        // wrong challenge fails
+        assert!(!verify_mrk_proof_ed25519(&mrk, b"other", &proof));
+        // wrong MRK fails
+        let other = Mrk::from_bytes([0x22; 32]);
+        assert!(!verify_mrk_proof_ed25519(&other, challenge, &proof));
+        // external vk path
+        let vk = admin_verifying_key_bytes(&mrk);
+        assert!(verify_mrk_proof_ed25519_with_vk(&vk, challenge, &proof));
+        let bad_vk = [0u8; 32];
+        assert!(!verify_mrk_proof_ed25519_with_vk(&bad_vk, challenge, &proof));
+    }
+
+    #[test]
+    fn mrk_admin_proof_hmac_roundtrip() {
+        let mrk = Mrk::from_bytes([0x33; 32]);
+        let challenge = b"hmac-challenge";
+        let proof = sign_mrk_proof_hmac(&mrk, challenge);
+        assert_eq!(proof.method, MrkProofMethod::Hmac);
+        assert!(proof.public_key_hex.is_none());
+        assert!(verify_mrk_proof_hmac(&mrk, challenge, &proof));
+        assert!(!verify_mrk_proof_hmac(&mrk, b"nope", &proof));
+        let other = Mrk::from_bytes([0x44; 32]);
+        assert!(!verify_mrk_proof_hmac(&other, challenge, &proof));
+    }
+
+    #[test]
+    fn admin_sign_and_mac_keys_distinct() {
+        let mrk = Mrk::from_bytes([0x55; 32]);
+        let sign_seed = mrk.derive(HKDF_ADMIN_SIGN);
+        let mac_key = admin_mac_key(&mrk);
+        assert_ne!(sign_seed, mac_key);
+        let vk = admin_verifying_key_bytes(&mrk);
+        // verifying key is not raw seed
+        assert_ne!(vk, sign_seed);
+    }
+
+    #[test]
+    fn mrk_proof_preimage_domain_separated() {
+        let pre = mrk_proof_preimage(b"abc");
+        assert!(pre.starts_with(MRK_PROOF_DOMAIN));
+        assert!(pre.ends_with(b"abc"));
+        assert_ne!(pre, b"abc");
     }
 }

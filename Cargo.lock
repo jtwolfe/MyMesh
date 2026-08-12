@@ -2450,6 +2450,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "hex",
  "hkdf",
+ "hmac",
  "mymesh-core",
  "rand 0.8.7",
  "serde",

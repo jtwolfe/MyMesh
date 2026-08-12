@@ -13,7 +13,9 @@ mod pair_session;
 mod paths;
 
 pub use config::{Config, DaemonConfig, Limits, MagicConfig};
-pub use device::{Capability, DeviceRecord, DeviceStore, TrustState};
+pub use device::{
+    remote_admin_authority, AdminAuthority, Capability, DeviceRecord, DeviceStore, TrustState,
+};
 pub use error::{Error, Result};
 pub use identity::{DeviceId, DeviceLabel, NodeFingerprint};
 pub use join::{ArmState, JoinDecision, JoinStore, PendingJoin};

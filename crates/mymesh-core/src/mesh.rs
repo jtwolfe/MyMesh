@@ -25,6 +25,13 @@ pub struct MeshState {
     /// Monotonic generation bumped on local roster changes (for dirty sync).
     #[serde(default)]
     pub roster_generation: u64,
+    /// Optional mirror of live MMK fingerprint (set on `mesh init` / unlock paths).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mrk_fingerprint: Option<String>,
+    /// Device that ran `mesh init` (creator). Host-local admin on that node;
+    /// remote Admin still requires explicit grant or MRK proof (KD15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator_device_id: Option<DeviceId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -43,6 +50,8 @@ impl MeshState {
             last_sync: None,
             last_kick_notice: None,
             roster_generation: 0,
+            mrk_fingerprint: None,
+            creator_device_id: None,
         }
     }
 
