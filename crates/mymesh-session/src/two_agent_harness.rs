@@ -439,7 +439,8 @@ mod tests {
         };
 
         let (host_res, guest_res, _confirm_res) = tokio::join!(host_fut, guest_fut, confirm_fut);
-        host_res.expect("host join");
+        let outcome = host_res.expect("host join");
+        assert_eq!(outcome, crate::JoinHostOutcome::MemberAccepted);
         let (host_rec, store_b) = guest_res.expect("guest join");
         assert_eq!(host_rec.trust, TrustState::Trusted);
         assert!(store_b.is_trusted(&peer_a));

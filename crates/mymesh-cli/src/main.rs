@@ -1074,6 +1074,12 @@ pub(crate) async fn cmd_arm(
         if !g.is_active(chrono::Utc::now()) {
             bail!("grant {gid} is revoked or expired");
         }
+        if g.capabilities.is_empty() {
+            bail!("grant {gid} has no capabilities");
+        }
+        if g.capabilities.contains(&Capability::Admin) {
+            bail!("Admin is not allowed on guest grants");
+        }
         let identity = Identity::load_or_create(paths.identity_file())?;
         let local = identity.device_id();
         if !g.covers_object(&local) {

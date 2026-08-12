@@ -97,7 +97,8 @@ pub async fn run_join_as_guest(
                 mat.extend_from_slice(host_label.as_bytes());
                 mat.extend_from_slice(b"mymesh-join-accept-v1");
                 pub_id.verify(&mat, &signature)?;
-                // Role finalized when membership arrives (member) or on close without it (guest).
+                // Provisional Guest until MembershipSnapshot upgrades to Member
+                // (crash between accept and finalize must not leave wrong Member role).
                 let rec = DeviceRecord {
                     id: host_id,
                     label: DeviceLabel::new(host_label),
@@ -113,7 +114,7 @@ pub async fn run_join_as_guest(
 
                     aliases: Vec::new(),
                     groups: Vec::new(),
-                    mesh_role: MeshRole::Member,
+                    mesh_role: MeshRole::Guest,
                 };
                 store.upsert(rec.clone())?;
                 host_rec = Some(rec);
@@ -138,15 +139,18 @@ pub async fn run_join_as_guest(
                 info!(added = n, "applied mesh membership from join host");
                 got_membership = true;
                 if let Some(rec) = host_rec {
-                    // Ensure host stays Member after full roster handoff.
+                    // Full roster handoff ⇒ member bilateral role for host.
                     if let Some(mut r) = store.get(&rec.id).cloned() {
                         r.mesh_role = MeshRole::Member;
                         store.upsert(r.clone())?;
                         let _ = conn.close().await;
                         return Ok(r);
                     }
+                    let mut r = rec;
+                    r.mesh_role = MeshRole::Member;
+                    store.upsert(r.clone())?;
                     let _ = conn.close().await;
-                    return Ok(rec);
+                    return Ok(r);
                 }
             }
             ControlMessage::JoinDeny { reason } => {
@@ -167,7 +171,8 @@ pub async fn run_join_as_guest(
     }
 }
 
-/// Finalize joiner's host DeviceRecord: no MembershipSnapshot ⇒ guest bilateral (GUEST.md).
+/// Finalize joiner's host DeviceRecord after accept.
+/// Host is already Guest on JoinAccept; MembershipSnapshot upgrades to Member.
 fn finish_joiner_host_rec(
     store: &mut DeviceStore,
     host_rec: Option<DeviceRecord>,
@@ -176,14 +181,26 @@ fn finish_joiner_host_rec(
     let Some(rec) = host_rec else {
         return Ok(None);
     };
-    if got_membership {
-        return Ok(Some(rec));
-    }
     let mut r = store.get(&rec.id).cloned().unwrap_or(rec);
-    r.mesh_role = MeshRole::Guest;
+    r.mesh_role = if got_membership {
+        MeshRole::Member
+    } else {
+        MeshRole::Guest
+    };
     r.trust = TrustState::Trusted;
     store.upsert(r.clone())?;
     Ok(Some(r))
+}
+
+/// Outcome of a host-side join attempt (for mesh dirty / gossip side-effects).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinHostOutcome {
+    /// Denied, not armed, protocol error handled, or no accept.
+    Noop,
+    /// Full member accepted (roster may need gossip).
+    MemberAccepted,
+    /// Guest accepted bilaterally (local DeviceStore only; no mesh dirty).
+    GuestAccepted,
 }
 
 /// Host agent: handle a join from an untrusted peer while armed.
@@ -204,7 +221,7 @@ pub async fn handle_join_as_host(
     mesh_path: &Path,
     arm_timeout_hint: u64,
     pair_sessions_dir: Option<&Path>,
-) -> Result<()> {
+) -> Result<JoinHostOutcome> {
     // Derive grants path next to devices (data_dir/devices.json → data_dir/grants.json).
     let grants_path = devices_path
         .parent()
@@ -238,7 +255,7 @@ pub async fn handle_join_as_host_with_grants(
     mesh_path: &Path,
     arm_timeout_hint: u64,
     pair_sessions_dir: Option<&Path>,
-) -> Result<()> {
+) -> Result<JoinHostOutcome> {
     let peer = conn.peer_id();
     let arm = ArmState::load(arm_path)?;
     if !arm.is_effectively_armed() {
@@ -253,9 +270,8 @@ pub async fn handle_join_as_host_with_grants(
             })
             .await;
         let _ = conn.close().await;
-        return Ok(());
+        return Ok(JoinHostOutcome::Noop);
     }
-    let guest_grant_id = arm.guest_grant_id.clone();
 
     let frame = conn.recv_frame().await?;
     let msg: ControlMessage = decode_msg(&frame.payload)?;
@@ -285,7 +301,7 @@ pub async fn handle_join_as_host_with_grants(
                 })
                 .await;
             let _ = conn.close().await;
-            return Ok(());
+            return Ok(JoinHostOutcome::Noop);
         }
     };
 
@@ -300,7 +316,7 @@ pub async fn handle_join_as_host_with_grants(
             })
             .await;
         let _ = conn.close().await;
-        return Ok(());
+        return Ok(JoinHostOutcome::Noop);
     }
 
     let material = sign_material(&joiner_id, &joiner_label, ts);
@@ -317,7 +333,7 @@ pub async fn handle_join_as_host_with_grants(
             })
             .await;
         let _ = conn.close().await;
-        return Ok(());
+        return Ok(JoinHostOutcome::Noop);
     }
 
     let now = Utc::now().timestamp();
@@ -332,7 +348,7 @@ pub async fn handle_join_as_host_with_grants(
             })
             .await;
         let _ = conn.close().await;
-        return Ok(());
+        return Ok(JoinHostOutcome::Noop);
     }
 
     let joins = JoinStore::open(join_dir)?;
@@ -399,6 +415,10 @@ pub async fn handle_join_as_host_with_grants(
             let mut store = DeviceStore::open(devices_path)?;
             let host_id = identity.device_id();
 
+            // Re-load arm so mid-pending re-arm (member ↔ guest / grant id) is honored.
+            let arm_now = ArmState::load(arm_path)?;
+            let guest_grant_id = arm_now.guest_grant_id.clone();
+
             // Guest path: arm bound to grant → bilateral Guest, no full roster.
             let guest_grant = if let Some(ref gid) = guest_grant_id {
                 match resolve_guest_grant_for_accept(
@@ -421,7 +441,7 @@ pub async fn handle_join_as_host_with_grants(
                             })
                             .await;
                         let _ = conn.close().await;
-                        return Ok(());
+                        return Ok(JoinHostOutcome::Noop);
                     }
                 }
             } else {
@@ -481,13 +501,14 @@ pub async fn handle_join_as_host_with_grants(
             })
             .await?;
 
-            if guest_grant.is_some() {
+            let outcome = if guest_grant.is_some() {
                 // Skip MembershipSnapshot — guests must not receive mesh roster.
                 ArmState::disarm(arm_path)?;
                 info!(
                     peer = %joiner_id.short(),
                     "guest join accepted (no membership snapshot); disarmed"
                 );
+                JoinHostOutcome::GuestAccepted
             } else {
                 // Full roster of members only (guests already filtered in build_snapshot).
                 let snap = build_snapshot(identity, label, &store, &mesh, 0);
@@ -498,10 +519,11 @@ pub async fn handle_join_as_host_with_grants(
                 .await?;
                 ArmState::disarm(arm_path)?;
                 info!(peer = %joiner_id.short(), "join accepted + membership shared; disarmed");
-            }
+                JoinHostOutcome::MemberAccepted
+            };
             tokio::time::sleep(Duration::from_millis(800)).await;
             let _ = conn.close().await;
-            Ok(())
+            Ok(outcome)
         }
         JoinDecision::Deny { reason } => {
             joins.clear_pending(&joiner_id)?;
@@ -512,7 +534,7 @@ pub async fn handle_join_as_host_with_grants(
             .await?;
             tokio::time::sleep(Duration::from_millis(300)).await;
             let _ = conn.close().await;
-            Ok(())
+            Ok(JoinHostOutcome::Noop)
         }
     }
 }
@@ -840,7 +862,7 @@ mod tests {
         };
 
         let (host_res, guest_res, _) = tokio::join!(host_fut, guest_fut, accept_fut);
-        host_res.expect("host");
+        assert_eq!(host_res.expect("host"), JoinHostOutcome::GuestAccepted);
         let (host_rec, store_g) = guest_res.expect("guest");
 
         // Guest only knows object host, as Guest role bilateral
@@ -882,6 +904,15 @@ mod tests {
         assert!(members
             .iter()
             .any(|m| m.id == DeviceId::from_bytes([0xee; 32])));
+
+        // Session-open path must not send mesh gossip to guests either (GUEST.md).
+        assert!(
+            !crate::mesh_sync::peer_receives_mesh_gossip(&store_h, &guest_id),
+            "guest peer must not receive session-open MembershipSnapshot"
+        );
+        assert!(!crate::mesh_sync::peer_may_mutate_grants(
+            &store_h, &guest_id
+        ));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1014,7 +1045,7 @@ mod tests {
         };
 
         let (host_res, join_res, _) = tokio::join!(host_fut, guest_fut, accept_fut);
-        host_res.expect("host");
+        assert_eq!(host_res.expect("host"), JoinHostOutcome::MemberAccepted);
         let (host_rec, store_j) = join_res.expect("joiner");
         assert_eq!(host_rec.mesh_role, MeshRole::Member);
         // Joiner learned host + peer-ab, not guest-cd
@@ -1042,6 +1073,169 @@ mod tests {
 
         let store_h = DeviceStore::open(host_data.join("devices.json")).unwrap();
         assert_eq!(store_h.get(&join_id).unwrap().mesh_role, MeshRole::Member);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Session-open path: after handshake, host must not push MembershipSnapshot to guests
+    /// (mirrors agent `handle_session` gate via `peer_receives_mesh_gossip`).
+    #[tokio::test]
+    async fn session_open_skips_snapshot_for_guest_peer() {
+        use crate::mesh_sync::{build_snapshot, peer_receives_mesh_gossip};
+        use crate::session::Session;
+        use mymesh_protocol::{encode_msg, ChannelId, Frame};
+
+        let root = tmp_root("session-guest");
+        let host_data = root.join("host");
+        let guest_data = root.join("guest");
+        std::fs::create_dir_all(&host_data).unwrap();
+        std::fs::create_dir_all(&guest_data).unwrap();
+
+        let id_host = Identity::generate();
+        let id_guest = Identity::generate();
+        let host_id = id_host.device_id();
+        let guest_id = id_guest.device_id();
+
+        let mesh_path = host_data.join("mesh.json");
+        MeshState::new_mesh().save(&mesh_path).unwrap();
+        let mesh = MeshState::load(&mesh_path).unwrap();
+
+        let mut store_h = DeviceStore::open(host_data.join("devices.json")).unwrap();
+        store_h
+            .upsert(DeviceRecord {
+                id: DeviceId::from_bytes([0xee; 32]),
+                label: DeviceLabel::new("secret-member"),
+                fingerprint: "fp-ee".into(),
+                capabilities: Capability::all(),
+                trust: TrustState::Trusted,
+                linked_at: Utc::now(),
+                last_seen: None,
+                endpoint_hint: None,
+                mesh_id: Some(mesh.mesh_id.clone()),
+                aliases: vec![],
+                groups: vec![],
+                mesh_role: MeshRole::Member,
+            })
+            .unwrap();
+        store_h
+            .upsert(DeviceRecord {
+                id: guest_id,
+                label: DeviceLabel::new("guest"),
+                fingerprint: "fp-g".into(),
+                capabilities: vec![Capability::Terminal],
+                trust: TrustState::Trusted,
+                linked_at: Utc::now(),
+                last_seen: None,
+                endpoint_hint: None,
+                mesh_id: Some(mesh.mesh_id.clone()),
+                aliases: vec![],
+                groups: vec![],
+                mesh_role: MeshRole::Guest,
+            })
+            .unwrap();
+
+        let mut store_g = DeviceStore::open(guest_data.join("devices.json")).unwrap();
+        store_g
+            .upsert(DeviceRecord {
+                id: host_id,
+                label: DeviceLabel::new("host"),
+                fingerprint: "fp-h".into(),
+                capabilities: Capability::all(),
+                trust: TrustState::Trusted,
+                linked_at: Utc::now(),
+                last_seen: None,
+                endpoint_hint: None,
+                mesh_id: None,
+                aliases: vec![],
+                groups: vec![],
+                mesh_role: MeshRole::Guest,
+            })
+            .unwrap();
+
+        let mut grants = GrantStore::open(host_data.join("grants.json")).unwrap();
+        grants
+            .create_guest(
+                mesh.mesh_id.clone(),
+                guest_id,
+                host_id,
+                vec![Capability::Terminal],
+                None,
+                IssuedBy::device(&host_id),
+            )
+            .unwrap();
+        let grants = GrantStore::open(host_data.join("grants.json")).unwrap();
+
+        assert!(!peer_receives_mesh_gossip(&store_h, &guest_id));
+
+        let fabric = LocalFabric::new();
+        let ep_host = fabric.endpoint(host_id);
+        let ep_guest = fabric.endpoint(guest_id);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_c = sent.clone();
+        let host_secret = id_host.to_secret_bytes();
+        let guest_secret = id_guest.to_secret_bytes();
+
+        let host_fut = async move {
+            let id = Identity::from_secret_bytes(host_secret);
+            let conn = ep_host.accept().await.unwrap();
+            let cap = CaptureConn {
+                inner: conn,
+                sent: sent_c,
+            };
+            let session = Session::handshake_acceptor_with_grants(
+                Box::new(cap),
+                &id,
+                "host",
+                &store_h,
+                Some(&grants),
+                vec![Capability::Terminal],
+            )
+            .await
+            .expect("handshake");
+            let peer = session.peer_id();
+            let conn = session.into_conn();
+            // Same gate as agent handle_session
+            if peer_receives_mesh_gossip(&store_h, &peer) {
+                let snap = build_snapshot(&id, "host", &store_h, &mesh, 0);
+                conn.send_frame(Frame {
+                    channel: ChannelId::control(),
+                    payload: encode_msg(&snap).unwrap(),
+                })
+                .await
+                .unwrap();
+            }
+            let _ = conn.close().await;
+        };
+
+        let guest_fut = async move {
+            let id = Identity::from_secret_bytes(guest_secret);
+            let conn = ep_guest.connect(host_id).await.unwrap();
+            Session::handshake_dialer_with_grants(
+                conn,
+                &id,
+                "guest",
+                &store_g,
+                None,
+                vec![Capability::Terminal],
+            )
+            .await
+            .expect("guest handshake");
+        };
+
+        let ((), ()) = tokio::join!(host_fut, guest_fut);
+        let msgs = sent.lock().unwrap().clone();
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, ControlMessage::MembershipSnapshot { .. })),
+            "session open must not send MembershipSnapshot to guest: {msgs:?}"
+        );
+        // HelloAck is expected
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, ControlMessage::HelloAck { .. })),
+            "expected HelloAck: {msgs:?}"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -340,6 +340,22 @@ pub fn bump_mesh_dirty(mesh_path: &Path, dirty_path: &Path) -> Result<()> {
 
 // --- Grant revoke / announce (GUEST.md / GRANTS.md wire) ---
 
+/// Peer may receive mesh-wide roster / kick gossip (Trusted **member** only).
+pub fn peer_receives_mesh_gossip(store: &DeviceStore, peer: &DeviceId) -> bool {
+    matches!(
+        store.get(peer),
+        Some(d) if d.trust == TrustState::Trusted && d.mesh_role == MeshRole::Member
+    )
+}
+
+/// Peer may sign/apply grant control messages (Trusted and not Guest — fail closed).
+pub fn peer_may_mutate_grants(store: &DeviceStore, peer: &DeviceId) -> bool {
+    matches!(
+        store.get(peer),
+        Some(d) if d.trust == TrustState::Trusted && d.mesh_role != MeshRole::Guest
+    )
+}
+
 pub fn grant_revoke_material(
     mesh_id: &str,
     grant_id: &str,
@@ -636,6 +652,36 @@ mod tests {
             }
             other => panic!("expected GrantRevoke, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn peer_gossip_and_grant_mutate_gates() {
+        let dir = temp_dir("gates");
+        let mut store = DeviceStore::open(dir.join("devices.json")).unwrap();
+        let member = trusted(0x61, "m", MeshRole::Member);
+        let guest = trusted(0x62, "g", MeshRole::Guest);
+        let mid = member.id;
+        let gid = guest.id;
+        store.upsert(member).unwrap();
+        store.upsert(guest).unwrap();
+
+        assert!(peer_receives_mesh_gossip(&store, &mid));
+        assert!(!peer_receives_mesh_gossip(&store, &gid));
+        assert!(!peer_receives_mesh_gossip(
+            &store,
+            &DeviceId::from_bytes([0x00; 32])
+        ));
+
+        assert!(peer_may_mutate_grants(&store, &mid));
+        assert!(
+            !peer_may_mutate_grants(&store, &gid),
+            "Trusted Guest must not mutate grants"
+        );
+        assert!(!peer_may_mutate_grants(
+            &store,
+            &DeviceId::from_bytes([0x00; 32])
+        ));
         let _ = std::fs::remove_dir_all(dir);
     }
 

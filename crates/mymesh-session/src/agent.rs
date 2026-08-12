@@ -216,7 +216,7 @@ impl Agent {
 
     async fn handle_join(&self, conn: Box<dyn mymesh_net::PeerConnection>) -> Result<()> {
         let identity = self.identity();
-        handle_join_as_host_with_grants(
+        let outcome = handle_join_as_host_with_grants(
             conn,
             &identity,
             &self.label,
@@ -229,8 +229,10 @@ impl Agent {
             Some(&self.pair_sessions_dir),
         )
         .await?;
-        // roster changed (member joins); guest joins stay local to object host
-        let _ = crate::mesh_sync::bump_mesh_dirty(&self.mesh_path, &self.mesh_dirty_path);
+        // Only full members change mesh-wide roster (guest joins stay local).
+        if matches!(outcome, crate::join::JoinHostOutcome::MemberAccepted) {
+            let _ = crate::mesh_sync::bump_mesh_dirty(&self.mesh_path, &self.mesh_dirty_path);
+        }
         Ok(())
     }
 
@@ -307,55 +309,61 @@ impl Agent {
         let mut active_put: Option<String> = None;
         let conn = session.into_conn();
 
-        // gossip roster + any pending kicks to this peer
-        if let Ok(mesh) = MeshState::load(&self.mesh_path) {
-            if let Ok(store) = self.store() {
-                let snap = build_snapshot(&identity, &self.label, &store, &mesh, 0);
-                let _ = conn
-                    .send_frame(Frame {
-                        channel: ChannelId::control(),
-                        payload: encode_msg(&snap)?,
-                    })
-                    .await;
+        // Mesh-wide roster / kick gossip is for full members only (GUEST.md).
+        // Guests are Trusted bilaterally but must never receive MembershipSnapshot.
+        let peer_gets_gossip = crate::mesh_sync::peer_receives_mesh_gossip(&store, &peer);
+        if peer_gets_gossip {
+            if let Ok(mesh) = MeshState::load(&self.mesh_path) {
+                if let Ok(store) = self.store() {
+                    let snap = build_snapshot(&identity, &self.label, &store, &mesh, 0);
+                    let _ = conn
+                        .send_frame(Frame {
+                            channel: ChannelId::control(),
+                            payload: encode_msg(&snap)?,
+                        })
+                        .await;
+                }
             }
         }
-        if let Ok(pk) = self.pending() {
-            for kick in pk.list() {
-                let ann = ControlMessage::KickAnnounce {
-                    mesh_id: kick.mesh_id.clone(),
-                    target_id: kick.target_id,
-                    target_label: kick.target_label.clone(),
-                    by_id: kick.by_id,
-                    by_label: kick.by_label.clone(),
-                    message: kick.message.clone(),
-                    ts: kick.ts,
-                    force: kick.force,
-                    expected: kick.expected.clone(),
-                    signature: kick.signature,
-                };
-                let _ = conn
-                    .send_frame(Frame {
-                        channel: ChannelId::control(),
-                        payload: encode_msg(&ann)?,
-                    })
-                    .await;
-                // if this peer IS the target, send notice
-                if kick.target_id == peer && !kick.delivered_to_target {
-                    let notice = ControlMessage::KickNotice {
+        if peer_gets_gossip {
+            if let Ok(pk) = self.pending() {
+                for kick in pk.list() {
+                    let ann = ControlMessage::KickAnnounce {
                         mesh_id: kick.mesh_id.clone(),
+                        target_id: kick.target_id,
+                        target_label: kick.target_label.clone(),
                         by_id: kick.by_id,
                         by_label: kick.by_label.clone(),
                         message: kick.message.clone(),
                         ts: kick.ts,
                         force: kick.force,
+                        expected: kick.expected.clone(),
                         signature: kick.signature,
                     };
                     let _ = conn
                         .send_frame(Frame {
                             channel: ChannelId::control(),
-                            payload: encode_msg(&notice)?,
+                            payload: encode_msg(&ann)?,
                         })
                         .await;
+                    // if this peer IS the target, send notice
+                    if kick.target_id == peer && !kick.delivered_to_target {
+                        let notice = ControlMessage::KickNotice {
+                            mesh_id: kick.mesh_id.clone(),
+                            by_id: kick.by_id,
+                            by_label: kick.by_label.clone(),
+                            message: kick.message.clone(),
+                            ts: kick.ts,
+                            force: kick.force,
+                            signature: kick.signature,
+                        };
+                        let _ = conn
+                            .send_frame(Frame {
+                                channel: ChannelId::control(),
+                                payload: encode_msg(&notice)?,
+                            })
+                            .await;
+                    }
                 }
             }
         }
@@ -734,9 +742,17 @@ impl Agent {
                 ts,
                 signature,
             } => {
-                // Accept revoke from trusted members only (fail closed).
+                // Trusted full members only — guests must not mutate grants (fail closed).
                 let store = self.store()?;
-                if !store.is_trusted(&by_id) || by_id != peer {
+                if !crate::mesh_sync::peer_may_mutate_grants(&store, &by_id) || by_id != peer {
+                    return Ok(());
+                }
+                let local_mesh = MeshState::load(&self.mesh_path)?;
+                if !mesh_id.is_empty() && mesh_id != local_mesh.mesh_id {
+                    return Ok(());
+                }
+                let now = chrono::Utc::now().timestamp();
+                if (now - ts).abs() > 3600 {
                     return Ok(());
                 }
                 if verify_grant_revoke(
@@ -783,7 +799,15 @@ impl Agent {
                 ..
             } => {
                 let store = self.store()?;
-                if !store.is_trusted(&by_id) || by_id != peer {
+                if !crate::mesh_sync::peer_may_mutate_grants(&store, &by_id) || by_id != peer {
+                    return Ok(());
+                }
+                let local_mesh = MeshState::load(&self.mesh_path)?;
+                if !mesh_id.is_empty() && mesh_id != local_mesh.mesh_id {
+                    return Ok(());
+                }
+                let now = chrono::Utc::now().timestamp();
+                if (now - ts).abs() > 3600 {
                     return Ok(());
                 }
                 if verify_grant_announce(
