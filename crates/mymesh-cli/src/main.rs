@@ -318,6 +318,9 @@ enum Commands {
         /// HTTP listen port (default 17878)
         #[arg(long, default_value_t = 17878)]
         port: u16,
+        /// Emit pair/v1 LAN QR instead of default v2 (compat escape; KD23/D5)
+        #[arg(long = "pair-v1")]
+        pair_v1: bool,
     },
     /// Pair v2 dual-scan + confirm-on-machine (no carrier process required)
     Pair {
@@ -901,7 +904,9 @@ async fn main() -> Result<()> {
             port,
             local,
         } => magic_cmd::cmd_expose(&paths, &device, port, local).await?,
-        Commands::Carrier { port } => magic_cmd::cmd_carrier(&paths, port).await?,
+        Commands::Carrier { port, pair_v1 } => {
+            magic_cmd::cmd_carrier(&paths, port, pair_v1).await?
+        }
         Commands::Pair { action } => match action {
             PairCmd::Dual {
                 join,

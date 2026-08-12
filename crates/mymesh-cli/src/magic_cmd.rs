@@ -375,7 +375,7 @@ pub async fn cmd_expose(
     }
 }
 
-pub async fn cmd_carrier(paths: &Paths, port: u16) -> Result<()> {
+pub async fn cmd_carrier(paths: &Paths, port: u16, pair_v1: bool) -> Result<()> {
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file())?;
     // clear pending
@@ -388,12 +388,26 @@ pub async fn cmd_carrier(paths: &Paths, port: u16) -> Result<()> {
         cfg.device_label.clone(),
         port,
         None,
+        pair_v1,
     )
     .await?;
 
+    let pair_prefix = if handle.pair_protocol_version == 1 {
+        "pair/v1"
+    } else {
+        "pair/v2"
+    };
     println!("{}", style("connect by carrier").bold());
-    println!("  pair API  {}/pair/v1", handle.host_base);
+    println!(
+        "  pair API  {}/{}  (QR v{})",
+        handle.host_base, pair_prefix, handle.pair_protocol_version
+    );
     println!("  page      {}  (deprecated HTML fallback)", handle.url);
+    if pair_v1 {
+        println!("  mode      pair/v1 LAN escape (--pair-v1)");
+    } else {
+        println!("  mode      pair/v2 default (use --pair-v1 for alpha.1 LAN QR)");
+    }
     println!();
     println!("  scan this QR with Carrier (same LAN):");
     println!("  {}", handle.pair_qr);
@@ -407,7 +421,9 @@ pub async fn cmd_carrier(paths: &Paths, port: u16) -> Result<()> {
     }
     println!();
     println!("Join path: other machine runs  mymesh link <this-host-id>");
-    println!("Phone approves via pair/v1 (JoinStore). HTML paste path still works as fallback.");
+    println!(
+        "Phone approves via {pair_prefix} (JoinStore). HTML paste path still works as fallback."
+    );
     println!("Waiting for join approval or phone paste… (Ctrl+C to cancel)");
 
     loop {
@@ -491,7 +507,8 @@ pub fn print_magic_help() {
   mymesh ssh-config         # print Host *.mym ProxyCommand block
   mymesh proxy-ssh <host>   # used by OpenSSH ProxyCommand
   mymesh expose <dev> <port> [--local N]
-  mymesh carrier            # connect-by-carrier (phone QR page)
+  mymesh carrier            # connect-by-carrier (default pair/v2 QR)
+  mymesh carrier --pair-v1  # escape: alpha.1 pair/v1 LAN QR
 
 Browser:
   export ALL_PROXY=socks5://127.0.0.1:18080
@@ -590,13 +607,15 @@ pub fn magic_status_text(paths: &Paths) -> Result<String> {
     ))
 }
 
-/// Start carrier HTTP + pair/v1; returns HTML page URL and pair QR deep link.
+/// Start carrier HTTP + default pair/v2 QR; returns HTML page URL and pair QR deep link.
+///
+/// TUI uses product default (v2). CLI escape: `mymesh carrier --pair-v1`.
 pub async fn start_carrier_ui(paths: &Paths, port: u16) -> Result<(String, String)> {
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file())?;
     let pend = carrier_pending_path(paths);
     let _ = std::fs::remove_file(&pend);
-    // Arm *before* start so bootstrap token in pair_qr matches arm.until
+    // Arm *before* start so bootstrap token / session TTL matches arm.until
     let _ = mymesh_core::ArmState::arm(paths.arm_file(), 900);
     let handle = start_carrier(
         paths.clone(),
@@ -604,6 +623,7 @@ pub async fn start_carrier_ui(paths: &Paths, port: u16) -> Result<(String, Strin
         cfg.device_label.clone(),
         port,
         None,
+        false, // default pair/v2 QR (D5)
     )
     .await?;
     Ok((handle.url, handle.pair_qr))

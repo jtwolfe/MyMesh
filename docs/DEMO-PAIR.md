@@ -187,19 +187,20 @@ Alpha.1 path still supported during migration. **Not** the Wave A product exit.
 # --- Host A ---
 mymesh serve &
 mymesh firewall ufw allow          # or firewalld / ufw 17878/tcp
-mymesh carrier                     # arms; prints pair API base + carrier://pair?v=1&… QR
+mymesh carrier                     # arms; prints pair API base + carrier://pair?v=2&… QR (default)
+# mymesh carrier --pair-v1         # escape: alpha.1 carrier://pair?v=1&… LAN QR
 
 # --- Joiner B ---
 mymesh link '<host-hex-or-words-or-uri>'
 
 # --- Phone ---
-# Unlock → Pair mesh join → paste/open v1 QR
+# Unlock → Pair mesh join → paste/open QR (v2 default; v1 if --pair-v1)
 # Wait for pending → verify words → Accept (L2)
 ```
 
 | Note | Detail |
 |------|--------|
-| Default QR from `mymesh carrier` | **v1** until D5; then v2 default with `--pair-v1` escape |
+| Default QR from `mymesh carrier` | **v2** (`ep=direct` + LAN `host`; PairSession armed). Escape: `--pair-v1` |
 | `mymesh pair dual` | Emits **v2** (post A3) |
 | Port | **17878** |
 

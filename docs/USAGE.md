@@ -119,23 +119,24 @@ mymesh pair status                  # optional
 
 **Honesty:** Carrier `mock-pair-host` is **lab-only** (not in this repo) — not a production pair path. See [DEMO-PAIR.md](DEMO-PAIR.md).
 
-### Connect-by-carrier (phone as scanner — v1 LAN helper)
+### Connect-by-carrier (phone as scanner — default pair/v2 QR)
 
-Phone must reach the **carrier HTTP page** on one machine (same LAN, or open carrier port carefully). Migration path; `mymesh carrier` still emits **v1** QR until D5. Prefer dual-scan + confirm above when possible.
+Phone must reach the **carrier pair API** on one machine (same LAN, or open carrier port carefully). Default bootstrap QR is **pair/v2** with LAN `host` + `ep=direct` (D5 / KD23). Prefer dual-scan + confirm above when phone cannot reach host HTTP.
 
 ```bash
 # Machine A
-mymesh carrier                      # prints URL + QR; page on :17878 by default
+mymesh carrier                      # default: pair/v2 QR + /pair/v2 (page on :17878)
+# mymesh carrier --pair-v1          # escape: alpha.1 pair/v1 LAN QR
 # scan QR with phone
 
 # Machine B
 mymesh id --uri                     # show URI/QR
-# paste/scan into phone page
+# paste/scan into phone page  (or: mymesh link <host-id>)
 
 # A completes join over iroh (not through the phone as a node)
 ```
 
-If the phone cannot load the page, check **host firewall** (see below). Carrier binds `0.0.0.0` so LAN clients can connect.
+If the phone cannot load the page / API, check **host firewall** (see below). Carrier binds `0.0.0.0` so LAN clients can connect.
 
 ### Optional: SPAKE + local mailbox
 

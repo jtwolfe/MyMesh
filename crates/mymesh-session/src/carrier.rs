@@ -4,6 +4,9 @@
 //! under `/pair/v1` (status / pending / decide), `/pair/v2`, and `/mesh/v1`
 //! (auth challenge + topology) using the same `Paths` as serve.
 //! PairSessionStore is source of truth for v2 (PAIR-V2.md).
+//!
+//! **Default bootstrap QR is pair/v2** (KD23 / D5) with LAN `host` + `ep=direct`.
+//! Pass `pair_v1: true` (`mymesh carrier --pair-v1`) for the alpha.1 LAN v1 QR escape.
 use axum::extract::{ConnectInfo, FromRequestParts, Query, State};
 use axum::http::{header, request::Parts, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
@@ -142,29 +145,49 @@ struct BootstrapPersist {
     until: DateTime<Utc>,
 }
 
+/// Default arm / pair-session TTL used when carrier starts (seconds).
+const CARRIER_ARM_TTL_SECS: u64 = 900;
+
 pub struct CarrierHandle {
     /// HTML page URL (deprecated fallback).
     pub url: String,
     pub bind: SocketAddr,
     /// Base `http://IP:port` for pair API (no trailing slash).
     pub host_base: String,
-    /// Bootstrap token (base64url, no padding).
+    /// Bootstrap token embedded in `pair_qr` (base64url, no padding).
+    ///
+    /// For default v2 this is the PairSessionStore arm token; for `--pair-v1`
+    /// it is the arm-scoped v1 bootstrap secret.
     pub bootstrap_token: String,
-    /// Deep link: `carrier://pair?v=1&host=…&token=…&fp=…&mesh?…`
+    /// Deep link for phone scan.
+    ///
+    /// Default (D5 / KD23): `carrier://pair?v=2&sid&did&token&nonce&fp&ep=direct&host&mesh?`
+    /// Escape (`pair_v1`): `carrier://pair?v=1&host&token&fp&mesh?`
     pub pair_qr: String,
+    /// Protocol version of `pair_qr` (`1` or `2`).
+    pub pair_protocol_version: u32,
 }
 
+/// Start carrier HTTP facade + emit bootstrap QR.
+///
+/// * `pair_v1 == false` (default product path): mint a **pair/v2** PairSession
+///   (`ep=direct`) and print a v2 QR that includes LAN `host`.
+/// * `pair_v1 == true` (`mymesh carrier --pair-v1`): emit alpha.1 **v1** LAN QR
+///   using the arm-scoped bootstrap token (escape hatch during compat window).
+///
+/// `/pair/v1/*` and `/pair/v2/*` endpoints are both served regardless of QR version.
 pub async fn start_carrier(
     paths: Paths,
     identity: Identity,
     label: String,
     port: u16,
     lan_ip: Option<String>,
+    pair_v1: bool,
 ) -> anyhow::Result<CarrierHandle> {
     paths.ensure()?;
-    // Arm window gives bootstrap token its TTL (PAIR-HTTP.md).
+    // Arm window gives bootstrap / session its TTL (PAIR-HTTP.md / PAIR-V2.md).
     if !ArmState::load(paths.arm_file())?.is_effectively_armed() {
-        let _ = ArmState::arm(paths.arm_file(), 900);
+        let _ = ArmState::arm(paths.arm_file(), CARRIER_ARM_TTL_SECS);
     }
 
     let bootstrap = Arc::new(Mutex::new(None));
@@ -180,8 +203,9 @@ pub async fn start_carrier(
         rate_limits: rate_limits.clone(),
     };
 
-    // Mint arm-scoped token so QR is valid immediately.
-    let token_b64 = {
+    // Always keep arm-scoped v1 bootstrap in sync so /pair/v1/* stays usable
+    // during the compat window (even when the printed QR is v2).
+    let v1_token_b64 = {
         let mut guard = st.bootstrap.lock().await;
         ensure_bootstrap_locked(&st.paths, &mut guard)?
     };
@@ -197,8 +221,45 @@ pub async fn start_carrier(
     let id = identity.device_id();
     let fp = NodeFingerprint::from_device_id(&id).as_str().to_string();
     let mesh_id = MeshState::load(paths.mesh_file())?.mesh_id;
-    let pair_qr = build_pair_qr(&host_base, &token_b64, &fp, Some(&mesh_id));
-    info!(%url, %host_base, "carrier + pair/v1 + mesh/v1 listening");
+
+    let (pair_qr, bootstrap_token, pair_protocol_version) = if pair_v1 {
+        (
+            build_pair_qr(&host_base, &v1_token_b64, &fp, Some(&mesh_id)),
+            v1_token_b64,
+            1u32,
+        )
+    } else {
+        // Default (D5): PairSession + v2 QR with direct LAN host.
+        let store = PairSessionStore::open(paths.pair_sessions_dir())?;
+        let armed = store.arm_new(
+            mesh_id.clone(),
+            id,
+            CARRIER_ARM_TTL_SECS,
+            PairEndpointClass::Direct,
+        )?;
+        let token_b64 = URL_SAFE_NO_PAD.encode(armed.token_raw);
+        let did = id.to_string();
+        let qr = build_pair_qr_v2(&PairQrV2Params {
+            sid: &armed.session.sid,
+            did: &did,
+            token: &token_b64,
+            nonce: &armed.session.nonce,
+            fp: &fp,
+            mesh: Some(&mesh_id),
+            host: Some(host_base.as_str()),
+            ep: Some(PairEndpointClass::Direct),
+            relay: None,
+            tlspin: None,
+        });
+        (qr, token_b64, 2u32)
+    };
+
+    info!(
+        %url,
+        %host_base,
+        pair_v = pair_protocol_version,
+        "carrier + pair/v1 + pair/v2 + mesh/v1 listening"
+    );
 
     tokio::spawn(async move {
         // ConnectInfo peer IP for S9 IP-scoped rate limits (not client-spoofable XFF).
@@ -216,8 +277,9 @@ pub async fn start_carrier(
         url,
         bind: actual,
         host_base,
-        bootstrap_token: token_b64,
+        bootstrap_token,
         pair_qr,
+        pair_protocol_version,
     })
 }
 
@@ -235,11 +297,11 @@ fn build_router(st: CarrierState) -> Router {
         .route("/api/status", get(api_status))
         .route("/api/peer", post(api_peer))
         .route("/api/local", get(api_local))
-        // pair/v1 machine API (compat through D5)
+        // pair/v1 machine API (compat window; QR escape via --pair-v1)
         .route("/pair/v1/status", get(pair_status))
         .route("/pair/v1/pending", get(pair_pending))
         .route("/pair/v1/decide", post(pair_decide))
-        // pair/v2 control plane (PairSessionStore)
+        // pair/v2 control plane (PairSessionStore; default QR after D5)
         .route("/pair/v2/status", get(pair_v2_status))
         .route("/pair/v2/pending", get(pair_v2_pending))
         .route("/pair/v2/decide", post(pair_v2_decide))
@@ -1806,6 +1868,84 @@ mod tests {
         assert!(qr.contains("token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
         assert!(qr.contains("fp=a1b2-c3d4-e5f6-7890-abcd-ef01-2345-6789"));
         assert!(qr.contains("mesh=550e8400-e29b-41d4-a716-446655440000"));
+    }
+
+    /// D5 / KD23: `start_carrier` default bootstrap QR is v2 with direct LAN host.
+    #[tokio::test]
+    async fn start_carrier_default_pair_qr_is_v2() {
+        let paths = tmp_paths();
+        let secret = [0xABu8; 32];
+        let expected_did = Identity::from_secret_bytes(secret).device_id();
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+
+        let handle = start_carrier(
+            paths.clone(),
+            Identity::from_secret_bytes(secret),
+            "host".into(),
+            0, // ephemeral port
+            Some("127.0.0.1".into()),
+            false, // default product path
+        )
+        .await
+        .expect("start_carrier");
+
+        assert_eq!(handle.pair_protocol_version, 2);
+        assert!(
+            handle.pair_qr.starts_with("carrier://pair?v=2&"),
+            "default QR must be v2: {}",
+            handle.pair_qr
+        );
+        assert!(handle.pair_qr.contains("nonce="));
+        assert!(handle.pair_qr.contains("sid="));
+        assert!(handle.pair_qr.contains("did="));
+        assert!(handle.pair_qr.contains("ep=direct"));
+        assert!(handle.pair_qr.contains("host="));
+        assert!(handle.pair_qr.contains(&format!("token={}", handle.bootstrap_token)));
+
+        // PairSession was armed and is findable by the QR token.
+        let store = PairSessionStore::open(paths.pair_sessions_dir()).unwrap();
+        let raw = URL_SAFE_NO_PAD
+            .decode(handle.bootstrap_token.as_bytes())
+            .unwrap();
+        let mut tok = [0u8; 32];
+        tok.copy_from_slice(&raw);
+        let sess = store
+            .find_by_token_raw(&tok)
+            .unwrap()
+            .expect("session for QR token");
+        assert_eq!(sess.resident_device_id, expected_did);
+        assert_eq!(sess.ep, PairEndpointClass::Direct);
+        assert!(handle.pair_qr.contains(&format!("sid={}", sess.sid)));
+    }
+
+    /// D5 escape hatch: `--pair-v1` still emits alpha.1 LAN QR.
+    #[tokio::test]
+    async fn start_carrier_pair_v1_escape_emits_v1_qr() {
+        let paths = tmp_paths();
+        let secret = [0xCDu8; 32];
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+
+        let handle = start_carrier(
+            paths,
+            Identity::from_secret_bytes(secret),
+            "host".into(),
+            0,
+            Some("192.168.1.10".into()),
+            true, // --pair-v1
+        )
+        .await
+        .expect("start_carrier pair_v1");
+
+        assert_eq!(handle.pair_protocol_version, 1);
+        assert!(
+            handle.pair_qr.starts_with("carrier://pair?v=1&"),
+            "escape QR must be v1: {}",
+            handle.pair_qr
+        );
+        assert!(!handle.pair_qr.contains("nonce="));
+        assert!(!handle.pair_qr.contains("sid="));
+        assert!(handle.pair_qr.contains("host=http%3A%2F%2F192.168.1.10%3A"));
+        assert!(handle.pair_qr.contains(&format!("token={}", handle.bootstrap_token)));
     }
 
     #[test]

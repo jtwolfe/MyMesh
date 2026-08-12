@@ -1138,7 +1138,7 @@ Metrics dir: extend MyMesh `paths.metrics_dir` JSON counters (existing metrics p
 3. Persistent Carrier audit log redacted.
 4. Runbooks: lost phone; lost MMK; compromised guest; MMK leak rotate; restore owner from sealed backup — MyMesh ops: **[RECOVERY.md](RECOVERY.md)** (B7-m).
 5. mock-pair-host lab-only; DEMO-PAIR real MyMesh dual-scan+confirm — see [DEMO-PAIR.md](DEMO-PAIR.md).
-6. **QR default policy (single KD):** After A3, `mymesh pair dual` emits **v2**. `mymesh carrier` (single-host LAN helper) continues **v1** until **D5**, then v2 default with `--pair-v1` escape.
+6. **QR default policy (single KD):** After A3, `mymesh pair dual` emits **v2**. After **D5**, `mymesh carrier` also defaults to **v2** (LAN `host` + `ep=direct`); `--pair-v1` remains the alpha.1 LAN escape.
 7. **Relay (KD31):** Optional Class C is **self-hosted only** if ever implemented; not a product deliverable in Waves A–E. No public MyMesh pair relay.
 
 ### S9 control checklist (threat → control id)
@@ -1547,7 +1547,7 @@ Each PR mergeable; MyMesh-only for trust mutations; dependency-correct.
 | **D2** | MyMesh | `pair: optional TLS pin / harden` | S9 | A3 |
 | **D3** | carrier | `audit persistent + TLS pin client` | S9 | D2 |
 | **D4** | both | `docs SECURITY/THREATS + control checklist C1–C7` | S9 | — |
-| **D5** | MyMesh | `carrier default QR v2; --pair-v1 escape` | KD23 complete | A3, D4 |
+| **D5** | MyMesh | `carrier default QR v2; --pair-v1 escape` | KD23 complete (**done**) | A3, D4 |
 
 ### Wave E — Multi-id + continuity
 
@@ -1589,8 +1589,8 @@ Do **not** claim multi-id/continuity until Wave E exit. Do **not** claim dual au
 |-------|--------|
 | v1 QR host required | Accepted through Wave B+ |
 | v2 without host | `pair dual` after A3 (KD23) |
-| `/pair/v1/*` | Until D5; then `--pair-v1` |
-| carrier process | Optional facade; serve owns state |
+| `/pair/v1/*` | Compat endpoints remain; QR via `--pair-v1` after D5 |
+| carrier process | Optional facade; serve owns state; **default QR v2** after D5 |
 | Admin on upgrade | Not auto-granted; host-local CLI + mesh init Admin on creator |
 | JoinStore | Still SoT for accept/deny outcomes |
 | Full snapshot on member accept | Unchanged; guest path diverges S5 |
