@@ -626,9 +626,12 @@ enum PairCmd {
         /// Resident device id / words (required with --join)
         #[arg(long, value_name = "DEVICE")]
         resident: Option<String>,
-        /// Optional direct host base URL for ep=direct (`http://ip:port`)
+        /// Optional direct host base URL for ep=direct (`http://ip:port` or `https://…`)
         #[arg(long)]
         host: Option<String>,
+        /// Optional TLS SPKI pin (`sha256/<base64>`) for direct HTTPS host (requires `--host https://…`)
+        #[arg(long, value_name = "PIN")]
+        tlspin: Option<String>,
         /// Arm / session TTL seconds (default: config arm_timeout_secs)
         #[arg(long)]
         ttl: Option<u64>,
@@ -889,6 +892,7 @@ async fn main() -> Result<()> {
                 join,
                 resident,
                 host,
+                tlspin,
                 ttl,
             } => {
                 if join {
@@ -897,7 +901,7 @@ async fn main() -> Result<()> {
                     })?;
                     pair_cmd::cmd_pair_dual_join(&paths, &r).await?
                 } else {
-                    pair_cmd::cmd_pair_dual(&paths, host, ttl).await?
+                    pair_cmd::cmd_pair_dual(&paths, host, ttl, tlspin).await?
                 }
             }
             PairCmd::Confirm { code, sid, joiner } => {

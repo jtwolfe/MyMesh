@@ -12,6 +12,7 @@ mod metrics;
 mod pair_confirm;
 mod pair_session;
 mod paths;
+mod tls_pin;
 
 pub use config::{Config, DaemonConfig, Limits, MagicConfig};
 pub use device::{
@@ -42,3 +43,8 @@ pub use pair_session::{
     PairConfirmError, PairEndpointClass, PairPhase, PairSessionFile, PairSessionStore,
 };
 pub use paths::Paths;
+pub use tls_pin::{
+    check_direct_host_tls_pin, host_is_http_cleartext, host_is_https, parse_tls_pin,
+    require_https_when_pinned, verify_tls_pin, verify_tls_pin_str, TlsPin, TlsPinError,
+    TLS_PIN_SHA256_LEN, TLS_PIN_SHA256_PREFIX,
+};

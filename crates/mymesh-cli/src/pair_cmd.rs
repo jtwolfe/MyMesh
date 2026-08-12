@@ -1,7 +1,7 @@
 //! Pair v2 CLI: dual-scan + confirm-on-machine (PAIR-V2.md / A3b+A5).
 //!
 //! ```text
-//! mymesh pair dual [--host <url>] [--ttl N]
+//! mymesh pair dual [--host <url>] [--tlspin sha256/…] [--ttl N]
 //! mymesh pair dual --join --resident <id|words>
 //! mymesh pair confirm <code> [--sid] [--joiner]
 //! mymesh pair status [--sid]
@@ -12,21 +12,36 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use console::style;
 use mymesh_core::{
-    apply_pair_confirm, ArmState, Config, JoinDecision, JoinStore, MeshState, NodeFingerprint,
-    PairEndpointClass, PairPhase, PairSessionStore, Paths,
+    apply_pair_confirm, parse_tls_pin, ArmState, Config, JoinDecision, JoinStore, MeshState,
+    NodeFingerprint, PairEndpointClass, PairPhase, PairSessionStore, Paths,
 };
 use mymesh_crypto::{parse_device_id, Identity};
-use mymesh_session::{build_pair_qr_v2, run_join_as_guest, PairQrV2Params};
+use mymesh_session::{build_pair_qr_v2_checked, run_join_as_guest, PairQrV2Params};
 use qrcode::QrCode;
 
 use crate::mesh_conn;
 
 /// Resident: arm join window, mint PairSession, print QR_A v2 (required nonce).
-pub async fn cmd_pair_dual(paths: &Paths, host: Option<String>, ttl: Option<u64>) -> Result<()> {
+///
+/// Optional `--tlspin` (SPKI pin) requires `--host https://…` (fail closed).
+pub async fn cmd_pair_dual(
+    paths: &Paths,
+    host: Option<String>,
+    ttl: Option<u64>,
+    tlspin: Option<String>,
+) -> Result<()> {
     paths.ensure()?;
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file()).unwrap_or_default();
     let ttl = ttl.unwrap_or(cfg.limits.arm_timeout_secs);
+
+    // Validate pin early (format + HTTPS policy) before arming.
+    let pin_wire = if let Some(raw) = tlspin.as_deref() {
+        let pin = parse_tls_pin(raw).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Some(pin.to_wire())
+    } else {
+        None
+    };
 
     // Arm join window so serve accepts JoinRequest.
     let arm = ArmState::arm(paths.arm_file(), ttl)?;
@@ -38,14 +53,19 @@ pub async fn cmd_pair_dual(paths: &Paths, host: Option<String>, ttl: Option<u64>
     } else {
         PairEndpointClass::Confirm
     };
-    let armed = store.arm_new(mesh.mesh_id.clone(), identity.device_id(), ttl, ep)?;
+    let mut armed = store.arm_new(mesh.mesh_id.clone(), identity.device_id(), ttl, ep)?;
+
+    if let Some(ref pin) = pin_wire {
+        armed.session.tls_pin = Some(pin.clone());
+        store.save(&armed.session)?;
+    }
 
     let token_b64 = URL_SAFE_NO_PAD.encode(armed.token_raw);
     let did = identity.device_id().to_string();
     let fp = NodeFingerprint::from_device_id(&identity.device_id())
         .as_str()
         .to_string();
-    let qr = build_pair_qr_v2(&PairQrV2Params {
+    let qr = build_pair_qr_v2_checked(&PairQrV2Params {
         sid: &armed.session.sid,
         did: &did,
         token: &token_b64,
@@ -55,7 +75,9 @@ pub async fn cmd_pair_dual(paths: &Paths, host: Option<String>, ttl: Option<u64>
         host: host.as_deref(),
         ep: Some(ep),
         relay: None,
-    });
+        tlspin: pin_wire.as_deref(),
+    })
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     println!("{}", style("pair dual — resident QR_A (v2)").bold());
     println!("  sid     {}", armed.session.sid);
@@ -70,6 +92,9 @@ pub async fn cmd_pair_dual(paths: &Paths, host: Option<String>, ttl: Option<u64>
         println!(
             "  mode    confirm-on-machine (no host) — after joiner dials: mymesh pair confirm <code>"
         );
+    }
+    if let Some(ref pin) = pin_wire {
+        println!("  tlspin  {pin}");
     }
     println!();
     println!("  {}", qr);
@@ -225,6 +250,9 @@ pub async fn cmd_pair_status(paths: &Paths, sid: Option<String>) -> Result<()> {
         println!("  joiner    (not bound)");
     }
     println!("  confirm   consumed={}", sess.confirm_consumed);
+    if let Some(pin) = &sess.tls_pin {
+        println!("  tlspin    {pin}");
+    }
     if let Some(d) = &sess.decision {
         println!("  decision  {d:?}");
     }
@@ -261,7 +289,7 @@ pub async fn cmd_pair_retry(paths: &Paths, sid: Option<String>) -> Result<()> {
         );
     }
     // Fresh dual arm (confirm ep, no host).
-    cmd_pair_dual(paths, None, None).await
+    cmd_pair_dual(paths, None, None, None).await
 }
 
 fn percent_encode(s: &str) -> String {

@@ -42,6 +42,7 @@ carrier://pair?v=2&sid=<ulid>&did=<64hex>&token=<b64url>&nonce=<b64url-16B>&fp=<
                  &host=<optional>
                  &mesh=<optional>
                  &relay=<optional>
+                 &tlspin=<optional>   # S9 / D2 — SPKI pin when host is HTTPS
 ```
 
 ### Parse rules (normative)
@@ -54,6 +55,38 @@ carrier://pair?v=2&sid=<ulid>&did=<64hex>&token=<b64url>&nonce=<b64url-16B>&fp=<
 - Do **not** fail parse when host absent on v2.
 - **Do** fail parse when v2 `nonce` missing or malformed (KD27).
 - `relay` / `ep=relay`: **not Wave A** product path; self-host only if ever (KD31).
+- `tlspin` is **optional**. When present: see [TLS pin (`tlspin`)](#tls-pin-tlspin) — pin requires `https://` host; clients **fail closed** on pin mismatch.
+
+### TLS pin (`tlspin`)
+
+Optional certificate pin for **direct** HTTPS pair hosts (S9 / PR D2). Release cleartext policy is **unchanged**: Carrier release already denies cleartext HTTP; MyMesh LAN lab may still emit `http://` host **without** a pin.
+
+| Topic | Normative |
+|-------|-----------|
+| Wire | `tlspin=sha256/<base64>` query param on v2 QR |
+| Digest | **SHA-256** over the DER-encoded **SubjectPublicKeyInfo (SPKI)** of the leaf (or pinned) certificate |
+| Base64 | Standard Base64 **or** base64url; padding optional. Emitters SHOULD use **base64url no padding** (URL-safe) |
+| Prefix | Case-sensitive algorithm label `sha256/` (accept `SHA256/` on parse) |
+| Host | When `tlspin` is present, `host` **must** be `https://…`. Pin + cleartext / missing host → **fail closed** at emit and at client |
+| Client | Before sending the bootstrap Bearer token on direct ep, verify peer SPKI against pin; **mismatch → abort** (do not send token) |
+| Absent pin | No SPKI check; behaviour unchanged (TOFU `fp` still applies for host identity) |
+| Lab HTTP | `http://` host without pin remains valid for debug / LAN alpha |
+
+```text
+# Example (synthetic)
+tlspin=sha256/AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-abcde
+
+# Android Network Security Config style also accepted on parse:
+tlspin=sha256/AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/abcde=
+```
+
+**CLI (resident):**
+
+```bash
+mymesh pair dual --host https://pair.example:8443 --tlspin 'sha256/<base64…>'
+```
+
+**MyMesh helpers:** `mymesh_core::{parse_tls_pin, verify_tls_pin, check_direct_host_tls_pin}` — Carrier D3 wires the verify hook into the pair HTTP client TLS stack.
 
 ### Deprecation of required `host`
 
@@ -88,6 +121,7 @@ pub struct PairBootstrapV2 {
     pub host: Option<String>,      // OPTIONAL direct hint
     pub ep: PairEndpointClass,     // direct | confirm | relay
     pub relay: Option<String>,
+    pub tlspin: Option<String>,    // OPTIONAL: sha256/<base64> SPKI pin (HTTPS host only)
 }
 
 pub enum PairEndpointClass {
@@ -134,6 +168,8 @@ PairSessionFile {
   phase: PairPhase,
   decision: Option<JoinDecision>,
   confirm_consumed: bool,
+  ep: PairEndpointClass,
+  tls_pin: Option,      // optional wire form sha256/… when QR advertises tlspin
   created_at, updated_at
 }
 
@@ -256,8 +292,8 @@ Authorization: Bearer <token>
 ## Dual-scan ceremony (product path)
 
 ```text
-1. Machine A (resident): mymesh pair dual
-   → PairSession sid; QR_A v2 (sid, did_A, fp_A, token, nonce, mesh, ep, host?)
+1. Machine A (resident): mymesh pair dual [--host https://… --tlspin sha256/…]
+   → PairSession sid; QR_A v2 (sid, did_A, fp_A, token, nonce, mesh, ep, host?, tlspin?)
 2. Machine B (joiner): mymesh pair dual --join --resident <did_A|words>
    → iroh join toward A; QR_B (did_B, fp_B, label) for phone
 3. Phone: Scan A → SessionDraft; Scan B → bind joiner; show both fps → L2 Accept/Deny

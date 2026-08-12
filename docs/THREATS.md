@@ -173,7 +173,7 @@ Normative IDs from [CARRIER-NEXT.md](CARRIER-NEXT.md) §S9. Status reflects **th
 | Item | PR / slice | Notes |
 |------|------------|-------|
 | Rate limits + metric names | **D1** | Implements **C7** |
-| Optional TLS pin `tlspin=` on direct ep | **D2** | Carrier release already denies cleartext product path |
+| Optional TLS pin `tlspin=` on direct ep | **D2** | Wire + parse + fail-closed verify hook (MyMesh); Carrier release denies cleartext; client TLS stack wiring is **D3** |
 | Persistent Carrier audit (redacted) | **D3** | Carrier repo |
 | This document + SECURITY cross-link | **D4** | This PR |
 | Carrier default QR v2 | **D5** | Completes KD23; `--pair-v1` escape |

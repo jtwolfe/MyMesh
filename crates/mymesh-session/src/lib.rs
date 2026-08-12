@@ -16,8 +16,9 @@ mod two_agent_harness;
 
 pub use agent::Agent;
 pub use carrier::{
-    build_pair_qr, build_pair_qr_v2, carrier_pending_path, decode_pair_nonce, encode_pair_nonce,
-    start_carrier, CarrierHandle, PairQrV2Params, PAIR_HTTP_PORT, PAIR_V1_PREFIX, PAIR_V2_PREFIX,
+    build_pair_qr, build_pair_qr_v2, build_pair_qr_v2_checked, carrier_pending_path,
+    decode_pair_nonce, encode_pair_nonce, start_carrier, CarrierHandle, PairQrV2Params,
+    PAIR_HTTP_PORT, PAIR_V1_PREFIX, PAIR_V2_PREFIX,
 };
 pub use mesh_api::{auth_challenge_preimage, mrk_admin_identity, AuthMethod, MESH_V1_PREFIX};
 // Re-export owner types from crypto for callers that used mesh_api::MeshOwnerFile (B3).

@@ -258,6 +258,7 @@ pub fn build_pair_qr(host_base: &str, token: &str, fp: &str, mesh: Option<&str>)
 /// Parameters for a v2 pair bootstrap QR (`carrier://pair?v=2&…`).
 ///
 /// `nonce` is **required** (16 raw bytes). `host` is optional — absent ⇒ `ep=confirm`.
+/// Optional `tlspin` (SPKI pin) requires HTTPS host (validated by caller / `build_pair_qr_v2`).
 #[derive(Clone, Debug)]
 pub struct PairQrV2Params<'a> {
     pub sid: &'a str,
@@ -267,14 +268,18 @@ pub struct PairQrV2Params<'a> {
     pub nonce: &'a [u8; 16],
     pub fp: &'a str,
     pub mesh: Option<&'a str>,
-    /// Optional direct host base URL (`http://ip:port`). When set, `ep` defaults to direct.
+    /// Optional direct host base URL (`http://ip:port` or `https://…`). When set, `ep` defaults to direct.
     pub host: Option<&'a str>,
     pub ep: Option<PairEndpointClass>,
     pub relay: Option<&'a str>,
+    /// Optional TLS SPKI pin wire form (`sha256/…`). When set, host must be HTTPS.
+    pub tlspin: Option<&'a str>,
 }
 
-/// Build v2 pair QR. Fails only if nonce is not 16 bytes (compile-time via type) —
-/// call sites must supply a real session nonce (KD27).
+/// Build v2 pair QR. Call sites must supply a real session nonce (KD27).
+///
+/// Does **not** validate `tlspin` policy — use [`build_pair_qr_v2_checked`] for
+/// fail-closed HTTPS + pin format checks (CLI / product emit path).
 ///
 /// ```text
 /// carrier://pair?v=2&sid=…&did=…&token=…&nonce=…&fp=…
@@ -282,6 +287,7 @@ pub struct PairQrV2Params<'a> {
 ///              &host=<optional>
 ///              &mesh=<optional>
 ///              &relay=<optional>
+///              &tlspin=<optional sha256/…>
 /// ```
 pub fn build_pair_qr_v2(p: &PairQrV2Params<'_>) -> String {
     let nonce_b64 = URL_SAFE_NO_PAD.encode(p.nonce);
@@ -317,7 +323,34 @@ pub fn build_pair_qr_v2(p: &PairQrV2Params<'_>) -> String {
             q.push_str(&percent_encode(r));
         }
     }
+    if let Some(pin) = p.tlspin {
+        if !pin.is_empty() {
+            q.push_str("&tlspin=");
+            q.push_str(&percent_encode(pin));
+        }
+    }
     q
+}
+
+/// Build v2 QR after validating optional `tlspin` format and HTTPS policy.
+///
+/// Fail closed: invalid pin format or pin without `https://` host → `Err`.
+pub fn build_pair_qr_v2_checked(
+    p: &PairQrV2Params<'_>,
+) -> std::result::Result<String, mymesh_core::TlsPinError> {
+    let pin = match p.tlspin {
+        Some(s) if !s.is_empty() => Some(mymesh_core::parse_tls_pin(s)?),
+        _ => None,
+    };
+    mymesh_core::require_https_when_pinned(pin.as_ref(), p.host)?;
+    // Re-emit canonical wire form when pin present.
+    let wire;
+    let mut params = p.clone();
+    if let Some(ref pin) = pin {
+        wire = pin.to_wire();
+        params.tlspin = Some(wire.as_str());
+    }
+    Ok(build_pair_qr_v2(&params))
 }
 
 /// Encode 16B nonce as base64url (no padding) for status / SessionDecision wire.
@@ -1724,6 +1757,7 @@ mod tests {
             host: None,
             ep: None,
             relay: None,
+            tlspin: None,
         });
         assert!(qr.starts_with("carrier://pair?v=2&"));
         assert!(qr.contains("sid=01HZXEXAMPLE00000000000000"));
@@ -1731,6 +1765,7 @@ mod tests {
         assert!(qr.contains("ep=confirm"));
         assert!(!qr.contains("host="));
         assert!(qr.contains("mesh=mesh-1"));
+        assert!(!qr.contains("tlspin="));
 
         let qr_host = build_pair_qr_v2(&PairQrV2Params {
             sid: "01HZXEXAMPLE00000000000000",
@@ -1742,9 +1777,84 @@ mod tests {
             host: Some("http://192.168.1.10:17878"),
             ep: None,
             relay: None,
+            tlspin: None,
         });
         assert!(qr_host.contains("ep=direct"));
         assert!(qr_host.contains("host=http%3A%2F%2F192.168.1.10%3A17878"));
+    }
+
+    #[test]
+    fn pair_qr_v2_optional_tlspin_https_only() {
+        use mymesh_core::{parse_tls_pin, TlsPin, TlsPinError};
+
+        let nonce = [0x7u8; 16];
+        let pin = TlsPin::from_spki_der(&[0x30, 0x01, 0x02, 0x03]);
+        let wire = pin.to_wire();
+
+        let qr = build_pair_qr_v2_checked(&PairQrV2Params {
+            sid: "01HZXEXAMPLE00000000000000",
+            did: "aa",
+            token: "tok",
+            nonce: &nonce,
+            fp: "fp",
+            mesh: None,
+            host: Some("https://pair.example:8443"),
+            ep: Some(PairEndpointClass::Direct),
+            relay: None,
+            tlspin: Some(&wire),
+        })
+        .unwrap();
+        assert!(qr.contains("tlspin="));
+        assert!(qr.contains(&percent_encode(&wire)) || qr.contains(&wire));
+        // parsed pin round-trips
+        assert_eq!(parse_tls_pin(&wire).unwrap(), pin);
+
+        // pin + cleartext host → fail closed
+        let err = build_pair_qr_v2_checked(&PairQrV2Params {
+            sid: "s",
+            did: "d",
+            token: "t",
+            nonce: &nonce,
+            fp: "fp",
+            mesh: None,
+            host: Some("http://192.168.1.10:17878"),
+            ep: None,
+            relay: None,
+            tlspin: Some(&wire),
+        })
+        .unwrap_err();
+        assert_eq!(err, TlsPinError::HttpsRequired);
+
+        // pin without host → fail closed
+        let err = build_pair_qr_v2_checked(&PairQrV2Params {
+            sid: "s",
+            did: "d",
+            token: "t",
+            nonce: &nonce,
+            fp: "fp",
+            mesh: None,
+            host: None,
+            ep: None,
+            relay: None,
+            tlspin: Some(&wire),
+        })
+        .unwrap_err();
+        assert_eq!(err, TlsPinError::HttpsRequired);
+
+        // no pin + http still ok
+        assert!(build_pair_qr_v2_checked(&PairQrV2Params {
+            sid: "s",
+            did: "d",
+            token: "t",
+            nonce: &nonce,
+            fp: "fp",
+            mesh: None,
+            host: Some("http://192.168.1.10:17878"),
+            ep: None,
+            relay: None,
+            tlspin: None,
+        })
+        .is_ok());
     }
 
     #[test]
