@@ -5,7 +5,7 @@
 | **Status** | Normative contract freeze (S0) |
 | **Slice** | S3 implements; this doc freezes crypto ranges, file shape, authority, recovery |
 | **Source** | [CARRIER-NEXT.md](CARRIER-NEXT.md) §S3, dual authority, recovery matrix |
-| **Related** | [GRANTS.md](GRANTS.md), [GUEST.md](GUEST.md), [JOIN.md](JOIN.md), [SECURITY.md](SECURITY.md), [PAIR-V2.md](PAIR-V2.md) |
+| **Related** | [RECOVERY.md](RECOVERY.md) (ops runbooks), [GRANTS.md](GRANTS.md), [GUEST.md](GUEST.md), [JOIN.md](JOIN.md), [SECURITY.md](SECURITY.md), [THREATS.md](THREATS.md), [PAIR-V2.md](PAIR-V2.md) |
 
 ---
 
@@ -77,15 +77,17 @@ Optional related fields on mesh/owner files:
 
 ---
 
-## CLI (target shape — S3)
+## CLI (S3 — implemented unless noted)
 
 ```bash
 mymesh mesh init                 # password + print recovery codes once
 mymesh mesh unlock | lock | status
-mymesh mesh rotate-master
+mymesh mesh rotate-master        # re-wrap same MRK under new password
 mymesh mesh recover-master --code <recovery>
-mymesh mesh recover-master --owner-proof  # after owner claim (S4); signs challenge
+mymesh mesh recover-master --owner-proof  # flag exists; challenge/sign not yet wired
 ```
+
+Owner claim + sealed backup CLI: `mymesh owner allow-claim|claim|show|clear|backup …` (S4). Full recovery procedures: [RECOVERY.md](RECOVERY.md).
 
 ### Unlock policy (normative — KD30)
 
@@ -134,16 +136,18 @@ Never enable keyring by default in `mesh init`.
 
 ## Recovery matrix (dual authority)
 
+**Ops runbooks (commands, checklists, honesty about CLI gaps):** **[RECOVERY.md](RECOVERY.md)**.
+
 | Lost | Still have | Recovery |
 |------|------------|----------|
 | Phone | Sealed backup + password | Restore person on new phone; re-auth as owner |
 | Phone + backup password | MMK | MMK clears/replaces owner; new claim |
 | Phone + backup + MMK | — | Nuclear: new mesh / re-pair devices; old mesh_id abandoned |
-| MMK password | Owner claim + working phone | `mymesh mesh recover-master --owner-proof`: owner signs challenge; rate-limited; new MRK; update `mesh-owner.json` `mrk_fingerprint` (claim remains valid) |
+| MMK password | Recovery codes (today) / owner claim + phone (planned `--owner-proof`) | `mymesh mesh recover-master --code` (**implemented**); `--owner-proof` signs challenge when wired — new MRK; update `mesh-owner.json` `mrk_fingerprint` (claim remains valid) |
 | MMK + owner phone | Sealed backup on disk + password | Restore phone first, then recover-master |
 | MMK + owner + backup | Trusted member with host-local CLI | Host-local can still run node; **cannot** prove remote MMK; export recovery codes at init recommended; else nuclear re-init policy files |
 
-**MMK recovery codes** at `mesh init`: 256-bit printed once (or 24 words), separate from daily password; hashes in `mesh-master.json` for `recover-master --code`. Owner proof path is additional when claim exists.
+**MMK recovery codes** at `mesh init`: 256-bit printed once (or 24 words), separate from daily password; hashes in `mesh-master.json` for `recover-master --code`. Owner proof path is additional when claim exists (**flag present; challenge/sign not yet wired** — see [RECOVERY.md](RECOVERY.md) R4).
 
 ---
 
@@ -205,9 +209,11 @@ carrier-mesh-owner-v1 || u16le(len) || mesh_id_utf8
 
 ## See also
 
+- [RECOVERY.md](RECOVERY.md) — dual-authority recovery runbooks (lost phone/MMK, guest, rotate, sealed backup)
 - [CARRIER-NEXT.md](CARRIER-NEXT.md) — full S0–S9 design
 - [GRANTS.md](GRANTS.md) — grant schema; issued_by may be MasterKeyProof
 - [GUEST.md](GUEST.md) — guests never hold MMK
 - [PAIR-V2.md](PAIR-V2.md) — pair control plane (orthogonal to MMK in Wave A)
 - [JOIN.md](JOIN.md) — member join; Admin migration note
-- [SECURITY.md](SECURITY.md) — trust model
+- [SECURITY.md](SECURITY.md) · [THREATS.md](THREATS.md) — trust model + C1–C7
+- Carrier repo: `docs/OWNERSHIP.md` — phone claim / restore UX

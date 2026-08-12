@@ -1136,7 +1136,7 @@ Metrics dir: extend MyMesh `paths.metrics_dir` JSON counters (existing metrics p
 1. Optional TLS pin in QR `tlspin=` for direct ep; release cleartext policy unchanged (Carrier release denies cleartext).
 2. Topology optional `snapshot_sig_hex`.
 3. Persistent Carrier audit log redacted.
-4. Runbooks: lost phone; lost MMK; compromised guest; MMK leak rotate.
+4. Runbooks: lost phone; lost MMK; compromised guest; MMK leak rotate; restore owner from sealed backup — MyMesh ops: **[RECOVERY.md](RECOVERY.md)** (B7-m).
 5. mock-pair-host lab-only; DEMO-PAIR real MyMesh dual-scan+confirm — see [DEMO-PAIR.md](DEMO-PAIR.md).
 6. **QR default policy (single KD):** After A3, `mymesh pair dual` emits **v2**. `mymesh carrier` (single-host LAN helper) continues **v1** until **D5**, then v2 default with `--pair-v1` escape.
 7. **Relay (KD31):** Optional Class C is **self-hosted only** if ever implemented; not a product deliverable in Waves A–E. No public MyMesh pair relay.

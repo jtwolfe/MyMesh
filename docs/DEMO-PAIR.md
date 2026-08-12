@@ -274,6 +274,7 @@ Confirm algorithm (normative): [PAIR-V2.md](PAIR-V2.md) — pepper = bootstrap t
 - [JOIN.md](JOIN.md) — CLI link, membership snapshot, v1/v2 migration  
 - [USAGE.md](USAGE.md) — day-to-day linking and carrier  
 - [SECURITY.md](SECURITY.md) — trust and arming  
+- [RECOVERY.md](RECOVERY.md) — re-pair after nuclear recovery (R3); dual-authority runbooks  
 - [CARRIER-NEXT.md](CARRIER-NEXT.md) — Wave A–E plan, KD14 lab honesty  
 - [GUEST.md](GUEST.md) — guest accept skips full roster  
 - Carrier repo: `docs/DEMO-PAIR.md`, `tools/mock-pair-host`  
