@@ -1308,7 +1308,7 @@ See mesh API matrix + pair Bearer for pair routes only.
 | **D** | S9 (+ deprecation) | Harden, rate limits, audit persist, QR default |
 | **E** | S7, S8 | Multi-id + continuity (after D; D1+D2 same release) |
 
-Feature flags: v2 dual emit on after A3; carrier v1 until **D5**; continuity off until E; relay off / self-host experimental only (KD31).
+Feature flags: v2 dual emit on after A3; **carrier default v2 after D5** (`--pair-v1` escape); continuity off until E; relay off / self-host experimental only (KD31).
 
 Rollback: `--pair-v1`; MMK optional for basic sessions; delete mesh-owner with MMK if corrupt.
 
@@ -1478,7 +1478,7 @@ Relay ep, phone iroh, guest path, MMK, topology API, continuity.
 | KD20 | **Owner claim requires MMK on agent** (co-sign or allow-claim window); **phone never holds MMK** | Chicken-and-egg fix; no MMK on phone |
 | KD21 | Device `mesh_role` is `member\|guest` only; person owner only in mesh-owner.json | No Owner-on-device conflation |
 | KD22 | PairSessionStore on agent Paths; carrier HTTP is facade; `mymesh pair` works without carrier process | Process split honesty |
-| KD23 | After A3, `pair dual` emits v2; `mymesh carrier` stays v1 until **D5** | Single default policy |
+| KD23 | After A3, `pair dual` emits v2; after **D5**, `mymesh carrier` defaults v2 (`--pair-v1` escape) | Single default policy |
 | KD24 | Topology authenticity Wave C = mesh-auth session; signature optional S9 | Threat alignment |
 | KD25 | S7 UI and mesh enforcement same release; S7–S8 Wave E after harden Wave D | Least-placeholder / slip risk |
 | KD26 | Claim auth = agent co-sign (preferred) + CLI `allow-claim` window; phone person-sig only | Operational MMK without vault contamination |

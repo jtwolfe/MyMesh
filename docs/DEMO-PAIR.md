@@ -9,7 +9,7 @@
 |------|------|-------------|
 | **A — dual-scan + confirm** | **Primary product demo** | Two machines + phone; phone **need not** reach host HTTP |
 | **B — dual-scan + direct host** | LAN optimization | Optional `--host` in QR_A; phone can `POST /pair/v2/decide` |
-| **C — v1 single-host LAN** | Migration / alpha.1 | `mymesh carrier` still emits v1 until D5 |
+| **C — carrier single-host LAN** | Migration / LAN helper | Default **v2** after D5; `--pair-v1` for alpha.1 |
 | **Lab — mock-pair-host** | **Lab only** | Lives in **Carrier** repo; emulator / unit fixtures — **not** product |
 
 **Honesty (KD14):** `mock-pair-host` (Carrier `tools/mock-pair-host`) implements **pair/v1** fixtures for unit/ceremony tests and emulator loops. It is **not** a substitute for dual-scan + iroh completion. Do not present mock accept as “internet-first pair.” This MyMesh tree does **not** ship mock-pair-host.
@@ -179,9 +179,9 @@ mymesh pair dual --join --resident <did_or_words_from_A>
 
 ---
 
-## Path C — v1 single-host LAN (migration)
+## Path C — carrier single-host LAN (default v2; `--pair-v1` escape)
 
-Alpha.1 path still supported during migration. **Not** the Wave A product exit.
+Single-host LAN helper via `mymesh carrier`. Default QR is **pair/v2** after D5; `--pair-v1` restores alpha.1. **Not** the Wave A dual-scan product exit.
 
 ```bash
 # --- Host A ---

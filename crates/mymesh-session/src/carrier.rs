@@ -185,10 +185,10 @@ pub async fn start_carrier(
     pair_v1: bool,
 ) -> anyhow::Result<CarrierHandle> {
     paths.ensure()?;
-    // Arm window gives bootstrap / session its TTL (PAIR-HTTP.md / PAIR-V2.md).
-    if !ArmState::load(paths.arm_file())?.is_effectively_armed() {
-        let _ = ArmState::arm(paths.arm_file(), CARRIER_ARM_TTL_SECS);
-    }
+    // Always refresh arm window so join arm TTL aligns with PairSession / QR.
+    // Restart prints a new QR; residual short arms must not outlive the new session
+    // (join host path requires ArmState; status.armed = arm && session open).
+    let _ = ArmState::arm(paths.arm_file(), CARRIER_ARM_TTL_SECS);
 
     let bootstrap = Arc::new(Mutex::new(None));
     let rate_limits = Arc::new(RateLimitState::new());
@@ -1876,7 +1876,10 @@ mod tests {
         let paths = tmp_paths();
         let secret = [0xABu8; 32];
         let expected_did = Identity::from_secret_bytes(secret).device_id();
-        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        let mesh = MeshState::new_mesh();
+        mesh.save(paths.mesh_file()).unwrap();
+        // Residual short arm must be refreshed to full carrier TTL (Issue 4).
+        ArmState::arm(paths.arm_file(), 30).unwrap();
 
         let handle = start_carrier(
             paths.clone(),
@@ -1897,9 +1900,23 @@ mod tests {
         );
         assert!(handle.pair_qr.contains("nonce="));
         assert!(handle.pair_qr.contains("sid="));
-        assert!(handle.pair_qr.contains("did="));
+        assert!(
+            handle.pair_qr.contains(&format!("did={}", expected_did)),
+            "did= must be resident device id hex: {}",
+            handle.pair_qr
+        );
         assert!(handle.pair_qr.contains("ep=direct"));
-        assert!(handle.pair_qr.contains("host="));
+        // Percent-encoded LAN host (same grammar as v1 escape).
+        assert!(
+            handle.pair_qr.contains("host=http%3A%2F%2F127.0.0.1%3A"),
+            "host must be percent-encoded: {}",
+            handle.pair_qr
+        );
+        assert!(
+            handle.pair_qr.contains(&format!("mesh={}", mesh.mesh_id)),
+            "mesh= required when mesh loaded: {}",
+            handle.pair_qr
+        );
         assert!(handle.pair_qr.contains(&format!("token={}", handle.bootstrap_token)));
 
         // PairSession was armed and is findable by the QR token.
@@ -1916,9 +1933,36 @@ mod tests {
         assert_eq!(sess.resident_device_id, expected_did);
         assert_eq!(sess.ep, PairEndpointClass::Direct);
         assert!(handle.pair_qr.contains(&format!("sid={}", sess.sid)));
+
+        // Compat: default path still mints arm-scoped v1 bootstrap (distinct from session token).
+        let v1_persist = std::fs::read_to_string(paths.data_dir.join("pair-bootstrap.json"))
+            .expect("pair-bootstrap.json for /pair/v1 compat");
+        let v1: serde_json::Value = serde_json::from_str(&v1_persist).unwrap();
+        let v1_token = v1["token"].as_str().expect("v1 token field");
+        assert_ne!(
+            v1_token, handle.bootstrap_token,
+            "v1 bootstrap must not be the PairSession QR token"
+        );
+        let v1_raw = URL_SAFE_NO_PAD.decode(v1_token.as_bytes()).unwrap();
+        let mut v1_tok = [0u8; 32];
+        v1_tok.copy_from_slice(&v1_raw);
+        assert!(
+            store.find_by_token_raw(&v1_tok).unwrap().is_none(),
+            "v1 bootstrap must not resolve as a PairSession"
+        );
+
+        // Arm window refreshed to full carrier TTL (not residual 30s).
+        let arm = ArmState::load(paths.arm_file()).unwrap();
+        assert!(arm.is_effectively_armed());
+        let until = arm.until.expect("arm until");
+        let remaining = (until - Utc::now()).num_seconds();
+        assert!(
+            remaining > 800,
+            "arm must be refreshed to ~{CARRIER_ARM_TTL_SECS}s, remaining={remaining}"
+        );
     }
 
-    /// D5 escape hatch: `--pair-v1` still emits alpha.1 LAN QR.
+    /// D5 escape hatch: `--pair-v1` still emits alpha.1 LAN QR (no PairSession for that token).
     #[tokio::test]
     async fn start_carrier_pair_v1_escape_emits_v1_qr() {
         let paths = tmp_paths();
@@ -1926,7 +1970,7 @@ mod tests {
         MeshState::new_mesh().save(paths.mesh_file()).unwrap();
 
         let handle = start_carrier(
-            paths,
+            paths.clone(),
             Identity::from_secret_bytes(secret),
             "host".into(),
             0,
@@ -1946,6 +1990,23 @@ mod tests {
         assert!(!handle.pair_qr.contains("sid="));
         assert!(handle.pair_qr.contains("host=http%3A%2F%2F192.168.1.10%3A"));
         assert!(handle.pair_qr.contains(&format!("token={}", handle.bootstrap_token)));
+
+        // Escape must not mint a PairSession for the v1 QR token.
+        let store = PairSessionStore::open(paths.pair_sessions_dir()).unwrap();
+        let raw = URL_SAFE_NO_PAD
+            .decode(handle.bootstrap_token.as_bytes())
+            .unwrap();
+        let mut tok = [0u8; 32];
+        tok.copy_from_slice(&raw);
+        assert!(
+            store.find_by_token_raw(&tok).unwrap().is_none(),
+            "v1 QR token must not resolve as a PairSession"
+        );
+        // Fresh home: no sessions created by escape path alone.
+        assert!(
+            store.list().unwrap().is_empty(),
+            "escape path must not arm a PairSession"
+        );
     }
 
     #[test]

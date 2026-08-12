@@ -137,7 +137,7 @@ The kickee then sends **KickLeaveAck** to all known peers so the mesh converges.
 
 ---
 
-## Connect-by-carrier (alpha.3 / pair v1)
+## Connect-by-carrier (default pair/v2)
 
 Phone acts as a **scanner / approver only** (not a mesh node). See [USAGE.md](USAGE.md) and [ALPHA-3.md](ALPHA-3.md).
 
