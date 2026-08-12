@@ -175,7 +175,7 @@ carrier://pair?v=2&sid=<ulid>&did=<64hex>&token=<b64url>&nonce=<b64url-16B>&fp=<
                  &ep=direct|confirm|relay&host=<optional>&mesh=<optional>
 ```
 
-CLI target shape (S2): `mymesh pair dual`, `pair dual --join`, `pair confirm <code>`, `pair status`, `pair retry`.
+CLI (implemented): `mymesh pair dual`, `pair dual --join`, `pair confirm <code>`, `pair status`, `pair retry`. E2E demo steps and lab honesty: **[DEMO-PAIR.md](DEMO-PAIR.md)**.
 
 **Migration policy:** v1 accepted through compat window; `pair dual` emits v2 after A3; `mymesh carrier` stays v1 until D5 then v2 default with `--pair-v1`. Details in [PAIR-V2.md](PAIR-V2.md) and [CARRIER-NEXT.md](CARRIER-NEXT.md) Appendix A.
 

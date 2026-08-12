@@ -154,6 +154,7 @@ Linking model: **[docs/JOIN.md](docs/JOIN.md)**
 | [docs/ALPHA-3.md](docs/ALPHA-3.md) | Magic plane design & limits |
 | [docs/JOIN.md](docs/JOIN.md) | Arming, ids, carrier, SPAKE, pair v1→v2 migration |
 | [docs/PAIR-V2.md](docs/PAIR-V2.md) | S0: pair v2 wire, nonce, confirm 4-4, not_bound |
+| [docs/DEMO-PAIR.md](docs/DEMO-PAIR.md) | Wave A E2E: dual-scan+confirm; mock-pair-host lab-only |
 | [docs/MASTER-KEY.md](docs/MASTER-KEY.md) | S0: mesh master key / policy root |
 | [docs/GRANTS.md](docs/GRANTS.md) | S0: grant schema |
 | [docs/GUEST.md](docs/GUEST.md) | S0: guest membership (no full roster) |

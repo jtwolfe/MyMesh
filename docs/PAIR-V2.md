@@ -5,7 +5,7 @@
 | **Status** | Normative contract freeze (S0) |
 | **Slice** | S1–S2 implement; this doc freezes wire, confirm algorithm, fail-closed rules |
 | **Source** | [CARRIER-NEXT.md](CARRIER-NEXT.md) §S0–S2, Wave A protocol appendix |
-| **Related** | [JOIN.md](JOIN.md), [MASTER-KEY.md](MASTER-KEY.md), [GUEST.md](GUEST.md), [SECURITY.md](SECURITY.md) |
+| **Related** | [DEMO-PAIR.md](DEMO-PAIR.md) (E2E demo), [JOIN.md](JOIN.md), [MASTER-KEY.md](MASTER-KEY.md), [GUEST.md](GUEST.md), [SECURITY.md](SECURITY.md) |
 
 ---
 
@@ -347,6 +347,7 @@ Device-to-device trust completion always uses **existing iroh dial-by-device-id*
 
 ## See also
 
+- [DEMO-PAIR.md](DEMO-PAIR.md) — dual-scan+confirm demo steps, harness, mock-pair-host lab-only
 - [JOIN.md](JOIN.md) — CLI link, membership snapshot, migration from pair/v1
 - [GUEST.md](GUEST.md) — guest accept skips full roster
 - [MASTER-KEY.md](MASTER-KEY.md) — orthogonal in Wave A; dual authority later
