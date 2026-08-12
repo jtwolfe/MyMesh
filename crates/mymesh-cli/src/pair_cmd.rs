@@ -305,7 +305,7 @@ pub async fn cmd_pair_retry(paths: &Paths, sid: Option<String>) -> Result<()> {
     cmd_pair_dual(paths, None, None, None).await
 }
 
-fn percent_encode(s: &str) -> String {
+pub(crate) fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.as_bytes() {
         match *b {

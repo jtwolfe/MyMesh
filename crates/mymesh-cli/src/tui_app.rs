@@ -10,8 +10,8 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use mymesh_core::{
-    ArmState, Config, DeviceStore, JoinStore, MeshState, Paths, PeerMetrics, PendingKickStore,
-    TrustState,
+    ArmState, Config, DeviceStore, JoinStore, MeshState, NodeFingerprint, Paths, PeerMetrics,
+    PendingKickStore, TrustState,
 };
 use mymesh_crypto::{device_id_to_words, device_join_uri, Identity};
 use mymesh_protocol::FileEntry;
@@ -421,6 +421,20 @@ fn node_cwd_default(node: &BrowserNode, home: &Path) -> String {
         BrowserNode::Local => home.display().to_string(),
         BrowserNode::Peer { .. } => ".".into(),
     }
+}
+
+/// Phone-scannable identity for this node (Carrier second-machine QR).
+fn pair_peer_uri(id: &Identity, paths: &Paths) -> String {
+    let did = id.device_id().to_string();
+    let fp = NodeFingerprint::from_device_id(&id.device_id());
+    let label = Config::load(paths.config_file())
+        .map(|c| c.device_label)
+        .unwrap_or_default();
+    format!(
+        "mymesh://pair-peer?v=1&did={did}&fp={}&label={}",
+        crate::pair_cmd::percent_encode(fp.as_str()),
+        crate::pair_cmd::percent_encode(&label),
+    )
 }
 
 // ─── QR: half-block unicode (correct aspect for terminals) ───────────
@@ -2671,24 +2685,23 @@ fn draw_home(f: &mut TuiFrame, area: Rect, app: &App) {
         cols[0],
     );
 
-    // QR panel
+    // QR panel — pair-peer so Carrier can scan this node as the *second* machine.
     let mut qr_lines = vec![Line::from(Span::styled(
-        "Scan / share join URI",
+        "Scan this node (Carrier: second machine)",
         Style::default().fg(C_MUTED),
     ))];
     if let Some(id) = id {
-        if let Ok(uri) = device_join_uri(&id.device_id()) {
+        let peer = pair_peer_uri(&id, &app.paths);
+        qr_lines.push(Line::from(Span::styled(
+            peer.clone(),
+            Style::default().fg(C_ACCENT),
+        )));
+        qr_lines.push(Line::from(""));
+        for row in qr_half_block_lines(&peer) {
             qr_lines.push(Line::from(Span::styled(
-                uri.clone(),
-                Style::default().fg(C_ACCENT),
+                row,
+                Style::default().fg(C_TEXT).bg(C_PANEL),
             )));
-            qr_lines.push(Line::from(""));
-            for row in qr_half_block_lines(&uri) {
-                qr_lines.push(Line::from(Span::styled(
-                    row,
-                    Style::default().fg(C_TEXT).bg(C_PANEL),
-                )));
-            }
         }
     }
     f.render_widget(
