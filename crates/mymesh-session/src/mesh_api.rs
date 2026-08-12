@@ -26,7 +26,8 @@
 //! - `person_owner` / `mrk_proof` → full **member** roster + active `grants_summary`
 //! - `device_member` (member) → full **member** roster (guests excluded);
 //!   `grants_summary` when Admin/host (all active) or own subject/object grants
-//! - `device_member` (guest) → **self + object host(s) only**; empty grants_summary
+//! - `device_member` (guest) → **self + object host(s) only**; empty grants_summary;
+//!   `minimal_roster` **pinned at session mint** (missing guest row cannot fail open)
 //! - `pair_read` → session-minimal (resident+joiner); empty grants_summary
 //!
 //! Grants mutate authz (docs/GRANTS.md): person_owner | mrk_proof |
@@ -108,6 +109,11 @@ struct MeshSession {
     subject_device_id: Option<DeviceId>,
     /// Person that authenticated (person_owner).
     person_id: Option<String>,
+    /// Pinned at mint: topology must not upgrade to full roster for this session.
+    /// True for `pair_read` and guest `device_member` (GUEST.md / KD19 fail-closed).
+    /// Re-deriving guest from live DeviceStore would fail *open* if the guest row
+    /// disappears mid-session.
+    minimal_roster: bool,
 }
 
 /// Auth method wire enum (S0 freeze).
@@ -177,7 +183,7 @@ struct SessionResponse {
     session_token: String,
     auth_mode: &'static str,
     expires_at: String,
-    /// `full` | `minimal` (pair_read).
+    /// `full` | `minimal` (pair_read or guest device_member).
     scope: &'static str,
 }
 
@@ -523,12 +529,15 @@ async fn auth_session(
     OsRng.fill_bytes(&mut token_raw);
     let key = session_token_key(&token_raw);
 
-    // Guest device_member is mesh-auth'd but topology-minimal (GUEST.md).
+    // Pin minimal roster at mint (pair_read or guest device_member). Topology
+    // honors this flag so a later missing guest DeviceStore row cannot fail open
+    // to the full household roster (GUEST.md / KD19).
     let guest_subject = body.method == AuthMethod::DeviceMember
         && subject_device_id
             .as_ref()
             .map(|id| device_is_guest(&st.paths, id))
             .unwrap_or(false);
+    let minimal_roster = body.method == AuthMethod::PairRead || guest_subject;
 
     {
         let mut store = st.auth.lock().await;
@@ -540,17 +549,14 @@ async fn auth_session(
                 pair_sid,
                 subject_device_id,
                 person_id,
+                minimal_roster,
             },
         );
         // Challenge fully spent.
         store.challenges.remove(&body.challenge_id);
     }
 
-    let scope = if body.method.is_full_roster() && !guest_subject {
-        "full"
-    } else {
-        "minimal"
-    };
+    let scope = if minimal_roster { "minimal" } else { "full" };
 
     Json(SessionResponse {
         session_token: encode_b64(&token_raw),
@@ -866,12 +872,16 @@ async fn topology(State(st): State<MeshApiState>, headers: HeaderMap) -> Respons
             },
         });
 
-    let guest_session = session.auth_mode == AuthMethod::DeviceMember
+    // Honor mint-time pin first (never upgrade minimal → full mid-session).
+    // Live guest re-check only *narrows* further if role became guest after mint
+    // (fail-closed); it must not expand a pinned-minimal session.
+    let live_guest = session.auth_mode == AuthMethod::DeviceMember
         && session
             .subject_device_id
             .as_ref()
             .map(|id| device_is_guest(&st.paths, id))
             .unwrap_or(false);
+    let minimal_session = session.minimal_roster || live_guest;
 
     let members = if session.auth_mode == AuthMethod::PairRead {
         // pair_read: session-minimal — resident + joiner only.
@@ -879,9 +889,15 @@ async fn topology(State(st): State<MeshApiState>, headers: HeaderMap) -> Respons
             Ok(m) => m,
             Err(r) => return r,
         }
-    } else if guest_session {
-        // Guest cannot full-read household roster (GUEST.md / S6).
-        let guest_id = session.subject_device_id.expect("guest session has subject");
+    } else if minimal_session {
+        // Guest (pinned or live) cannot full-read household roster (GUEST.md / S6).
+        let Some(guest_id) = session.subject_device_id else {
+            return mesh_err(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "minimal topology session missing subject device",
+            );
+        };
         match build_guest_members(&st.paths, &guest_id, &host_id, &st.label) {
             Ok(m) => m,
             Err(e) => {
@@ -906,7 +922,7 @@ async fn topology(State(st): State<MeshApiState>, headers: HeaderMap) -> Respons
         }
     };
 
-    let grants_summary = match build_grants_summary(&st, &session, guest_session) {
+    let grants_summary = match build_grants_summary(&st, &session, minimal_session) {
         Ok(g) => g,
         Err(e) => {
             return mesh_err(
@@ -1649,8 +1665,11 @@ fn build_full_members(
     Ok(out)
 }
 
-/// True when `device_id` is recorded as a Trusted (or any) guest on this agent.
-/// Fail closed: missing store → not guest (host/self-auth path still works).
+/// True when `device_id` is recorded as guest on this agent.
+///
+/// Missing store/row → `false` (used only to *detect* guest at mint or to
+/// narrow further mid-session). Topology roster isolation must use the
+/// session's pinned `minimal_roster` so a deleted guest row cannot fail open.
 fn device_is_guest(paths: &Paths, device_id: &DeviceId) -> bool {
     DeviceStore::open(paths.devices_file())
         .ok()
@@ -1737,16 +1756,16 @@ fn build_guest_members(
 
 /// Active grants visible on topology for this session (S6/C4).
 ///
-/// - `pair_read` / guest → empty
+/// - `pair_read` / minimal (guest) → empty
 /// - `person_owner` / `mrk_proof` → all active
 /// - `device_member` Admin or serving host → all active
 /// - `device_member` otherwise → grants where subject or object is self ("own")
 fn build_grants_summary(
     st: &MeshApiState,
     session: &MeshSession,
-    guest_session: bool,
+    minimal_session: bool,
 ) -> mymesh_core::Result<Vec<GrantHttp>> {
-    if session.auth_mode == AuthMethod::PairRead || guest_session {
+    if session.auth_mode == AuthMethod::PairRead || minimal_session {
         return Ok(vec![]);
     }
 
@@ -3857,5 +3876,280 @@ mod tests {
         assert_eq!(summary.len(), 1);
         assert_eq!(summary[0]["grant_id"], own.grant_id);
         assert_ne!(summary[0]["grant_id"], foreign.grant_id);
+    }
+
+    /// Mint-time `minimal_roster` pin: deleting the guest DeviceStore row mid-session
+    /// must not upgrade topology to the full household roster.
+    #[tokio::test]
+    async fn topology_guest_pin_survives_deleted_device_row() {
+        let paths = tmp_paths();
+        let secret = [0x8Eu8; 32];
+        let host = Identity::from_secret_bytes(secret);
+        let mesh = MeshState::new_mesh();
+        mesh.save(paths.mesh_file()).unwrap();
+
+        let mut store = DeviceStore::open(paths.devices_file()).unwrap();
+        let extra = Identity::from_secret_bytes([0x8Fu8; 32]);
+        store
+            .upsert(DeviceRecord {
+                id: extra.device_id(),
+                label: DeviceLabel::new("secret-household"),
+                fingerprint: NodeFingerprint::from_device_id(&extra.device_id())
+                    .as_str()
+                    .to_string(),
+                capabilities: Capability::all(),
+                trust: TrustState::Trusted,
+                linked_at: Utc::now(),
+                last_seen: None,
+                endpoint_hint: None,
+                mesh_id: Some(mesh.mesh_id.clone()),
+                aliases: vec![],
+                groups: vec![],
+                mesh_role: mymesh_core::MeshRole::Member,
+            })
+            .unwrap();
+
+        let guest = Identity::from_secret_bytes([0x91u8; 32]);
+        store
+            .upsert(DeviceRecord {
+                id: guest.device_id(),
+                label: DeviceLabel::new("guest-ephemeral"),
+                fingerprint: NodeFingerprint::from_device_id(&guest.device_id())
+                    .as_str()
+                    .to_string(),
+                capabilities: vec![Capability::Terminal],
+                trust: TrustState::Trusted,
+                linked_at: Utc::now(),
+                last_seen: None,
+                endpoint_hint: None,
+                mesh_id: Some(mesh.mesh_id.clone()),
+                aliases: vec![],
+                groups: vec![],
+                mesh_role: mymesh_core::MeshRole::Guest,
+            })
+            .unwrap();
+
+        let mut grants = GrantStore::open(paths.grants_file()).unwrap();
+        grants
+            .create_guest(
+                mesh.mesh_id.clone(),
+                guest.device_id(),
+                host.device_id(),
+                vec![Capability::Terminal],
+                None,
+                IssuedBy::device(&host.device_id()),
+            )
+            .unwrap();
+
+        let st = test_state(paths.clone(), secret, "host-a");
+        let app = mesh_v1_routes(st);
+        let token =
+            mint_device_member_token(&app, &mesh.mesh_id, &guest, &guest.device_id()).await;
+
+        // Simulate mid-session store wipe of guest row (would fail open without pin).
+        let mut store = DeviceStore::open(paths.devices_file()).unwrap();
+        store.remove(&guest.device_id()).unwrap();
+        assert!(store.get(&guest.device_id()).is_none());
+        assert!(!device_is_guest(&paths, &guest.device_id()));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mesh/v1/topology")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let topo = json_body(resp).await;
+        let members = topo["members"].as_array().unwrap();
+        let ids: Vec<String> = members
+            .iter()
+            .map(|m| m["device_id_hex"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            ids.contains(&guest.device_id().to_string()),
+            "guest self still listed (synthetic if row gone)"
+        );
+        assert!(ids.contains(&host.device_id().to_string()));
+        assert!(
+            !ids.contains(&extra.device_id().to_string()),
+            "pinned minimal must not leak household after guest row delete"
+        );
+        assert!(topo["grants_summary"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn topology_mrk_proof_includes_grants_summary() {
+        let paths = tmp_paths();
+        let secret = [0x92u8; 32];
+        let host = Identity::from_secret_bytes(secret);
+        let mesh = MeshState::new_mesh();
+        mesh.save(paths.mesh_file()).unwrap();
+
+        let password = b"test-mmk-topo-grants";
+        let init = mesh_init(
+            password,
+            Some(mymesh_crypto::KdfParams {
+                m: 64_000,
+                t: 2,
+                p: 1,
+            }),
+        )
+        .unwrap();
+        init.file.save(paths.mesh_master_file()).unwrap();
+        MmkRuntime::from_mrk(&init.mrk)
+            .save(paths.mmk_runtime_file())
+            .unwrap();
+
+        let guest = Identity::from_secret_bytes([0x93u8; 32]);
+        let mut grants = GrantStore::open(paths.grants_file()).unwrap();
+        let g = grants
+            .create_guest(
+                mesh.mesh_id.clone(),
+                guest.device_id(),
+                host.device_id(),
+                vec![Capability::Files],
+                None,
+                IssuedBy::MasterKeyProof(init.mrk.fingerprint()),
+            )
+            .unwrap();
+
+        let st = test_state(paths, secret, "host");
+        let app = mesh_v1_routes(st);
+        let (_, ch) = get_challenge(&app, "/mesh/v1/auth/challenge").await;
+        let cid = ch["challenge_id"].as_str().unwrap().to_string();
+        let nonce = decode_b64_32(ch["nonce"].as_str().unwrap()).unwrap();
+        let pre = auth_challenge_preimage(&cid, &nonce, &mesh.mesh_id, AuthMethod::MrkProof);
+        let admin = mrk_admin_identity(&init.mrk);
+        let sig = admin.sign(&pre);
+        let body = serde_json::json!({
+            "challenge_id": cid,
+            "method": "mrk_proof",
+            "sig_hex": hex::encode(sig),
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/auth/session")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let token = json_body(resp).await["session_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mesh/v1/topology")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let topo = json_body(resp).await;
+        assert_eq!(topo["auth_mode"], "mrk_proof");
+        let summary = topo["grants_summary"].as_array().unwrap();
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0]["grant_id"], g.grant_id);
+    }
+
+    #[tokio::test]
+    async fn topology_device_member_admin_non_host_sees_all_grants() {
+        let paths = tmp_paths();
+        let secret = [0x94u8; 32];
+        let host = Identity::from_secret_bytes(secret);
+        let mesh = MeshState::new_mesh();
+        mesh.save(paths.mesh_file()).unwrap();
+
+        // Trusted peer with Admin (not serving host).
+        let admin_peer = Identity::from_secret_bytes([0x95u8; 32]);
+        let mut store = DeviceStore::open(paths.devices_file()).unwrap();
+        store
+            .upsert(DeviceRecord {
+                id: admin_peer.device_id(),
+                label: DeviceLabel::new("admin-laptop"),
+                fingerprint: NodeFingerprint::from_device_id(&admin_peer.device_id())
+                    .as_str()
+                    .to_string(),
+                capabilities: Capability::with_admin(),
+                trust: TrustState::Trusted,
+                linked_at: Utc::now(),
+                last_seen: None,
+                endpoint_hint: None,
+                mesh_id: Some(mesh.mesh_id.clone()),
+                aliases: vec![],
+                groups: vec![],
+                mesh_role: mymesh_core::MeshRole::Member,
+            })
+            .unwrap();
+
+        let guest_a = Identity::from_secret_bytes([0x96u8; 32]);
+        let guest_b = Identity::from_secret_bytes([0x97u8; 32]);
+        let mut grants = GrantStore::open(paths.grants_file()).unwrap();
+        // Foreign grant: admin_peer is neither subject nor object — still visible with Admin.
+        let on_host = grants
+            .create_guest(
+                mesh.mesh_id.clone(),
+                guest_a.device_id(),
+                host.device_id(),
+                vec![Capability::Terminal],
+                None,
+                IssuedBy::device(&host.device_id()),
+            )
+            .unwrap();
+        let on_peer = grants
+            .create_guest(
+                mesh.mesh_id.clone(),
+                guest_b.device_id(),
+                admin_peer.device_id(),
+                vec![Capability::Files],
+                None,
+                IssuedBy::device(&host.device_id()),
+            )
+            .unwrap();
+
+        let st = test_state(paths, secret, "host");
+        let app = mesh_v1_routes(st);
+        let token = mint_device_member_token(
+            &app,
+            &mesh.mesh_id,
+            &admin_peer,
+            &admin_peer.device_id(),
+        )
+        .await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mesh/v1/topology")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let topo = json_body(resp).await;
+        let summary = topo["grants_summary"].as_array().unwrap();
+        assert_eq!(summary.len(), 2, "Admin non-host sees all active grants");
+        let ids: Vec<&str> = summary
+            .iter()
+            .map(|g| g["grant_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&on_host.grant_id.as_str()));
+        assert!(ids.contains(&on_peer.grant_id.as_str()));
     }
 }
