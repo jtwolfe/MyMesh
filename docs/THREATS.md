@@ -138,7 +138,7 @@ Normative IDs from [CARRIER-NEXT.md](CARRIER-NEXT.md) §S9. Status reflects **th
 
 - `GET /mesh/v1/topology` requires `Authorization: Bearer` mesh session.
 - Session minted only after challenge-response (`device_member` / `person_owner` / `mrk_proof` / short-lived `pair_read`).
-- Guests / pair_read get **minimal** topology, not full member roster.
+- Guests / pair_read get **minimal** topology, not full member roster (C4: guest `device_member` → self+object host; `grants_summary` for person_owner / mrk_proof / Admin-or-own device_member).
 
 **Planned:** Optional `snapshot_sig_hex` = host device Ed25519 over canonical topology body for TOFU/pinning displays. Until then, authenticity = possession of mesh session keys on the carrier process channel.
 
