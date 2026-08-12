@@ -1,10 +1,11 @@
-//! Pairing, join requests, sessions, agent, magic plane, carrier.
+//! Pairing, join requests, sessions, agent, magic plane, carrier, mesh/v1 API.
 
 mod agent;
 mod carrier;
 mod host_metrics;
 mod join;
 mod magic;
+mod mesh_api;
 mod mesh_sync;
 mod pair;
 mod session;
@@ -17,6 +18,9 @@ pub use agent::Agent;
 pub use carrier::{
     build_pair_qr, build_pair_qr_v2, carrier_pending_path, decode_pair_nonce, encode_pair_nonce,
     start_carrier, CarrierHandle, PairQrV2Params, PAIR_HTTP_PORT, PAIR_V1_PREFIX, PAIR_V2_PREFIX,
+};
+pub use mesh_api::{
+    auth_challenge_preimage, mrk_admin_identity, AuthMethod, MeshOwnerFile, MESH_V1_PREFIX,
 };
 pub use host_metrics::sample_metrics;
 pub use join::{handle_join_as_host, run_join_as_guest};
