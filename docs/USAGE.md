@@ -1,6 +1,6 @@
 # MyMesh usage guide (v0.1.0-alpha.3)
 
-This is the practical reference for day-to-day use. For design limits of the magic plane see [ALPHA-3.md](ALPHA-3.md). For linking security see [JOIN.md](JOIN.md) and [SECURITY.md](SECURITY.md). Next-phase contracts: [PAIR-V2.md](PAIR-V2.md), [MASTER-KEY.md](MASTER-KEY.md), [GRANTS.md](GRANTS.md), [GUEST.md](GUEST.md), [CARRIER-NEXT.md](CARRIER-NEXT.md).
+This is the practical reference for day-to-day use. For design limits of the magic plane see [ALPHA-3.md](ALPHA-3.md). For linking security see [JOIN.md](JOIN.md) and [SECURITY.md](SECURITY.md). Next-phase contracts: [PAIR-V2.md](PAIR-V2.md), [MASTER-KEY.md](MASTER-KEY.md), [GRANTS.md](GRANTS.md), [GUEST.md](GUEST.md), [CARRIER-NEXT.md](CARRIER-NEXT.md). Wave A pair demo (dual-scan + confirm): [DEMO-PAIR.md](DEMO-PAIR.md).
 
 ---
 
@@ -96,9 +96,32 @@ mymesh connect-request deny         # disarm early
 
 Arm auto-disarms after accept / timeout.
 
-### Connect-by-carrier (phone as scanner)
+### Pair v2 dual-scan + confirm (Wave A product path)
 
-Phone must reach the **carrier HTTP page** on one machine (same LAN, or open carrier port carefully).
+Internet-first decide without requiring phone HTTP to the host. Full demo checklist: **[DEMO-PAIR.md](DEMO-PAIR.md)**. Contract: [PAIR-V2.md](PAIR-V2.md).
+
+```bash
+# Machine A (resident) — mymesh serve must be running
+mymesh pair dual                    # QR_A v2 (nonce; ep=confirm if no --host)
+# optional LAN HTTP decide (needs mymesh carrier on :17878 — dual --host only sets the QR hint):
+# mymesh carrier &
+# mymesh pair dual --host http://<lan-ip>:17878
+
+# Machine B (joiner)
+mymesh pair dual --join --resident <did-or-words-from-A>   # QR_B + iroh dial
+
+# Phone: scan QR_A then QR_B → L2 Accept/Deny
+#   host reachable (carrier up) → POST /pair/v2/decide
+#   else → confirm codes on phone; on A:
+mymesh pair confirm <CODE>          # Crockford 4-4; hyphens optional
+mymesh pair status                  # optional
+```
+
+**Honesty:** Carrier `mock-pair-host` is **lab-only** (not in this repo) — not a production pair path. See [DEMO-PAIR.md](DEMO-PAIR.md).
+
+### Connect-by-carrier (phone as scanner — v1 LAN helper)
+
+Phone must reach the **carrier HTTP page** on one machine (same LAN, or open carrier port carefully). Migration path; `mymesh carrier` still emits **v1** QR until D5. Prefer dual-scan + confirm above when possible.
 
 ```bash
 # Machine A
@@ -396,6 +419,8 @@ mymesh demo pair                    # local SPAKE demo
 mymesh mailbox                      # HTTP SPAKE mailbox server
 ```
 
+Wave A pair product demo (dual-scan + confirm, two-agent harness, lab honesty): **[DEMO-PAIR.md](DEMO-PAIR.md)**.
+
 ---
 
 ## Quick diagnosis flowchart
@@ -419,7 +444,7 @@ carrier phone timeout?
 
 - [ALPHA-3.md](ALPHA-3.md) — magic plane  
 - [JOIN.md](JOIN.md) — pairing details  
-- [PAIR-V2.md](PAIR-V2.md) · [MASTER-KEY.md](MASTER-KEY.md) · [GRANTS.md](GRANTS.md) · [GUEST.md](GUEST.md)  
+- [PAIR-V2.md](PAIR-V2.md) · [DEMO-PAIR.md](DEMO-PAIR.md) · [MASTER-KEY.md](MASTER-KEY.md) · [GRANTS.md](GRANTS.md) · [GUEST.md](GUEST.md)  
 - [SECURITY.md](SECURITY.md) — threat model  
 - [CARRIER-NEXT.md](CARRIER-NEXT.md) — S0–S9 design  
 

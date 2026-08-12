@@ -1137,7 +1137,7 @@ Metrics dir: extend MyMesh `paths.metrics_dir` JSON counters (existing metrics p
 2. Topology optional `snapshot_sig_hex`.
 3. Persistent Carrier audit log redacted.
 4. Runbooks: lost phone; lost MMK; compromised guest; MMK leak rotate.
-5. mock-pair-host lab-only; DEMO-PAIR real MyMesh dual-scan+confirm.
+5. mock-pair-host lab-only; DEMO-PAIR real MyMesh dual-scan+confirm — see [DEMO-PAIR.md](DEMO-PAIR.md).
 6. **QR default policy (single KD):** After A3, `mymesh pair dual` emits **v2**. `mymesh carrier` (single-host LAN helper) continues **v1** until **D5**, then v2 default with `--pair-v1` escape.
 7. **Relay (KD31):** Optional Class C is **self-hosted only** if ever implemented; not a product deliverable in Waves A–E. No public MyMesh pair relay.
 
@@ -1340,7 +1340,7 @@ Incorporated final answers without redesign: display format 4-4; keyring opt-in 
 
 - Carrier: `docs/protocol/PAIR-HTTP.md`, `TRUST-MODEL.md`, `PLATFORM.md`, `design/ALPHA-1.md`
 - Carrier code: `crates/carrier-core/src/{pair_client,wire/pair,identity,policy,audit}.rs`
-- MyMesh: `docs/JOIN.md`, `SECURITY.md`, `ARCHITECTURE.md`
+- MyMesh: `docs/JOIN.md`, `docs/PAIR-V2.md`, `docs/DEMO-PAIR.md`, `SECURITY.md`, `ARCHITECTURE.md`
 - MyMesh code: `mymesh-session/src/{carrier,join,mesh_sync}.rs`, `mymesh-core/src/{device,join,mesh,paths}.rs`
 - GlassSpear: future consumer only
 
