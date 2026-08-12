@@ -12,8 +12,8 @@ mod tcp_tunnel;
 
 pub use agent::Agent;
 pub use carrier::{
-    build_pair_qr, carrier_pending_path, start_carrier, CarrierHandle, PAIR_HTTP_PORT,
-    PAIR_V1_PREFIX,
+    build_pair_qr, build_pair_qr_v2, carrier_pending_path, decode_pair_nonce, encode_pair_nonce,
+    start_carrier, CarrierHandle, PairQrV2Params, PAIR_HTTP_PORT, PAIR_V1_PREFIX, PAIR_V2_PREFIX,
 };
 pub use host_metrics::sample_metrics;
 pub use join::{handle_join_as_host, run_join_as_guest};

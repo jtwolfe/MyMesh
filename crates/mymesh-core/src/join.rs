@@ -4,21 +4,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ArmState {
     pub armed: bool,
     pub until: Option<DateTime<Utc>>,
     pub armed_at: Option<DateTime<Utc>>,
-}
-
-impl Default for ArmState {
-    fn default() -> Self {
-        Self {
-            armed: false,
-            until: None,
-            armed_at: None,
-        }
-    }
 }
 
 impl ArmState {
@@ -131,7 +121,7 @@ impl JoinStore {
             let raw = std::fs::read_to_string(ent.path())?;
             out.push(serde_json::from_str(&raw)?);
         }
-        out.sort_by(|a, b| a.received_at.cmp(&b.received_at));
+        out.sort_by_key(|a| a.received_at);
         Ok(out)
     }
 

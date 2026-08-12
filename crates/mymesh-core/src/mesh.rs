@@ -147,7 +147,7 @@ impl PendingKickStore {
 
     pub fn list(&self) -> Vec<&PendingKick> {
         let mut v: Vec<_> = self.kicks.values().collect();
-        v.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        v.sort_by_key(|b| std::cmp::Reverse(b.created_at));
         v
     }
 

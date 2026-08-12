@@ -75,4 +75,9 @@ impl Paths {
     pub fn mesh_dirty_file(&self) -> PathBuf {
         self.data_dir.join("mesh.dirty")
     }
+
+    /// Pair v2 sessions: `pair-sessions/<sid>.json` (mode 0600).
+    pub fn pair_sessions_dir(&self) -> PathBuf {
+        self.data_dir.join("pair-sessions")
+    }
 }

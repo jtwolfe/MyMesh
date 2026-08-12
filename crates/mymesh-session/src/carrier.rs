@@ -1,8 +1,9 @@
-//! Connect-by-carrier: local web page + pair/v1 HTTP for phone-assisted join.
+//! Connect-by-carrier: local web page + pair/v1 + pair/v2 HTTP for phone-assisted join.
 //!
 //! Port 17878 (default). Serves deprecated HTML (`/`, `/api/*`) and machine API
-//! under `/pair/v1` (status / pending / decide) using the same `Paths` as serve.
-use axum::extract::State;
+//! under `/pair/v1` (status / pending / decide) and `/pair/v2` using the same
+//! `Paths` as serve. PairSessionStore is source of truth for v2 (PAIR-V2.md).
+use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -11,8 +12,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
 use mymesh_core::{
-    ArmState, Config, DeviceId, JoinDecision, JoinStore, MeshState, NodeFingerprint, Paths,
-    PendingJoin,
+    ArmState, Config, DeviceId, JoinDecision, JoinStore, MeshState, NodeFingerprint,
+    PairEndpointClass, PairPhase, PairSessionFile, PairSessionStore, Paths, PendingJoin,
 };
 use mymesh_crypto::{device_id_to_words, device_join_uri, Identity};
 use rand::rngs::OsRng;
@@ -27,8 +28,12 @@ use tracing::info;
 
 /// Pair HTTP listen port (matches `CARRIER_TCP` / PAIR-HTTP.md).
 pub const PAIR_HTTP_PORT: u16 = 17878;
-/// Path prefix for the machine pair API.
+/// Path prefix for the machine pair API (v1, alpha.1).
 pub const PAIR_V1_PREFIX: &str = "/pair/v1";
+/// Path prefix for pair control plane v2.
+pub const PAIR_V2_PREFIX: &str = "/pair/v2";
+/// Timestamp skew allowed for SessionDecision.ts (±5 minutes).
+const DECIDE_TS_SKEW_SECS: i64 = 5 * 60;
 
 #[derive(Clone)]
 struct CarrierState {
@@ -206,10 +211,14 @@ fn build_router(st: CarrierState) -> Router {
         .route("/api/status", get(api_status))
         .route("/api/peer", post(api_peer))
         .route("/api/local", get(api_local))
-        // pair/v1 machine API
+        // pair/v1 machine API (compat through D5)
         .route("/pair/v1/status", get(pair_status))
         .route("/pair/v1/pending", get(pair_pending))
         .route("/pair/v1/decide", post(pair_decide))
+        // pair/v2 control plane (PairSessionStore)
+        .route("/pair/v2/status", get(pair_v2_status))
+        .route("/pair/v2/pending", get(pair_v2_pending))
+        .route("/pair/v2/decide", post(pair_v2_decide))
         .layer(CorsLayer::permissive())
         .with_state(st)
 }
@@ -229,6 +238,87 @@ pub fn build_pair_qr(host_base: &str, token: &str, fp: &str, mesh: Option<&str>)
         }
     }
     q
+}
+
+/// Parameters for a v2 pair bootstrap QR (`carrier://pair?v=2&…`).
+///
+/// `nonce` is **required** (16 raw bytes). `host` is optional — absent ⇒ `ep=confirm`.
+#[derive(Clone, Debug)]
+pub struct PairQrV2Params<'a> {
+    pub sid: &'a str,
+    pub did: &'a str,
+    pub token: &'a str,
+    /// 16 raw session nonce bytes (encoded as base64url no pad on the wire).
+    pub nonce: &'a [u8; 16],
+    pub fp: &'a str,
+    pub mesh: Option<&'a str>,
+    /// Optional direct host base URL (`http://ip:port`). When set, `ep` defaults to direct.
+    pub host: Option<&'a str>,
+    pub ep: Option<PairEndpointClass>,
+    pub relay: Option<&'a str>,
+}
+
+/// Build v2 pair QR. Fails only if nonce is not 16 bytes (compile-time via type) —
+/// call sites must supply a real session nonce (KD27).
+///
+/// ```text
+/// carrier://pair?v=2&sid=…&did=…&token=…&nonce=…&fp=…
+///              &ep=direct|confirm|relay
+///              &host=<optional>
+///              &mesh=<optional>
+///              &relay=<optional>
+/// ```
+pub fn build_pair_qr_v2(p: &PairQrV2Params<'_>) -> String {
+    let nonce_b64 = URL_SAFE_NO_PAD.encode(p.nonce);
+    let ep = p.ep.unwrap_or(if p.host.is_some() {
+        PairEndpointClass::Direct
+    } else {
+        PairEndpointClass::Confirm
+    });
+    let mut q = format!(
+        "carrier://pair?v=2&sid={}&did={}&token={}&nonce={}&fp={}&ep={}",
+        percent_encode(p.sid),
+        percent_encode(p.did),
+        percent_encode(p.token),
+        percent_encode(&nonce_b64),
+        percent_encode(p.fp),
+        ep.as_str(),
+    );
+    if let Some(h) = p.host {
+        if !h.is_empty() {
+            q.push_str("&host=");
+            q.push_str(&percent_encode(h));
+        }
+    }
+    if let Some(m) = p.mesh {
+        if !m.is_empty() {
+            q.push_str("&mesh=");
+            q.push_str(&percent_encode(m));
+        }
+    }
+    if let Some(r) = p.relay {
+        if !r.is_empty() {
+            q.push_str("&relay=");
+            q.push_str(&percent_encode(r));
+        }
+    }
+    q
+}
+
+/// Encode 16B nonce as base64url (no padding) for status / SessionDecision wire.
+pub fn encode_pair_nonce(nonce: &[u8; 16]) -> String {
+    URL_SAFE_NO_PAD.encode(nonce)
+}
+
+/// Decode base64url nonce; must be exactly 16 bytes.
+pub fn decode_pair_nonce(s: &str) -> Option<[u8; 16]> {
+    let bytes = URL_SAFE_NO_PAD.decode(s.as_bytes()).ok()?;
+    if bytes.len() != 16 {
+        return None;
+    }
+    let mut a = [0u8; 16];
+    a.copy_from_slice(&bytes);
+    Some(a)
 }
 
 fn percent_encode(s: &str) -> String {
@@ -584,6 +674,516 @@ async fn pair_decide(
         "pair/v1 decide written to JoinStore"
     );
     Json(DecideResponse { ok: true, state }).into_response()
+}
+
+// --- pair/v2 wire types (PAIR-V2.md) ---
+
+#[derive(Debug, Deserialize)]
+struct StatusQuery {
+    /// Optional sid; when absent, most recent active session is used.
+    sid: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PairStatusV2 {
+    protocol_version: u32,
+    sid: String,
+    ep: &'static str,
+    mesh_id: String,
+    host_label: String,
+    host_device_id_hex: String,
+    host_fingerprint: String,
+    host_short_id: String,
+    armed: bool,
+    arm_until: String,
+    /// Session wall-clock TTL (RFC3339).
+    until: String,
+    phase: &'static str,
+    /// base64url of 16B session nonce (echo of QR_A).
+    nonce: String,
+    auth_mode: &'static str,
+    joiner_device_id_hex: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionDecisionBody {
+    sid: String,
+    decision: DecideKind,
+    joiner_device_id_hex: String,
+    resident_device_id_hex: String,
+    ts: String,
+    /// base64url 16B — must match session nonce.
+    nonce: String,
+    #[serde(default)]
+    person_id: Option<String>,
+    #[serde(default)]
+    sig_hex: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DecideV2Response {
+    ok: bool,
+    state: &'static str,
+    sid: String,
+    phase: &'static str,
+}
+
+#[allow(clippy::result_large_err)] // axum Response as Err is intentional for early-return handlers
+fn pair_sessions(paths: &Paths) -> Result<PairSessionStore, Response> {
+    PairSessionStore::open(paths.pair_sessions_dir()).map_err(|e| {
+        pair_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("pair session store: {e}"),
+        )
+    })
+}
+
+/// Resolve Bearer → raw token bytes (32) for v2 session auth.
+#[allow(clippy::result_large_err)]
+fn extract_bearer_token_raw(headers: &HeaderMap) -> Result<[u8; 32], Response> {
+    let presented = match extract_bearer(headers) {
+        Some(t) => t,
+        None => {
+            return Err(pair_err(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "missing or malformed Authorization Bearer",
+            ));
+        }
+    };
+    match URL_SAFE_NO_PAD.decode(presented.as_bytes()) {
+        Ok(b) if b.len() == 32 => {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&b);
+            Ok(a)
+        }
+        _ => Err(pair_err(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "invalid bootstrap token encoding",
+        )),
+    }
+}
+
+/// Load session matching Bearer token (hash compare). Optional sid must match.
+#[allow(clippy::result_large_err)]
+fn require_v2_session(
+    paths: &Paths,
+    headers: &HeaderMap,
+    sid_hint: Option<&str>,
+) -> Result<(PairSessionStore, PairSessionFile, [u8; 32]), Response> {
+    let raw = extract_bearer_token_raw(headers)?;
+    let store = pair_sessions(paths)?;
+    let sess = match store.find_by_token_raw(&raw) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Err(pair_err(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "bootstrap token mismatch or unknown session",
+            ));
+        }
+        Err(e) => {
+            return Err(pair_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("session lookup: {e}"),
+            ));
+        }
+    };
+    if let Some(want) = sid_hint {
+        if sess.sid != want {
+            return Err(pair_err(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "token does not match sid",
+            ));
+        }
+    }
+    Ok((store, sess, raw))
+}
+
+#[allow(clippy::result_large_err)]
+fn resolve_status_session(
+    store: &PairSessionStore,
+    sid: Option<&str>,
+) -> Result<Option<PairSessionFile>, Response> {
+    if let Some(sid) = sid {
+        return store.load(sid).map_err(|e| {
+            pair_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("session load: {e}"),
+            )
+        });
+    }
+    store.active_session().map_err(|e| {
+        pair_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("session list: {e}"),
+        )
+    })
+}
+
+// --- pair/v2 handlers ---
+
+async fn pair_v2_status(
+    State(st): State<CarrierState>,
+    Query(q): Query<StatusQuery>,
+) -> Response {
+    let id = st.identity().device_id();
+    let store = match pair_sessions(&st.paths) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let sess = match resolve_status_session(&store, q.sid.as_deref()) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let Some(sess) = sess else {
+        return pair_err(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no active pair session",
+        );
+    };
+
+    let cfg = Config::load(st.paths.config_file()).unwrap_or_else(|_| Config {
+        device_label: st.label.clone(),
+        ..Config::default()
+    });
+    let arm = ArmState::load(st.paths.arm_file()).unwrap_or_default();
+    // Prefer session TTL for until; arm for armed flag (join window).
+    let armed = arm.is_effectively_armed() && !sess.is_expired_now() && sess.phase.is_open();
+    let phase = sess.effective_phase();
+
+    Json(PairStatusV2 {
+        protocol_version: 2,
+        sid: sess.sid.clone(),
+        ep: sess.ep.as_str(),
+        mesh_id: sess.mesh_id.clone(),
+        host_label: cfg.device_label,
+        host_device_id_hex: id.to_string(),
+        host_fingerprint: NodeFingerprint::from_device_id(&id).as_str().to_string(),
+        host_short_id: id.short(),
+        armed,
+        arm_until: arm.until.map(rfc3339).unwrap_or_else(|| rfc3339(sess.until)),
+        until: rfc3339(sess.until),
+        phase: phase.as_str(),
+        nonce: encode_pair_nonce(&sess.nonce),
+        auth_mode: "bootstrap_token",
+        joiner_device_id_hex: sess.joiner_device_id.map(|d| d.to_string()),
+    })
+    .into_response()
+}
+
+async fn pair_v2_pending(State(st): State<CarrierState>, headers: HeaderMap) -> Response {
+    let (store, sess, _) = match require_v2_session(&st.paths, &headers, None) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if sess.is_expired_now() {
+        return pair_err(
+            StatusCode::GONE,
+            "session_gone",
+            "pair session expired",
+        );
+    }
+
+    let joins = match JoinStore::open(st.paths.join_dir()) {
+        Ok(j) => j,
+        Err(e) => {
+            return pair_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("join store: {e}"),
+            );
+        }
+    };
+    let list = match joins.list_pending() {
+        Ok(p) => p,
+        Err(e) => {
+            return pair_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("list pending: {e}"),
+            );
+        }
+    };
+
+    // Bound to this sid only: if joiner set, filter; if armed, list all candidates.
+    let pending: Vec<PendingJoinWire> = list
+        .into_iter()
+        .filter(|p| match sess.joiner_device_id {
+            Some(jid) => p.device_id == jid,
+            None => sess.phase == PairPhase::Armed,
+        })
+        .map(|p: PendingJoin| {
+            let words = device_id_to_words(&p.device_id).unwrap_or_default();
+            PendingJoinWire {
+                device_id_hex: p.device_id.to_string(),
+                short_id: p.device_id.short(),
+                label: p.label,
+                fingerprint: p.fingerprint,
+                words,
+                capabilities: p.capabilities,
+                received_at: rfc3339(p.received_at),
+            }
+        })
+        .collect();
+    // silence unused when only store was needed for auth
+    let _ = store;
+    Json(PendingListResponse { pending }).into_response()
+}
+
+async fn pair_v2_decide(
+    State(st): State<CarrierState>,
+    headers: HeaderMap,
+    Json(body): Json<SessionDecisionBody>,
+) -> Response {
+    let (store, mut sess, _raw) = match require_v2_session(&st.paths, &headers, Some(&body.sid)) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+
+    // Optional person fields unused in Wave A (audit only).
+    let _ = (body.person_id, body.sig_hex);
+
+    if sess.sid != body.sid {
+        return pair_err(StatusCode::BAD_REQUEST, "bad_request", "sid mismatch");
+    }
+
+    // Nonce bind (anti-replay across sessions).
+    let Some(presented_nonce) = decode_pair_nonce(&body.nonce) else {
+        return pair_err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "nonce must be base64url of 16 bytes",
+        );
+    };
+    if !mymesh_core::ct_eq(&sess.nonce, &presented_nonce) {
+        return pair_err(
+            StatusCode::CONFLICT,
+            "conflict",
+            "nonce does not match session",
+        );
+    }
+
+    // Resident must match session.
+    let resident: DeviceId = match body.resident_device_id_hex.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return pair_err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "resident_device_id_hex must be 64 hex chars",
+            );
+        }
+    };
+    if resident != sess.resident_device_id {
+        return pair_err(
+            StatusCode::CONFLICT,
+            "conflict",
+            "resident_device_id does not match session",
+        );
+    }
+
+    let joiner: DeviceId = match body.joiner_device_id_hex.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return pair_err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "joiner_device_id_hex must be 64 hex chars",
+            );
+        }
+    };
+
+    // ts skew ±5 min.
+    let ts = match DateTime::parse_from_rfc3339(&body.ts) {
+        Ok(t) => t.with_timezone(&Utc),
+        Err(_) => {
+            return pair_err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "ts must be RFC3339",
+            );
+        }
+    };
+    let skew = (Utc::now() - ts).num_seconds().abs();
+    if skew > DECIDE_TS_SKEW_SECS {
+        return pair_err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "ts outside allowed skew (±5 min)",
+        );
+    }
+
+    if sess.is_expired_now() {
+        return pair_err(
+            StatusCode::GONE,
+            "session_gone",
+            "pair session expired",
+        );
+    }
+
+    let decision = match body.decision {
+        DecideKind::Accept => JoinDecision::Accept,
+        DecideKind::Deny => JoinDecision::Deny {
+            reason: body
+                .reason
+                .clone()
+                .unwrap_or_else(|| "denied by pair/v2".into()),
+        },
+    };
+
+    // Idempotent: already decided with same decision+joiner → ok.
+    if sess.phase.is_post_decide() {
+        let same_joiner = sess.joiner_device_id == Some(joiner);
+        let same_decision = matches!(
+            (&sess.decision, &decision),
+            (Some(JoinDecision::Accept), JoinDecision::Accept)
+                | (Some(JoinDecision::Deny { .. }), JoinDecision::Deny { .. })
+        );
+        if same_joiner && same_decision {
+            return Json(DecideV2Response {
+                ok: true,
+                state: "already_decided",
+                sid: sess.sid,
+                phase: sess.phase.as_str(),
+            })
+            .into_response();
+        }
+        return pair_err(
+            StatusCode::CONFLICT,
+            "already_decided",
+            "session already decided with different outcome",
+        );
+    }
+
+    // Binding gate (same as confirm): armed + zero pending → 409 not_bound;
+    // armed + single pending matching body joiner → bind; bound → verify match.
+    let joins = match JoinStore::open(st.paths.join_dir()) {
+        Ok(j) => j,
+        Err(e) => {
+            return pair_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("join store: {e}"),
+            );
+        }
+    };
+
+    match sess.phase {
+        PairPhase::Bound => {
+            if sess.joiner_device_id != Some(joiner) {
+                return pair_err(
+                    StatusCode::CONFLICT,
+                    "conflict",
+                    "joiner_device_id does not match bound session",
+                );
+            }
+        }
+        PairPhase::Armed => {
+            let pending = match joins.list_pending() {
+                Ok(p) => p,
+                Err(e) => {
+                    return pair_err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal",
+                        format!("list pending: {e}"),
+                    );
+                }
+            };
+            if pending.is_empty() {
+                // Fail closed: stay armed, do not hang.
+                return pair_err(
+                    StatusCode::CONFLICT,
+                    "not_bound",
+                    "Joiner has not dialed yet — wait for JoinRequest / finish dual-scan order, then re-run decide.",
+                );
+            }
+            // Prefer exact match on body joiner among pending; else single pending.
+            let match_pending = pending.iter().find(|p| p.device_id == joiner);
+            if let Some(p) = match_pending {
+                match store.bind_joiner(
+                    &sess.sid,
+                    joiner,
+                    Some(p.label.clone()),
+                    Some(p.fingerprint.clone()),
+                ) {
+                    Ok(s) => sess = s,
+                    Err(e) => {
+                        return pair_err(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "internal",
+                            format!("bind: {e}"),
+                        );
+                    }
+                }
+            } else if pending.len() == 1 {
+                // Body joiner must equal the only pending (phone bound scan B).
+                return pair_err(
+                    StatusCode::CONFLICT,
+                    "conflict",
+                    "joiner_device_id does not match pending join",
+                );
+            } else {
+                return pair_err(
+                    StatusCode::CONFLICT,
+                    "ambiguous_pending",
+                    "multiple pending joins; bind joiner first",
+                );
+            }
+        }
+        other => {
+            return pair_err(
+                StatusCode::CONFLICT,
+                "session_phase",
+                format!("cannot decide in phase {}", other.as_str()),
+            );
+        }
+    }
+
+    // Write JoinStore decision for bound joiner only.
+    if let Err(e) = joins.write_decision(&joiner, decision.clone()) {
+        return pair_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("write decision: {e}"),
+        );
+    }
+    let _ = std::fs::remove_file(joins.pending_path(&joiner));
+
+    if let Err(e) = store.write_decision(&sess.sid, decision, false) {
+        return pair_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("session decide: {e}"),
+        );
+    }
+
+    let state = match body.decision {
+        DecideKind::Accept => "accepted",
+        DecideKind::Deny => "denied",
+    };
+    info!(
+        sid = %sess.sid,
+        peer = %joiner.short(),
+        decision = state,
+        "pair/v2 decide written to JoinStore + PairSessionStore"
+    );
+    Json(DecideV2Response {
+        ok: true,
+        state,
+        sid: sess.sid,
+        phase: PairPhase::Decided.as_str(),
+    })
+    .into_response()
 }
 
 // --- deprecated HTML fallback ---
@@ -1089,5 +1689,316 @@ mod tests {
         let s = rfc3339(t);
         assert!(s.ends_with('Z'));
         assert!(!s.contains('.'));
+    }
+
+    // --- pair/v2 ---
+
+    use mymesh_core::{PairEndpointClass, PairSessionStore};
+
+    fn arm_v2_session(
+        paths: &Paths,
+        resident: DeviceId,
+        ep: PairEndpointClass,
+    ) -> (String, String, [u8; 16], String) {
+        let mesh = MeshState::load(paths.mesh_file()).unwrap_or_else(|_| {
+            let m = MeshState::new_mesh();
+            m.save(paths.mesh_file()).unwrap();
+            m
+        });
+        let store = PairSessionStore::open(paths.pair_sessions_dir()).unwrap();
+        let armed = store.arm_new(&mesh.mesh_id, resident, 900, ep).unwrap();
+        let token = URL_SAFE_NO_PAD.encode(armed.token_raw);
+        (
+            armed.session.sid,
+            token,
+            armed.session.nonce,
+            mesh.mesh_id,
+        )
+    }
+
+    #[test]
+    fn pair_qr_v2_requires_nonce_optional_host() {
+        let nonce = [0x42u8; 16];
+        let qr = build_pair_qr_v2(&PairQrV2Params {
+            sid: "01HZXEXAMPLE00000000000000",
+            did: "abababababababababababababababababababababababababababababababab",
+            token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            nonce: &nonce,
+            fp: "a1b2-c3d4-e5f6-7890-abcd-ef01-2345-6789",
+            mesh: Some("mesh-1"),
+            host: None,
+            ep: None,
+            relay: None,
+        });
+        assert!(qr.starts_with("carrier://pair?v=2&"));
+        assert!(qr.contains("sid=01HZXEXAMPLE00000000000000"));
+        assert!(qr.contains(&format!("nonce={}", URL_SAFE_NO_PAD.encode(nonce))));
+        assert!(qr.contains("ep=confirm"));
+        assert!(!qr.contains("host="));
+        assert!(qr.contains("mesh=mesh-1"));
+
+        let qr_host = build_pair_qr_v2(&PairQrV2Params {
+            sid: "01HZXEXAMPLE00000000000000",
+            did: "aa",
+            token: "tok",
+            nonce: &nonce,
+            fp: "fp",
+            mesh: None,
+            host: Some("http://192.168.1.10:17878"),
+            ep: None,
+            relay: None,
+        });
+        assert!(qr_host.contains("ep=direct"));
+        assert!(qr_host.contains("host=http%3A%2F%2F192.168.1.10%3A17878"));
+    }
+
+    #[test]
+    fn nonce_roundtrip_wire() {
+        let n = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let s = encode_pair_nonce(&n);
+        assert!(!s.contains('='));
+        assert_eq!(decode_pair_nonce(&s).unwrap(), n);
+        assert!(decode_pair_nonce("AAAA").is_none()); // wrong length
+    }
+
+    #[tokio::test]
+    async fn v2_status_public_echoes_session_nonce() {
+        let paths = tmp_paths();
+        let secret = [0x71u8; 32];
+        let id = Identity::from_secret_bytes(secret);
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        ArmState::arm(paths.arm_file(), 600).unwrap();
+        let (sid, _token, nonce, mesh_id) =
+            arm_v2_session(&paths, id.device_id(), PairEndpointClass::Confirm);
+
+        let st = test_state(paths, secret, "host");
+        let app = build_router(st);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/pair/v2/status?sid={sid}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        assert_eq!(v["protocol_version"], 2);
+        assert_eq!(v["sid"], sid);
+        assert_eq!(v["mesh_id"], mesh_id);
+        assert_eq!(v["nonce"], encode_pair_nonce(&nonce));
+        assert_eq!(v["phase"], "armed");
+        assert_eq!(v["ep"], "confirm");
+        assert_eq!(v["host_device_id_hex"], id.device_id().to_string());
+    }
+
+    #[tokio::test]
+    async fn v2_pending_requires_bearer() {
+        let paths = tmp_paths();
+        let secret = [0x72u8; 32];
+        let id = Identity::from_secret_bytes(secret);
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        ArmState::arm(paths.arm_file(), 600).unwrap();
+        let (_sid, token, _nonce, _) =
+            arm_v2_session(&paths, id.device_id(), PairEndpointClass::Confirm);
+
+        let joiner = DeviceId::from_bytes([0xc2u8; 32]);
+        JoinStore::open(paths.join_dir())
+            .unwrap()
+            .write_pending(&PendingJoin {
+                device_id: joiner,
+                label: "peer".into(),
+                capabilities: Capability::all(),
+                received_at: Utc::now(),
+                fingerprint: NodeFingerprint::from_device_id(&joiner)
+                    .as_str()
+                    .to_string(),
+            })
+            .unwrap();
+
+        let st = test_state(paths, secret, "host");
+        let app = build_router(st);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/pair/v2/pending")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/pair/v2/pending")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        assert_eq!(v["pending"][0]["device_id_hex"], joiner.to_string());
+    }
+
+    #[tokio::test]
+    async fn v2_decide_not_bound_when_zero_pending() {
+        let paths = tmp_paths();
+        let secret = [0x73u8; 32];
+        let id = Identity::from_secret_bytes(secret);
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        ArmState::arm(paths.arm_file(), 600).unwrap();
+        let (sid, token, nonce, _) =
+            arm_v2_session(&paths, id.device_id(), PairEndpointClass::Direct);
+
+        let joiner = DeviceId::from_bytes([0xd3u8; 32]);
+        let st = test_state(paths.clone(), secret, "host");
+        let app = build_router(st);
+
+        let body = serde_json::json!({
+            "sid": sid,
+            "decision": "accept",
+            "joiner_device_id_hex": joiner.to_string(),
+            "resident_device_id_hex": id.device_id().to_string(),
+            "ts": rfc3339(Utc::now()),
+            "nonce": encode_pair_nonce(&nonce),
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/pair/v2/decide")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let v = json_body(resp).await;
+        assert_eq!(v["code"], "not_bound");
+
+        // Session remains armed (fail closed, no hang / no force-bind).
+        let store = PairSessionStore::open(paths.pair_sessions_dir()).unwrap();
+        let s = store.load(&sid).unwrap().unwrap();
+        assert_eq!(s.phase, mymesh_core::PairPhase::Armed);
+        assert!(s.joiner_device_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn v2_decide_bind_single_pending_and_nonce_mismatch() {
+        let paths = tmp_paths();
+        let secret = [0x74u8; 32];
+        let id = Identity::from_secret_bytes(secret);
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        ArmState::arm(paths.arm_file(), 600).unwrap();
+        let (sid, token, nonce, _) =
+            arm_v2_session(&paths, id.device_id(), PairEndpointClass::Direct);
+
+        let joiner = DeviceId::from_bytes([0xe4u8; 32]);
+        let joins = JoinStore::open(paths.join_dir()).unwrap();
+        joins
+            .write_pending(&PendingJoin {
+                device_id: joiner,
+                label: "joiner".into(),
+                capabilities: Capability::all(),
+                received_at: Utc::now(),
+                fingerprint: NodeFingerprint::from_device_id(&joiner)
+                    .as_str()
+                    .to_string(),
+            })
+            .unwrap();
+
+        let st = test_state(paths.clone(), secret, "host");
+        let app = build_router(st);
+
+        // Wrong nonce → conflict
+        let bad = serde_json::json!({
+            "sid": sid,
+            "decision": "accept",
+            "joiner_device_id_hex": joiner.to_string(),
+            "resident_device_id_hex": id.device_id().to_string(),
+            "ts": rfc3339(Utc::now()),
+            "nonce": encode_pair_nonce(&[0xffu8; 16]),
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/pair/v2/decide")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(bad.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(json_body(resp).await["code"], "conflict");
+
+        // Correct nonce + single pending matching joiner → accept + bind
+        let good = serde_json::json!({
+            "sid": sid,
+            "decision": "accept",
+            "joiner_device_id_hex": joiner.to_string(),
+            "resident_device_id_hex": id.device_id().to_string(),
+            "ts": rfc3339(Utc::now()),
+            "nonce": encode_pair_nonce(&nonce),
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/pair/v2/decide")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(good.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["state"], "accepted");
+        assert_eq!(v["phase"], "decided");
+
+        let store = PairSessionStore::open(paths.pair_sessions_dir()).unwrap();
+        let s = store.load(&sid).unwrap().unwrap();
+        assert_eq!(s.phase, mymesh_core::PairPhase::Decided);
+        assert_eq!(s.joiner_device_id, Some(joiner));
+        assert!(matches!(s.decision, Some(JoinDecision::Accept)));
+        let d = joins.take_decision(&joiner).unwrap().unwrap();
+        assert!(matches!(d, JoinDecision::Accept));
+    }
+
+    #[tokio::test]
+    async fn v1_still_works_alongside_v2() {
+        let paths = tmp_paths();
+        let secret = [0x75u8; 32];
+        ArmState::arm(paths.arm_file(), 600).unwrap();
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        let st = test_state(paths, secret, "host");
+        let _ = mint_token(&st).await;
+        let app = build_router(st);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/pair/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await["protocol_version"], 1);
     }
 }
