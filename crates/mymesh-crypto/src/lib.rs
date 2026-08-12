@@ -5,9 +5,11 @@
 //! - BIP39 24-word display encoding of device ids
 //! - HKDF session key derivation after pairing / handshake
 //! - Mesh master key (MMK): Argon2id wrap of mesh root key (MRK)
+//! - Owner claim preimage + sealed person backup (S4)
 
 mod identity;
 mod master_key;
+mod owner;
 mod pairing;
 mod word_id;
 mod words;
@@ -22,6 +24,12 @@ pub use master_key::{
     KdfParams, MeshInitResult, MeshMasterFile, MmkRuntime, Mrk, MrkAdminProof, MrkProofMethod,
     RecoveryCode, WrappedMrk, DEFAULT_M_KIB, DEFAULT_P, DEFAULT_T, HKDF_ADMIN_MAC,
     HKDF_ADMIN_SIGN, MRK_PROOF_DOMAIN, RECOVERY_CODE_COUNT,
+};
+pub use owner::{
+    accept_owner_claim, check_claim_authorized, owner_claim_preimage, resolve_claim_fingerprint,
+    seal_owner_backup, sign_owner_claim, unseal_owner_backup, verify_owner_claim_sig,
+    ClaimAuthMethod, ClaimWindowFile, MeshOwnerFile, OwnerBackupSealed, OwnerClaimRequest,
+    OWNER_CLAIM_DOMAIN,
 };
 pub use pairing::{PairingRole, PairingSession, SharedSecret};
 pub use word_id::{device_id_to_words, device_join_uri, parse_device_id};

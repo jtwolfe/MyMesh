@@ -15,9 +15,11 @@ use mymesh_core::{
     ArmState, Capability, Config, DeviceStore, JoinDecision, JoinStore, MeshState, Paths,
 };
 use mymesh_crypto::{
-    admin_verifying_key_bytes, device_id_to_words, device_join_uri, mesh_init,
-    mesh_recover_with_code, mesh_rotate_password, mesh_unlock_password, parse_device_id,
-    sign_mrk_proof_ed25519, Identity, MeshMasterFile, MmkRuntime, RecoveryCode,
+    accept_owner_claim, admin_verifying_key_bytes, check_claim_authorized, device_id_to_words,
+    device_join_uri, mesh_init, mesh_recover_with_code, mesh_rotate_password, mesh_unlock_password,
+    parse_device_id, resolve_claim_fingerprint, seal_owner_backup, sign_mrk_proof_ed25519,
+    unseal_owner_backup, ClaimAuthMethod, ClaimWindowFile, Identity, MeshMasterFile,
+    MeshOwnerFile, MmkRuntime, OwnerBackupSealed, OwnerClaimRequest, RecoveryCode,
 };
 use mymesh_net::{
     run_mailbox_server, FsMailbox, HttpMailbox, IrohTransport, LocalFabric, LocalRendezvous,
@@ -224,6 +226,11 @@ enum Commands {
         #[command(subcommand)]
         action: MeshCmd,
     },
+    /// Person owner claim + sealed backup (S4; MMK is policy root)
+    Owner {
+        #[command(subcommand)]
+        action: OwnerCmd,
+    },
     /// Kick a device from the mesh (double confirmation required)
     Kick {
         #[arg(value_name = "DEVICE")]
@@ -401,6 +408,74 @@ enum MeshCmd {
         owner_proof: bool,
         #[arg(long, value_name = "PATH")]
         password_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum OwnerCmd {
+    /// Open a claim window (MMK unlocked; phone may claim without live unlock)
+    #[command(name = "allow-claim")]
+    AllowClaim {
+        /// Window lifetime in seconds (default 300, max 86400)
+        #[arg(long, default_value_t = 300)]
+        secs: u64,
+    },
+    /// Accept a person-signed claim on this host (requires MMK unlock or claim window)
+    Claim {
+        #[arg(long)]
+        person_id: String,
+        /// Person Ed25519 public key (64 hex chars)
+        #[arg(long)]
+        person_pubkey: String,
+        /// File containing claim signature hex over S0 preimage
+        #[arg(long, value_name = "PATH")]
+        sig_file: PathBuf,
+        /// Unix timestamp signed in preimage (default: now)
+        #[arg(long)]
+        ts: Option<i64>,
+        #[arg(long)]
+        display_name: Option<String>,
+        /// Replace existing owner (requires live MMK unlock)
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Show current owner claim + backup slot
+    Show,
+    /// Clear owner claim (requires MMK unlocked — mesh-destructive)
+    Clear {
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Sealed owner backup export / import / seal-store
+    Backup {
+        #[command(subcommand)]
+        action: OwnerBackupCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum OwnerBackupCmd {
+    /// Copy on-disk sealed blob to a path
+    Export {
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+    },
+    /// Import a sealed blob file into owner-backup.sealed
+    Import {
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+    },
+    /// Seal a 32-byte seed hex under a password and store (test / air-gap helper)
+    Store {
+        #[arg(long)]
+        person_id: String,
+        /// 32-byte person seed as hex
+        #[arg(long)]
+        seed_hex: String,
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+        #[arg(long)]
+        hint: Option<String>,
     },
 }
 
@@ -698,6 +773,37 @@ async fn main() -> Result<()> {
                 owner_proof,
                 password_file,
             } => cmd_mesh_recover_master(&paths, code, owner_proof, password_file)?,
+        },
+        Commands::Owner { action } => match action {
+            OwnerCmd::AllowClaim { secs } => cmd_owner_allow_claim(&paths, secs)?,
+            OwnerCmd::Claim {
+                person_id,
+                person_pubkey,
+                sig_file,
+                ts,
+                display_name,
+                replace,
+            } => cmd_owner_claim(
+                &paths,
+                &person_id,
+                &person_pubkey,
+                &sig_file,
+                ts,
+                display_name,
+                replace,
+            )?,
+            OwnerCmd::Show => cmd_owner_show(&paths)?,
+            OwnerCmd::Clear { yes } => cmd_owner_clear(&paths, yes)?,
+            OwnerCmd::Backup { action } => match action {
+                OwnerBackupCmd::Export { out } => cmd_owner_backup_export(&paths, &out)?,
+                OwnerBackupCmd::Import { input } => cmd_owner_backup_import(&paths, &input)?,
+                OwnerBackupCmd::Store {
+                    person_id,
+                    seed_hex,
+                    password_file,
+                    hint,
+                } => cmd_owner_backup_store(&paths, &person_id, &seed_hex, password_file, hint)?,
+            },
         },
         Commands::Kick {
             device,
@@ -1848,7 +1954,9 @@ fn cmd_mesh_recover_master(
     password_file: Option<PathBuf>,
 ) -> Result<()> {
     if owner_proof {
-        bail!("--owner-proof recovery requires owner claim (S4); not available yet");
+        bail!(
+            "--owner-proof recovery: challenge/sign flow not yet wired; use --code recovery for now"
+        );
     }
     let code_str = code.ok_or_else(|| {
         anyhow::anyhow!("pass --code <recovery-hex> (printed once at mesh init)")
@@ -1859,6 +1967,15 @@ fn cmd_mesh_recover_master(
     let (new_file, mrk) =
         mesh_recover_with_code(&file, &recovery, new_pass.as_bytes(), None)?;
     new_file.save(paths.mesh_master_file())?;
+    // KD28: update owner claim fingerprint without clearing person binding.
+    if let Some(mut owner) = MeshOwnerFile::try_load(paths.mesh_owner_file())? {
+        owner.bump_mrk_fingerprint(&new_file.mrk_fingerprint);
+        owner.save(paths.mesh_owner_file())?;
+        println!(
+            "  owner claim retained; mrk_fingerprint → {} (epoch {})",
+            owner.mrk_fingerprint, owner.mrk_epoch
+        );
+    }
     // Force re-unlock after recovery (new MRK).
     let _ = MmkRuntime::clear(paths.mmk_runtime_file());
     println!(
@@ -1869,6 +1986,240 @@ fn cmd_mesh_recover_master(
     );
     println!("  old MRK invalidated; run mymesh mesh unlock with the new password");
     let _ = mrk; // zeroized on drop
+    Ok(())
+}
+
+fn cmd_owner_allow_claim(paths: &Paths, secs: u64) -> Result<()> {
+    if !MeshMasterFile::exists(paths.mesh_master_file()) {
+        bail!("mesh master not initialized — run mymesh mesh init first");
+    }
+    // Requires unlocked MMK (or we could accept recovery at mint — unlocked is the S0 path).
+    let rt = MmkRuntime::load(paths.mmk_runtime_file())?
+        .ok_or_else(|| anyhow::anyhow!("MMK locked — run mymesh mesh unlock before allow-claim"))?;
+    let _mrk = rt.to_mrk()?;
+    let win = ClaimWindowFile::mint(&rt.mrk_fingerprint, secs);
+    win.save(paths.claim_window_file())?;
+    println!("{}", style("claim window open").green().bold());
+    println!("  until           {}", win.until.to_rfc3339());
+    println!("  secs            {}", win.secs);
+    println!("  mrk_fingerprint {}", win.mrk_fingerprint);
+    println!("  nonce           {}", win.nonce);
+    println!(
+        "  file            {} (mode 0600; phone may POST person-signed claim)",
+        paths.claim_window_file().display()
+    );
+    println!("  note            phone never receives MMK/MRK — person sig only");
+    Ok(())
+}
+
+fn cmd_owner_claim(
+    paths: &Paths,
+    person_id: &str,
+    person_pubkey: &str,
+    sig_file: &Path,
+    ts: Option<i64>,
+    display_name: Option<String>,
+    replace: bool,
+) -> Result<()> {
+    let auth = check_claim_authorized(paths.mmk_runtime_file(), paths.claim_window_file())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mrk_fp = resolve_claim_fingerprint(
+        auth,
+        paths.mmk_runtime_file(),
+        paths.claim_window_file(),
+        paths.mesh_master_file(),
+    )?;
+    let mesh = MeshState::load(paths.mesh_file())?;
+    let ts_unix = ts.unwrap_or_else(|| chrono::Utc::now().timestamp());
+    let sig_hex = std::fs::read_to_string(sig_file)
+        .with_context(|| format!("read sig file {}", sig_file.display()))?;
+    let sig_hex = sig_hex.trim().to_string();
+
+    let identity = Identity::load(paths.identity_file())?;
+    let existing = MeshOwnerFile::try_load(paths.mesh_owner_file())?;
+    let req = OwnerClaimRequest {
+        mesh_id: mesh.mesh_id,
+        person_id: person_id.to_string(),
+        person_public_key_hex: person_pubkey.trim().to_string(),
+        display_name: display_name.unwrap_or_default(),
+        ts_unix,
+        claim_sig_hex: sig_hex,
+        claimed_from_device_id: Some(identity.device_id().to_string()),
+        replace,
+    };
+    let file = accept_owner_claim(
+        &req,
+        &mrk_fp,
+        auth,
+        existing.as_ref(),
+        paths.mesh_owner_file(),
+    )?;
+    if auth == ClaimAuthMethod::ClaimWindow {
+        let _ = ClaimWindowFile::clear(paths.claim_window_file());
+    }
+    println!("{}", style("owner claimed").green().bold());
+    println!("  person_id       {}", file.person_id);
+    println!("  display_name    {}", file.display_name);
+    println!("  mrk_fingerprint {}", file.mrk_fingerprint);
+    println!("  claimed_at      {}", file.claimed_at.to_rfc3339());
+    println!(
+        "  auth            {}",
+        match auth {
+            ClaimAuthMethod::MrkUnlocked => "agent_cosign (MMK unlocked)",
+            ClaimAuthMethod::ClaimWindow => "claim_window",
+        }
+    );
+    println!("  file            {}", paths.mesh_owner_file().display());
+    Ok(())
+}
+
+fn cmd_owner_show(paths: &Paths) -> Result<()> {
+    match MeshOwnerFile::try_load(paths.mesh_owner_file())? {
+        Some(o) => {
+            println!("{}", style("owner claim").green().bold());
+            println!("  person_id       {}", o.person_id);
+            println!("  display_name    {}", o.display_name);
+            println!("  person_pk       {}", o.person_public_key_hex);
+            println!("  mesh_id         {}", o.mesh_id);
+            println!("  mrk_fingerprint {}", o.mrk_fingerprint);
+            println!("  mrk_epoch       {}", o.mrk_epoch);
+            println!("  claimed_at      {}", o.claimed_at.to_rfc3339());
+            if let Some(d) = &o.claimed_from_device_id {
+                println!("  claimed_from    {d}");
+            }
+            let backup = paths.owner_backup_file().exists();
+            println!(
+                "  backup_slot     {}",
+                if backup {
+                    format!("stored ({})", paths.owner_backup_file().display())
+                } else if o.backup_stored_at.is_some() {
+                    "marked but file missing".into()
+                } else {
+                    "empty".into()
+                }
+            );
+        }
+        None => {
+            println!("{}", style("no owner claim").yellow().bold());
+            println!("  claim with MMK unlocked or: mymesh owner allow-claim");
+            println!("  then: mymesh owner claim --person-id … --person-pubkey … --sig-file …");
+        }
+    }
+    if let Some(win) = ClaimWindowFile::try_load(paths.claim_window_file())? {
+        if win.is_valid_now() {
+            println!(
+                "  claim_window    open until {} (nonce {})",
+                win.until.to_rfc3339(),
+                &win.nonce[..8.min(win.nonce.len())]
+            );
+        } else {
+            println!("  claim_window    expired");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_owner_clear(paths: &Paths, yes: bool) -> Result<()> {
+    if !yes {
+        bail!("refusing to clear owner without --yes (mesh-destructive; requires MMK unlock)");
+    }
+    // Live MRK required for clear (policy root).
+    let _rt = MmkRuntime::load(paths.mmk_runtime_file())?
+        .ok_or_else(|| anyhow::anyhow!("MMK locked — unlock before clearing owner claim"))?;
+    let cleared = MeshOwnerFile::clear(paths.mesh_owner_file())?;
+    let _ = std::fs::remove_file(paths.owner_backup_file());
+    let _ = ClaimWindowFile::clear(paths.claim_window_file());
+    if cleared {
+        println!("{}", style("owner cleared").yellow().bold());
+    } else {
+        println!("no owner claim present");
+    }
+    Ok(())
+}
+
+fn cmd_owner_backup_export(paths: &Paths, out: &Path) -> Result<()> {
+    let sealed = OwnerBackupSealed::load(paths.owner_backup_file())?;
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    sealed.save(out)?;
+    println!(
+        "{} → {}",
+        style("exported").green().bold(),
+        out.display()
+    );
+    Ok(())
+}
+
+fn cmd_owner_backup_import(paths: &Paths, input: &Path) -> Result<()> {
+    let raw = std::fs::read_to_string(input)
+        .with_context(|| format!("read {}", input.display()))?;
+    let sealed: OwnerBackupSealed = serde_json::from_str(&raw)?;
+    OwnerBackupSealed::store_blob(paths.owner_backup_file(), &sealed)?;
+    if let Some(mut owner) = MeshOwnerFile::try_load(paths.mesh_owner_file())? {
+        owner.mark_backup_stored();
+        owner.save(paths.mesh_owner_file())?;
+    }
+    println!(
+        "{} person_id={} → {}",
+        style("imported").green().bold(),
+        sealed.person_id,
+        paths.owner_backup_file().display()
+    );
+    Ok(())
+}
+
+fn cmd_owner_backup_store(
+    paths: &Paths,
+    person_id: &str,
+    seed_hex: &str,
+    password_file: Option<PathBuf>,
+    hint: Option<String>,
+) -> Result<()> {
+    let cleaned: String = seed_hex
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let bytes = hex::decode(&cleaned).context("seed_hex")?;
+    if bytes.len() != 32 {
+        bail!("seed must be 32 bytes (64 hex chars), got {}", bytes.len());
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&bytes);
+    // Reuse MMK password helper but prefer MYMESH_BACKUP_PASSWORD when set.
+    let password = if let Ok(env) = std::env::var("MYMESH_BACKUP_PASSWORD") {
+        if !env.is_empty() {
+            env
+        } else {
+            read_mmk_password(password_file.as_deref(), "Owner backup password", true)?
+        }
+    } else {
+        read_mmk_password(password_file.as_deref(), "Owner backup password", true)?
+    };
+    let sealed = seal_owner_backup(
+        password.as_bytes(),
+        person_id,
+        &seed,
+        "",
+        hint.as_deref(),
+        None,
+    )?;
+    OwnerBackupSealed::store_blob(paths.owner_backup_file(), &sealed)?;
+    if let Some(mut owner) = MeshOwnerFile::try_load(paths.mesh_owner_file())? {
+        owner.mark_backup_stored();
+        owner.save(paths.mesh_owner_file())?;
+    }
+    // Smoke-check roundtrip.
+    let (out, _) = unseal_owner_backup(password.as_bytes(), &sealed)?;
+    if out != seed {
+        bail!("internal: backup roundtrip mismatch");
+    }
+    println!(
+        "{} person_id={} → {}",
+        style("backup stored").green().bold(),
+        person_id,
+        paths.owner_backup_file().display()
+    );
     Ok(())
 }
 

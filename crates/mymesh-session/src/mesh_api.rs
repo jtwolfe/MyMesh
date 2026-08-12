@@ -1,4 +1,4 @@
-//! Mesh API v1 — auth challenge (Issue 4) + topology read from DeviceStore.
+//! Mesh API v1 — auth challenge (Issue 4) + topology + owner claim (S4/B4).
 //!
 //! Routes (served on the carrier HTTP process, same Paths as serve):
 //!
@@ -6,6 +6,11 @@
 //! GET  /mesh/v1/auth/challenge   # public: nonce + methods_allowed
 //! POST /mesh/v1/auth/session     # prove challenge → short-lived session token
 //! GET  /mesh/v1/topology         # Authorization: Bearer <mesh session>
+//! POST /mesh/v1/owner/claim      # person sig; agent co-sign MRK or claim-window
+//! GET  /mesh/v1/owner            # public meta (any mesh session or public)
+//! PUT  /mesh/v1/owner/backup     # person_owner session
+//! GET  /mesh/v1/owner/backup     # person_owner | mrk_proof
+//! DELETE /mesh/v1/owner/claim    # mrk_proof only (or host-local via CLI)
 //! ```
 //!
 //! Auth methods (S0 freeze / CARRIER-NEXT Issue 4):
@@ -14,7 +19,8 @@
 //! - `device_member`  — device Ed25519 of Trusted member (or serving host)
 //! - `pair_read`      — bootstrap-bound pair session → **minimal** topology only
 //!
-//! See docs/CARRIER-NEXT.md §S6 and docs/MASTER-KEY.md.
+//! Owner claim: phone sends **person signature only** — never MMK/MRK.
+//! See docs/CARRIER-NEXT.md §S4/S6 and docs/MASTER-KEY.md.
 
 // axum Response as Err is intentional for early-return handler helpers (same as carrier).
 #![allow(clippy::result_large_err)]
@@ -22,7 +28,7 @@
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -32,7 +38,9 @@ use mymesh_core::{
     PairSessionStore, Paths, TrustState,
 };
 use mymesh_crypto::{
-    Identity, IdentityPublic, MeshMasterFile, MmkRuntime, Mrk, HKDF_ADMIN_SIGN,
+    accept_owner_claim, check_claim_authorized, resolve_claim_fingerprint, ClaimAuthMethod,
+    Identity, IdentityPublic, MeshMasterFile, MeshOwnerFile, MmkRuntime, Mrk, OwnerBackupSealed,
+    OwnerClaimRequest, HKDF_ADMIN_SIGN,
 };
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -199,37 +207,6 @@ struct MeshErrorBody {
     code: &'static str,
 }
 
-/// Minimal owner claim file reader (S4 shape; claim write is B4).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MeshOwnerFile {
-    pub mesh_id: String,
-    pub person_id: String,
-    pub person_public_key_hex: String,
-    #[serde(default)]
-    pub display_name: String,
-    #[serde(default)]
-    pub claimed_at: Option<DateTime<Utc>>,
-    #[serde(default)]
-    pub claimed_from_device_id: Option<String>,
-    #[serde(default)]
-    pub mrk_fingerprint: Option<String>,
-    #[serde(default)]
-    pub mrk_epoch: u64,
-    #[serde(default)]
-    pub claim_sig_hex: Option<String>,
-}
-
-impl MeshOwnerFile {
-    pub fn try_load(path: impl AsRef<std::path::Path>) -> mymesh_core::Result<Option<Self>> {
-        let path = path.as_ref();
-        if !path.exists() {
-            return Ok(None);
-        }
-        let raw = std::fs::read_to_string(path)?;
-        Ok(Some(serde_json::from_str(&raw)?))
-    }
-}
-
 // ── Router attachment ───────────────────────────────────────────────────────
 
 /// State fragment mesh routes need from the carrier process.
@@ -246,6 +223,12 @@ pub fn mesh_v1_routes(st: MeshApiState) -> Router {
         .route("/mesh/v1/auth/challenge", get(auth_challenge))
         .route("/mesh/v1/auth/session", post(auth_session))
         .route("/mesh/v1/topology", get(topology))
+        .route("/mesh/v1/owner/claim", post(owner_claim).delete(owner_clear))
+        .route("/mesh/v1/owner", get(owner_get))
+        .route(
+            "/mesh/v1/owner/backup",
+            put(owner_backup_put).get(owner_backup_get),
+        )
         .with_state(st)
 }
 
@@ -929,6 +912,349 @@ async fn topology(State(st): State<MeshApiState>, headers: HeaderMap) -> Respons
     .into_response()
 }
 
+// ── Owner claim + sealed backup (S4 / B4) ───────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct OwnerClaimBody {
+    person_id: String,
+    person_public_key_hex: String,
+    /// Person Ed25519 sig hex over S0 claim preimage (phone only — no MMK).
+    claim_sig_hex: String,
+    /// Unix timestamp signed in preimage.
+    ts_unix: i64,
+    #[serde(default)]
+    display_name: Option<String>,
+    /// Force replace existing owner (requires live MRK unlock, not claim window alone).
+    #[serde(default)]
+    replace: bool,
+}
+
+#[derive(Serialize)]
+struct OwnerClaimResponse {
+    ok: bool,
+    person_id: String,
+    mrk_fingerprint: String,
+    claimed_at: String,
+    auth_method: &'static str,
+}
+
+#[derive(Serialize)]
+struct OwnerPublicResponse {
+    claimed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    person_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mrk_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mrk_epoch: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claimed_at: Option<String>,
+    backup_stored: bool,
+}
+
+async fn owner_claim(
+    State(st): State<MeshApiState>,
+    Json(body): Json<OwnerClaimBody>,
+) -> Response {
+    // Agent-local MMK auth (co-sign or claim window). Phone never holds MMK.
+    let auth = match check_claim_authorized(
+        st.paths.mmk_runtime_file(),
+        st.paths.claim_window_file(),
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            let msg = e.to_string();
+            let code = if msg.contains("expired") {
+                "claim_window_expired"
+            } else {
+                "mmk_locked"
+            };
+            return mesh_err(
+                StatusCode::FORBIDDEN,
+                code,
+                format!(
+                    "{msg}; unlock on agent (mymesh mesh unlock) or open claim window (mymesh owner allow-claim)"
+                ),
+            );
+        }
+    };
+
+    let mesh = match MeshState::load(st.paths.mesh_file()) {
+        Ok(m) => m,
+        Err(e) => {
+            return mesh_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("mesh load: {e}"),
+            );
+        }
+    };
+
+    let mrk_fp = match resolve_claim_fingerprint(
+        auth,
+        st.paths.mmk_runtime_file(),
+        st.paths.claim_window_file(),
+        st.paths.mesh_master_file(),
+    ) {
+        Ok(fp) => fp,
+        Err(e) => {
+            return mesh_err(
+                StatusCode::FORBIDDEN,
+                "mmk_locked",
+                format!("cannot resolve mrk_fingerprint: {e}"),
+            );
+        }
+    };
+
+    let existing = match MeshOwnerFile::try_load(st.paths.mesh_owner_file()) {
+        Ok(o) => o,
+        Err(e) => {
+            return mesh_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("owner load: {e}"),
+            );
+        }
+    };
+
+    let host = host_identity(&st.secret);
+    let req = OwnerClaimRequest {
+        mesh_id: mesh.mesh_id.clone(),
+        person_id: body.person_id.clone(),
+        person_public_key_hex: body.person_public_key_hex.clone(),
+        display_name: body.display_name.unwrap_or_default(),
+        ts_unix: body.ts_unix,
+        claim_sig_hex: body.claim_sig_hex.clone(),
+        claimed_from_device_id: Some(host.device_id().to_string()),
+        replace: body.replace,
+    };
+
+    let file = match accept_owner_claim(
+        &req,
+        &mrk_fp,
+        auth,
+        existing.as_ref(),
+        st.paths.mesh_owner_file(),
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            let msg = e.to_string();
+            let (status, code) = if msg.contains("already claimed") {
+                (StatusCode::CONFLICT, "owner_exists")
+            } else if msg.contains("signature") || msg.contains("claim_sig") {
+                (StatusCode::UNAUTHORIZED, "invalid_proof")
+            } else if msg.contains("replace") || msg.contains("Permission") {
+                (StatusCode::FORBIDDEN, "forbidden")
+            } else {
+                (StatusCode::BAD_REQUEST, "invalid_claim")
+            };
+            return mesh_err(status, code, msg);
+        }
+    };
+
+    // Consume claim window after successful first claim (one-shot capability).
+    if auth == ClaimAuthMethod::ClaimWindow {
+        let _ = mymesh_crypto::ClaimWindowFile::clear(st.paths.claim_window_file());
+    }
+
+    Json(OwnerClaimResponse {
+        ok: true,
+        person_id: file.person_id,
+        mrk_fingerprint: file.mrk_fingerprint,
+        claimed_at: rfc3339(file.claimed_at),
+        auth_method: match auth {
+            ClaimAuthMethod::MrkUnlocked => "agent_cosign",
+            ClaimAuthMethod::ClaimWindow => "claim_window",
+        },
+    })
+    .into_response()
+}
+
+async fn owner_get(State(st): State<MeshApiState>) -> Response {
+    let owner = match MeshOwnerFile::try_load(st.paths.mesh_owner_file()) {
+        Ok(o) => o,
+        Err(e) => {
+            return mesh_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("owner load: {e}"),
+            );
+        }
+    };
+    let backup_stored = st.paths.owner_backup_file().exists()
+        || owner
+            .as_ref()
+            .and_then(|o| o.backup_stored_at)
+            .is_some();
+    match owner {
+        Some(o) => Json(OwnerPublicResponse {
+            claimed: true,
+            person_id: Some(o.person_id),
+            display_name: Some(if o.display_name.is_empty() {
+                "owner".into()
+            } else {
+                o.display_name
+            }),
+            mrk_fingerprint: Some(o.mrk_fingerprint),
+            mrk_epoch: Some(o.mrk_epoch),
+            claimed_at: Some(rfc3339(o.claimed_at)),
+            backup_stored,
+        })
+        .into_response(),
+        None => Json(OwnerPublicResponse {
+            claimed: false,
+            person_id: None,
+            display_name: None,
+            mrk_fingerprint: None,
+            mrk_epoch: None,
+            claimed_at: None,
+            backup_stored: false,
+        })
+        .into_response(),
+    }
+}
+
+async fn owner_clear(State(st): State<MeshApiState>, headers: HeaderMap) -> Response {
+    // DELETE requires mrk_proof session (mesh-destructive).
+    let session = match require_mesh_session(&st, &headers).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if session.auth_mode != AuthMethod::MrkProof {
+        return mesh_err(
+            StatusCode::FORBIDDEN,
+            "mrk_required",
+            "clear owner requires mrk_proof session (MMK root of policy)",
+        );
+    }
+    match MeshOwnerFile::clear(st.paths.mesh_owner_file()) {
+        Ok(true) => {
+            let _ = std::fs::remove_file(st.paths.owner_backup_file());
+            Json(serde_json::json!({ "ok": true, "cleared": true })).into_response()
+        }
+        Ok(false) => Json(serde_json::json!({ "ok": true, "cleared": false })).into_response(),
+        Err(e) => mesh_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("clear owner: {e}"),
+        ),
+    }
+}
+
+async fn owner_backup_put(
+    State(st): State<MeshApiState>,
+    headers: HeaderMap,
+    Json(body): Json<OwnerBackupSealed>,
+) -> Response {
+    let session = match require_mesh_session(&st, &headers).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if session.auth_mode != AuthMethod::PersonOwner {
+        return mesh_err(
+            StatusCode::FORBIDDEN,
+            "person_owner_required",
+            "PUT owner/backup requires person_owner session",
+        );
+    }
+    // Bind backup person_id to claimed owner when present.
+    if let Ok(Some(owner)) = MeshOwnerFile::try_load(st.paths.mesh_owner_file()) {
+        if body.person_id != owner.person_id {
+            return mesh_err(
+                StatusCode::FORBIDDEN,
+                "not_owner",
+                "backup person_id does not match owner claim",
+            );
+        }
+    }
+    if let Err(e) = OwnerBackupSealed::store_blob(st.paths.owner_backup_file(), &body) {
+        return mesh_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_backup",
+            format!("store sealed backup: {e}"),
+        );
+    }
+    // Update backup slot marker on claim file when present.
+    if let Ok(Some(mut owner)) = MeshOwnerFile::try_load(st.paths.mesh_owner_file()) {
+        owner.mark_backup_stored();
+        let _ = owner.save(st.paths.mesh_owner_file());
+    }
+    Json(serde_json::json!({
+        "ok": true,
+        "stored": true,
+        "person_id": body.person_id,
+    }))
+    .into_response()
+}
+
+async fn owner_backup_get(State(st): State<MeshApiState>, headers: HeaderMap) -> Response {
+    let session = match require_mesh_session(&st, &headers).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match session.auth_mode {
+        AuthMethod::PersonOwner | AuthMethod::MrkProof => {}
+        _ => {
+            return mesh_err(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "GET owner/backup requires person_owner or mrk_proof session",
+            );
+        }
+    }
+    match OwnerBackupSealed::try_load(st.paths.owner_backup_file()) {
+        Ok(Some(b)) => Json(b).into_response(),
+        Ok(None) => mesh_err(
+            StatusCode::NOT_FOUND,
+            "no_backup",
+            "no sealed owner backup stored",
+        ),
+        Err(e) => mesh_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("backup load: {e}"),
+        ),
+    }
+}
+
+async fn require_mesh_session(
+    st: &MeshApiState,
+    headers: &HeaderMap,
+) -> Result<MeshSession, Response> {
+    let token_b64 = extract_bearer(headers).ok_or_else(|| {
+        mesh_err(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing Authorization Bearer mesh session",
+        )
+    })?;
+    let raw = decode_b64_32(&token_b64).ok_or_else(|| {
+        mesh_err(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "invalid mesh session token",
+        )
+    })?;
+    let key = session_token_key(&raw);
+    let mut store = st.auth.lock().await;
+    store.sessions.retain(|_, s| s.expires_at > Utc::now());
+    match store.sessions.get(&key) {
+        Some(s) if s.expires_at > Utc::now() => Ok(s.clone()),
+        Some(_) => Err(mesh_err(
+            StatusCode::UNAUTHORIZED,
+            "session_expired",
+            "mesh session expired",
+        )),
+        None => Err(mesh_err(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "unknown mesh session",
+        )),
+    }
+}
+
 fn build_full_members(
     paths: &Paths,
     host_id: &DeviceId,
@@ -1437,22 +1763,21 @@ mod tests {
         mesh.save(paths.mesh_file()).unwrap();
 
         let person = Identity::generate();
+        let ts = Utc::now().timestamp();
         let owner = MeshOwnerFile {
             mesh_id: mesh.mesh_id.clone(),
             person_id: "01PERSONTEST00000000000000".into(),
             person_public_key_hex: hex::encode(person.verifying_key_bytes()),
             display_name: "Ada".into(),
-            claimed_at: Some(Utc::now()),
+            claimed_at: Utc::now(),
+            claim_ts_unix: ts,
             claimed_from_device_id: None,
-            mrk_fingerprint: None,
+            mrk_fingerprint: "deadbeef".into(),
             mrk_epoch: 0,
-            claim_sig_hex: None,
+            claim_sig_hex: "00".repeat(64),
+            backup_stored_at: None,
         };
-        std::fs::write(
-            paths.mesh_owner_file(),
-            serde_json::to_string_pretty(&owner).unwrap(),
-        )
-        .unwrap();
+        owner.save(paths.mesh_owner_file()).unwrap();
 
         let st = test_state(paths, secret, "host");
         let app = mesh_v1_routes(st);
@@ -1505,6 +1830,264 @@ mod tests {
         assert_eq!(topo["auth_mode"], "person_owner");
         assert_eq!(topo["owner"]["person_id"], owner.person_id);
         assert_eq!(topo["owner"]["display_name"], "Ada");
+    }
+
+    #[tokio::test]
+    async fn owner_claim_agent_cosign_and_reject_without_mmk() {
+        use mymesh_crypto::{
+            owner_claim_preimage, seal_owner_backup, sign_owner_claim, unseal_owner_backup,
+            OwnerBackupSealed,
+        };
+
+        let paths = tmp_paths();
+        let secret = [0x6Au8; 32];
+        let mesh = MeshState::new_mesh();
+        mesh.save(paths.mesh_file()).unwrap();
+
+        let password = b"test-mmk-owner-claim";
+        let init = mesh_init(
+            password,
+            Some(mymesh_crypto::KdfParams {
+                m: 64_000,
+                t: 2,
+                p: 1,
+            }),
+        )
+        .unwrap();
+        init.file.save(paths.mesh_master_file()).unwrap();
+        let fp = init.mrk.fingerprint();
+
+        let person = Identity::generate();
+        let pk = person.verifying_key_bytes();
+        let ts = Utc::now().timestamp();
+        let pre = owner_claim_preimage(&mesh.mesh_id, "01CLAIM", &pk, &fp, ts).unwrap();
+        let sig = sign_owner_claim(&person, &pre);
+
+        let st = test_state(paths.clone(), secret, "host");
+        let app = mesh_v1_routes(st);
+
+        // Locked → 403 mmk_locked
+        let body = serde_json::json!({
+            "person_id": "01CLAIM",
+            "person_public_key_hex": hex::encode(pk),
+            "claim_sig_hex": hex::encode(sig),
+            "ts_unix": ts,
+            "display_name": "Claimer",
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/owner/claim")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json_body(resp).await["code"], "mmk_locked");
+
+        // Unlock → agent co-sign succeeds
+        MmkRuntime::from_mrk(&init.mrk)
+            .save(paths.mmk_runtime_file())
+            .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/owner/claim")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["person_id"], "01CLAIM");
+        assert_eq!(v["mrk_fingerprint"], fp);
+        assert_eq!(v["auth_method"], "agent_cosign");
+        assert!(paths.mesh_owner_file().exists());
+
+        // GET /owner public meta
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/mesh/v1/owner")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let meta = json_body(resp).await;
+        assert_eq!(meta["claimed"], true);
+        assert_eq!(meta["person_id"], "01CLAIM");
+        assert_eq!(meta["backup_stored"], false);
+
+        // Second different claim without replace → conflict
+        let person2 = Identity::generate();
+        let pk2 = person2.verifying_key_bytes();
+        let pre2 = owner_claim_preimage(&mesh.mesh_id, "01OTHER", &pk2, &fp, ts).unwrap();
+        let sig2 = sign_owner_claim(&person2, &pre2);
+        let body2 = serde_json::json!({
+            "person_id": "01OTHER",
+            "person_public_key_hex": hex::encode(pk2),
+            "claim_sig_hex": hex::encode(sig2),
+            "ts_unix": ts,
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/owner/claim")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body2.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // person_owner session + PUT backup roundtrip store
+        let (_, ch) = get_challenge(&app, "/mesh/v1/auth/challenge").await;
+        let cid = ch["challenge_id"].as_str().unwrap().to_string();
+        let nonce = decode_b64_32(ch["nonce"].as_str().unwrap()).unwrap();
+        let auth_pre =
+            auth_challenge_preimage(&cid, &nonce, &mesh.mesh_id, AuthMethod::PersonOwner);
+        let auth_sig = person.sign(&auth_pre);
+        let sess_body = serde_json::json!({
+            "challenge_id": cid,
+            "method": "person_owner",
+            "person_id": "01CLAIM",
+            "sig_hex": hex::encode(auth_sig),
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/auth/session")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(sess_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let token = json_body(resp).await["session_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let sealed = seal_owner_backup(
+            b"backup-pass",
+            "01CLAIM",
+            &seed,
+            "{}",
+            None,
+            Some(mymesh_crypto::KdfParams {
+                m: 64_000,
+                t: 2,
+                p: 1,
+            }),
+        )
+        .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/mesh/v1/owner/backup")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(serde_json::to_string(&sealed).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(paths.owner_backup_file().exists());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mesh/v1/owner/backup")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got: OwnerBackupSealed = serde_json::from_value(json_body(resp).await).unwrap();
+        let (out_seed, _) = unseal_owner_backup(b"backup-pass", &got).unwrap();
+        assert_eq!(out_seed, seed);
+    }
+
+    #[tokio::test]
+    async fn owner_claim_via_allow_claim_window() {
+        use mymesh_crypto::{owner_claim_preimage, sign_owner_claim, ClaimWindowFile};
+
+        let paths = tmp_paths();
+        let secret = [0x7Bu8; 32];
+        let mesh = MeshState::new_mesh();
+        mesh.save(paths.mesh_file()).unwrap();
+
+        let init = mesh_init(
+            b"mmk-window-test",
+            Some(mymesh_crypto::KdfParams {
+                m: 64_000,
+                t: 2,
+                p: 1,
+            }),
+        )
+        .unwrap();
+        init.file.save(paths.mesh_master_file()).unwrap();
+        let fp = init.mrk.fingerprint();
+        // Window only — no runtime unlock.
+        ClaimWindowFile::mint(&fp, 300)
+            .save(paths.claim_window_file())
+            .unwrap();
+
+        let person = Identity::generate();
+        let pk = person.verifying_key_bytes();
+        let ts = Utc::now().timestamp();
+        let pre = owner_claim_preimage(&mesh.mesh_id, "01WIN", &pk, &fp, ts).unwrap();
+        let sig = sign_owner_claim(&person, &pre);
+
+        let st = test_state(paths.clone(), secret, "host");
+        let app = mesh_v1_routes(st);
+        let body = serde_json::json!({
+            "person_id": "01WIN",
+            "person_public_key_hex": hex::encode(pk),
+            "claim_sig_hex": hex::encode(sig),
+            "ts_unix": ts,
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/owner/claim")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        assert_eq!(v["auth_method"], "claim_window");
+        assert!(paths.mesh_owner_file().exists());
+        // Window consumed.
+        assert!(!paths.claim_window_file().exists());
     }
 
     #[tokio::test]

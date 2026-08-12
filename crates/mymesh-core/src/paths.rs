@@ -96,4 +96,14 @@ impl Paths {
     pub fn mesh_owner_file(&self) -> PathBuf {
         self.data_dir.join("mesh-owner.json")
     }
+
+    /// MMK-authorized claim window (mode 0600). Minted by `mymesh owner allow-claim`.
+    pub fn claim_window_file(&self) -> PathBuf {
+        self.data_dir.join("claim-window.json")
+    }
+
+    /// Sealed person seed backup (password-AEAD only; mode 0600).
+    pub fn owner_backup_file(&self) -> PathBuf {
+        self.data_dir.join("owner-backup.sealed")
+    }
 }
