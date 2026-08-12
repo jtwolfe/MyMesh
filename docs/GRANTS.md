@@ -2,8 +2,8 @@
 
 | Field | Value |
 |-------|--------|
-| **Status** | Normative contract freeze (S0) · **store + `allows()` (C1) · HTTP grants API (C2)** |
-| **Slice** | S5: GrantStore + session enforcement (this doc); guest join wire delta in C1b; mesh/v1 grants in C2 |
+| **Status** | Normative contract freeze (S0) · **store + `allows()` (C1) · HTTP grants API (C2) · facet/location enforce (E2)** |
+| **Slice** | S5: GrantStore + session enforcement (this doc); guest join wire delta in C1b; mesh/v1 grants in C2; S7 facet/location in E2 |
 | **Source** | [CARRIER-NEXT.md](CARRIER-NEXT.md) § grant model, §S5 |
 | **Related** | [GUEST.md](GUEST.md), [MASTER-KEY.md](MASTER-KEY.md), [RECOVERY.md](RECOVERY.md) (compromised guest), [JOIN.md](JOIN.md), [SECURITY.md](SECURITY.md) |
 
@@ -57,8 +57,8 @@ A **Grant** is first-class authorization: subject device, object, role, capabili
 | `capabilities` | Subset of `terminal`, `files`, `desktop`, `tcp`, `admin` |
 | `constraints.not_after` | Optional expiry |
 | `constraints.max_sessions` | Optional session cap |
-| `constraints.location_allowlist` | S7 thin; optional |
-| `constraints.identity_facet` | S7: `personal` \| `work`; optional |
+| `constraints.location_allowlist` | S7 thin; optional. When **present**, session must present a matching location tag (**fail closed** if missing/mismatch; empty list denies all) |
+| `constraints.identity_facet` | S7: `personal` \| `work`; optional. When **present**, session must present the same facet (**fail closed** if missing/mismatch) |
 | `issued_by` | DeviceId \| PersonId \| MasterKeyProof |
 | `revoked_at` | Set on revoke; grant becomes inactive |
 
@@ -100,7 +100,10 @@ Mode **0600** under agent `Paths` (`Paths::grants_file()`).
 }
 ```
 
-Rust: `mymesh_core::{GrantStore, Grant, allows}`. Session paths use `allows(devices, grants, local_id, peer, cap)`.
+Rust: `mymesh_core::{GrantStore, Grant, allows, allows_with, AllowContext, IdentityFacet}`.
+
+Session paths use `allows(devices, grants, local_id, peer, cap)` (empty context) or
+`allows_with(..., ctx)` when the peer’s active facet / location tags are known.
 
 ---
 
@@ -111,25 +114,34 @@ Rust: `mymesh_core::{GrantStore, Grant, allows}`. Session paths use `allows(devi
 | Object | **One Device** (the host being shared) |
 | Role | **`guest`** |
 | Roster | Guests do **not** receive mesh-wide `MembershipSnapshot` — see [GUEST.md](GUEST.md) |
-| Facet / location | Enforced when present (S7); ignored if absent in S5 |
+| Facet / location | **Enforced when present** (S7 / E2); unconstrained if absent |
 
 ---
 
 ## Session enforcement
 
 ```text
-allows(peer, cap):
+allows(peer, cap, ctx):
   if peer.trust != Trusted: deny
   if peer.mesh_role == Guest:
     require active Grant covering this node as object with cap
-    check not_after, facet constraints
+    check not_after
+    if grant.constraints.identity_facet is set:
+      require ctx.identity_facet == that value   // else deny (fail closed)
+    if grant.constraints.location_allowlist is set:
+      require some ctx.location_tag ∈ allowlist  // else deny (fail closed)
   else:
-    peer.capabilities.contains(cap)  // member path (alpha.1)
+    peer.capabilities.contains(cap)  // member path (alpha.1); facet/location N/A
 ```
 
 - **Active grant** = `revoked_at` is null and `not_after` not expired.
 - Guest caps come from the Grant, not from a full mesh Admin path.
 - Other mesh members (non-object hosts) deny guest sessions by default.
+- **S7 fail-closed (C6):** If a grant carries `identity_facet` or `location_allowlist` and the
+  session context does not present a matching value, **deny**. Empty `location_allowlist`
+  (`[]`) denies all locations. Absent (`null`) constraints do not constrain.
+- Callers without facet/location knowledge use empty `AllowContext` — unconstrained grants
+  still allow; constrained grants deny until context is supplied (e.g. Carrier active facet).
 
 ---
 

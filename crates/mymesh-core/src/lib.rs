@@ -27,8 +27,9 @@ pub use event_metrics::{
     record_pair_decide, record_pair_status, with_counters, EventCounters,
 };
 pub use grants::{
-    allows, allows_at, apply_guest_device_record, new_grant_id, not_after_days, parse_capabilities,
-    Grant, GrantConstraints, GrantObject, GrantRole, GrantStore, IdentityFacet, IssuedBy,
+    allows, allows_at, allows_with, apply_guest_device_record, new_grant_id, not_after_days,
+    parse_capabilities, AllowContext, Grant, GrantConstraints, GrantObject, GrantRole, GrantStore,
+    IdentityFacet, IssuedBy,
 };
 pub use identity::{DeviceId, DeviceLabel, NodeFingerprint};
 pub use join::{ArmState, JoinDecision, JoinStore, PendingJoin};

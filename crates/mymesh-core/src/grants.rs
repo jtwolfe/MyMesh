@@ -3,6 +3,11 @@
 //! Normative schema: docs/GRANTS.md (S0 freeze). S5 scope: object = one Device,
 //! role = guest. Guest session caps require an **active** grant covering this
 //! node as object (not merely caps mirrored onto DeviceRecord).
+//!
+//! S7 (E2): when a grant sets `constraints.identity_facet` or
+//! `constraints.location_allowlist`, [`allows`] / [`GrantStore::grant_allows`]
+//! evaluate them against [`AllowContext`] and **fail closed** on missing or
+//! mismatch (threat C6). Absent constraints remain unconstrained.
 use crate::device::{Capability, DeviceRecord, DeviceStore, MeshRole, TrustState};
 use crate::{DeviceId, Error, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -90,6 +95,68 @@ pub enum IdentityFacet {
     Work,
 }
 
+impl IdentityFacet {
+    /// Wire / JSON snake_case token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Personal => "personal",
+            Self::Work => "work",
+        }
+    }
+
+    /// Parse wire token (`personal` | `work`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "personal" => Some(Self::Personal),
+            "work" => Some(Self::Work),
+            _ => None,
+        }
+    }
+}
+
+/// Session / caller context for S7 grant constraints (facet + location).
+///
+/// When a grant sets `constraints.identity_facet` or `constraints.location_allowlist`,
+/// [`allows`] / [`GrantStore::grant_allows`] evaluate them against this context and
+/// **fail closed** on missing or mismatch (C6). Absent constraints remain unconstrained.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AllowContext {
+    /// Active identity facet presented by the subject (peer). `None` = not presented.
+    pub identity_facet: Option<IdentityFacet>,
+    /// Active location tags for this check (thin S7: usually 0–1 tags).
+    pub location_tags: Vec<String>,
+}
+
+impl AllowContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_facet(mut self, facet: IdentityFacet) -> Self {
+        self.identity_facet = Some(facet);
+        self
+    }
+
+    pub fn with_location(mut self, tag: impl Into<String>) -> Self {
+        let t = tag.into();
+        let trimmed = t.trim();
+        if !trimmed.is_empty() && !self.location_tags.iter().any(|x| x == trimmed) {
+            self.location_tags.push(trimmed.to_string());
+        }
+        self
+    }
+
+    pub fn with_locations(
+        mut self,
+        tags: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        for tag in tags {
+            self = self.with_location(tag);
+        }
+        self
+    }
+}
+
 /// Grant constraints (not_after is enforced in S5; facet/location S7).
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GrantConstraints {
@@ -101,6 +168,40 @@ pub struct GrantConstraints {
     pub location_allowlist: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_facet: Option<IdentityFacet>,
+}
+
+impl GrantConstraints {
+    /// Whether this grant's S7 constraints are satisfied by `ctx`.
+    ///
+    /// Fail-closed rules (only when the field is present on the grant):
+    /// - `identity_facet`: require `ctx.identity_facet == Some(required)`.
+    /// - `location_allowlist`: require at least one of `ctx.location_tags` is in the
+    ///   allowlist; empty allowlist or empty/missing session tags → deny.
+    pub fn matches_context(&self, ctx: &AllowContext) -> bool {
+        if let Some(required) = self.identity_facet {
+            match ctx.identity_facet {
+                Some(have) if have == required => {}
+                _ => return false,
+            }
+        }
+        if let Some(ref allow) = self.location_allowlist {
+            // Present means constrained. Empty allowlist denies all (fail closed).
+            if allow.is_empty() {
+                return false;
+            }
+            if ctx.location_tags.is_empty() {
+                return false;
+            }
+            let ok = ctx.location_tags.iter().any(|t| {
+                let t = t.trim();
+                !t.is_empty() && allow.iter().any(|a| a.trim() == t)
+            });
+            if !ok {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Who issued the grant.
@@ -158,6 +259,11 @@ impl Grant {
 
     pub fn has_cap(&self, cap: &Capability) -> bool {
         self.capabilities.contains(cap)
+    }
+
+    /// S7 facet/location constraints against session context (fail closed when set).
+    pub fn constraints_match(&self, ctx: &AllowContext) -> bool {
+        self.constraints.matches_context(ctx)
     }
 }
 
@@ -277,6 +383,10 @@ impl GrantStore {
     }
 
     /// Whether an active grant covers subject → object with `cap`.
+    ///
+    /// Uses an empty [`AllowContext`]: grants that set `identity_facet` or
+    /// `location_allowlist` **deny** (fail closed) until callers use
+    /// [`grant_allows_with`].
     pub fn grant_allows(
         &self,
         subject: &DeviceId,
@@ -284,11 +394,24 @@ impl GrantStore {
         cap: &Capability,
         now: DateTime<Utc>,
     ) -> bool {
+        self.grant_allows_with(subject, object, cap, now, &AllowContext::default())
+    }
+
+    /// Like [`grant_allows`] with explicit facet/location context (S7 / C6).
+    pub fn grant_allows_with(
+        &self,
+        subject: &DeviceId,
+        object: &DeviceId,
+        cap: &Capability,
+        now: DateTime<Utc>,
+        ctx: &AllowContext,
+    ) -> bool {
         self.grants.values().any(|g| {
             g.subject_device_id == *subject
                 && g.covers_object(object)
                 && g.is_active(now)
                 && g.has_cap(cap)
+                && g.constraints_match(ctx)
         })
     }
 
@@ -320,13 +443,17 @@ impl GrantStore {
 /// Session capability check (docs/GRANTS.md):
 ///
 /// ```text
-/// allows(peer, cap):
+/// allows(peer, cap, ctx):
 ///   if peer.trust != Trusted: deny
 ///   if peer.mesh_role == Guest:
 ///     require active Grant covering this node as object with cap
+///     check not_after, identity_facet, location_allowlist (fail closed when set)
 ///   else:
 ///     peer.capabilities.contains(cap)
 /// ```
+///
+/// Empty [`AllowContext`]: unconstrained grants still allow; grants that set
+/// facet/location constraints deny until a matching context is supplied.
 pub fn allows(
     devices: &DeviceStore,
     grants: &GrantStore,
@@ -334,10 +461,38 @@ pub fn allows(
     peer: &DeviceId,
     cap: &Capability,
 ) -> bool {
-    allows_at(devices, grants, local_device_id, peer, cap, Utc::now())
+    allows_at(
+        devices,
+        grants,
+        local_device_id,
+        peer,
+        cap,
+        Utc::now(),
+        &AllowContext::default(),
+    )
 }
 
-/// Same as [`allows`] with an explicit clock (tests).
+/// Same as [`allows`] with facet/location context (S7).
+pub fn allows_with(
+    devices: &DeviceStore,
+    grants: &GrantStore,
+    local_device_id: &DeviceId,
+    peer: &DeviceId,
+    cap: &Capability,
+    ctx: &AllowContext,
+) -> bool {
+    allows_at(
+        devices,
+        grants,
+        local_device_id,
+        peer,
+        cap,
+        Utc::now(),
+        ctx,
+    )
+}
+
+/// Same as [`allows`] with an explicit clock (tests). Default empty context.
 pub fn allows_at(
     devices: &DeviceStore,
     grants: &GrantStore,
@@ -345,6 +500,7 @@ pub fn allows_at(
     peer: &DeviceId,
     cap: &Capability,
     now: DateTime<Utc>,
+    ctx: &AllowContext,
 ) -> bool {
     let Some(rec) = devices.get(peer) else {
         return false;
@@ -353,7 +509,8 @@ pub fn allows_at(
         return false;
     }
     match rec.mesh_role {
-        MeshRole::Guest => grants.grant_allows(peer, local_device_id, cap, now),
+        MeshRole::Guest => grants.grant_allows_with(peer, local_device_id, cap, now, ctx),
+        // Member path ignores grant facet/location (membership caps only).
         MeshRole::Member => rec.capabilities.contains(cap),
     }
 }
@@ -645,6 +802,243 @@ mod tests {
         );
         assert!(parse_capabilities("").is_err());
         assert!(parse_capabilities("shell").is_err());
+    }
+
+    #[test]
+    fn identity_facet_wire() {
+        assert_eq!(IdentityFacet::Personal.as_str(), "personal");
+        assert_eq!(IdentityFacet::Work.as_str(), "work");
+        assert_eq!(IdentityFacet::parse("work"), Some(IdentityFacet::Work));
+        assert_eq!(
+            IdentityFacet::parse(" personal "),
+            Some(IdentityFacet::Personal)
+        );
+        assert!(IdentityFacet::parse("wallet").is_none());
+    }
+
+    fn guest_with_grant(
+        dir: &Path,
+        facet: Option<IdentityFacet>,
+        locations: Option<Vec<String>>,
+    ) -> (DeviceStore, GrantStore, DeviceId, DeviceId) {
+        let mut devices = DeviceStore::open(dir.join("devices.json")).unwrap();
+        let mut grants = GrantStore::open(dir.join("grants.json")).unwrap();
+        let local = DeviceId::from_bytes([0x01; 32]);
+        let guest = trusted_guest(0x02, vec![Capability::Terminal]);
+        let gid = guest.id;
+        devices.upsert(guest).unwrap();
+        let mut g = grants
+            .create_guest(
+                "mesh-g",
+                gid,
+                local,
+                vec![Capability::Terminal],
+                None,
+                IssuedBy::device(&local),
+            )
+            .unwrap();
+        g.constraints.identity_facet = facet;
+        g.constraints.location_allowlist = locations;
+        grants.upsert(g).unwrap();
+        (devices, grants, local, gid)
+    }
+
+    #[test]
+    fn identity_facet_absent_unconstrained() {
+        let dir = temp_dir("facet-none");
+        let (devices, grants, local, gid) = guest_with_grant(&dir, None, None);
+        // Empty context still allows when grant has no facet constraint.
+        assert!(allows(
+            &devices,
+            &grants,
+            &local,
+            &gid,
+            &Capability::Terminal
+        ));
+        assert!(allows_with(
+            &devices,
+            &grants,
+            &local,
+            &gid,
+            &Capability::Terminal,
+            &AllowContext::new().with_facet(IdentityFacet::Work),
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn identity_facet_required_fail_closed_missing_and_mismatch() {
+        let dir = temp_dir("facet-req");
+        let (devices, grants, local, gid) =
+            guest_with_grant(&dir, Some(IdentityFacet::Work), None);
+
+        // No facet presented → deny
+        assert!(!allows(
+            &devices,
+            &grants,
+            &local,
+            &gid,
+            &Capability::Terminal
+        ));
+        assert!(!allows_with(
+            &devices,
+            &grants,
+            &local,
+            &gid,
+            &Capability::Terminal,
+            &AllowContext::default(),
+        ));
+
+        // Wrong facet → deny
+        assert!(!allows_with(
+            &devices,
+            &grants,
+            &local,
+            &gid,
+            &Capability::Terminal,
+            &AllowContext::new().with_facet(IdentityFacet::Personal),
+        ));
+
+        // Matching facet → allow
+        assert!(allows_with(
+            &devices,
+            &grants,
+            &local,
+            &gid,
+            &Capability::Terminal,
+            &AllowContext::new().with_facet(IdentityFacet::Work),
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn location_allowlist_required_fail_closed() {
+        let dir = temp_dir("loc-req");
+        let (devices, grants, local, gid) =
+            guest_with_grant(&dir, None, Some(vec!["home".into(), "lab".into()]));
+
+        // No location tags → deny
+        assert!(!allows(
+            &devices,
+            &grants,
+            &local,
+            &gid,
+            &Capability::Terminal
+        ));
+        assert!(!allows_with(
+            &devices,
+            &grants,
+            &local,
+            &gid,
+            &Capability::Terminal,
+            &AllowContext::default(),
+        ));
+
+        // Wrong location → deny
+        assert!(!allows_with(
+            &devices,
+            &grants,
+            &local,
+            &gid,
+            &Capability::Terminal,
+            &AllowContext::new().with_location("hotel"),
+        ));
+
+        // Matching location → allow
+        assert!(allows_with(
+            &devices,
+            &grants,
+            &local,
+            &gid,
+            &Capability::Terminal,
+            &AllowContext::new().with_location("lab"),
+        ));
+        // One of several session tags matches
+        assert!(allows_with(
+            &devices,
+            &grants,
+            &local,
+            &gid,
+            &Capability::Terminal,
+            &AllowContext::new().with_locations(["hotel", "home"]),
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn location_allowlist_empty_denies_all() {
+        let dir = temp_dir("loc-empty");
+        let (devices, grants, local, gid) = guest_with_grant(&dir, None, Some(vec![]));
+        assert!(!allows_with(
+            &devices,
+            &grants,
+            &local,
+            &gid,
+            &Capability::Terminal,
+            &AllowContext::new().with_location("home"),
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn facet_and_location_both_required() {
+        let dir = temp_dir("facet-loc");
+        let (devices, grants, local, gid) = guest_with_grant(
+            &dir,
+            Some(IdentityFacet::Personal),
+            Some(vec!["office".into()]),
+        );
+        // Facet ok, location missing → deny
+        assert!(!allows_with(
+            &devices,
+            &grants,
+            &local,
+            &gid,
+            &Capability::Terminal,
+            &AllowContext::new().with_facet(IdentityFacet::Personal),
+        ));
+        // Location ok, facet wrong → deny
+        assert!(!allows_with(
+            &devices,
+            &grants,
+            &local,
+            &gid,
+            &Capability::Terminal,
+            &AllowContext::new()
+                .with_facet(IdentityFacet::Work)
+                .with_location("office"),
+        ));
+        // Both match → allow
+        assert!(allows_with(
+            &devices,
+            &grants,
+            &local,
+            &gid,
+            &Capability::Terminal,
+            &AllowContext::new()
+                .with_facet(IdentityFacet::Personal)
+                .with_location("office"),
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn constraints_match_unit() {
+        let c = GrantConstraints {
+            identity_facet: Some(IdentityFacet::Work),
+            location_allowlist: Some(vec!["a".into()]),
+            ..Default::default()
+        };
+        assert!(!c.matches_context(&AllowContext::default()));
+        assert!(!c.matches_context(&AllowContext::new().with_facet(IdentityFacet::Work)));
+        assert!(!c.matches_context(&AllowContext::new().with_location("a")));
+        assert!(c.matches_context(
+            &AllowContext::new()
+                .with_facet(IdentityFacet::Work)
+                .with_location("a")
+        ));
+        // Absent constraints always match
+        assert!(GrantConstraints::default().matches_context(&AllowContext::default()));
     }
 
     #[test]
