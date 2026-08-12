@@ -1138,7 +1138,7 @@ Metrics dir: extend MyMesh `paths.metrics_dir` JSON counters (existing metrics p
 3. Persistent Carrier audit log redacted.
 4. Runbooks: lost phone; lost MMK; compromised guest; MMK leak rotate; restore owner from sealed backup — MyMesh ops: **[RECOVERY.md](RECOVERY.md)** (B7-m).
 5. mock-pair-host lab-only; DEMO-PAIR real MyMesh dual-scan+confirm — see [DEMO-PAIR.md](DEMO-PAIR.md).
-6. **QR default policy (single KD):** After A3, `mymesh pair dual` emits **v2**. `mymesh carrier` (single-host LAN helper) continues **v1** until **D5**, then v2 default with `--pair-v1` escape.
+6. **QR default policy (single KD):** After A3, `mymesh pair dual` emits **v2**. After **D5**, `mymesh carrier` also defaults to **v2** (LAN `host` + `ep=direct`); `--pair-v1` remains the alpha.1 LAN escape.
 7. **Relay (KD31):** Optional Class C is **self-hosted only** if ever implemented; not a product deliverable in Waves A–E. No public MyMesh pair relay.
 
 ### S9 control checklist (threat → control id)
@@ -1308,7 +1308,7 @@ See mesh API matrix + pair Bearer for pair routes only.
 | **D** | S9 (+ deprecation) | Harden, rate limits, audit persist, QR default |
 | **E** | S7, S8 | Multi-id + continuity (after D; D1+D2 same release) |
 
-Feature flags: v2 dual emit on after A3; carrier v1 until **D5**; continuity off until E; relay off / self-host experimental only (KD31).
+Feature flags: v2 dual emit on after A3; **carrier default v2 after D5** (`--pair-v1` escape); continuity off until E; relay off / self-host experimental only (KD31).
 
 Rollback: `--pair-v1`; MMK optional for basic sessions; delete mesh-owner with MMK if corrupt.
 
@@ -1478,7 +1478,7 @@ Relay ep, phone iroh, guest path, MMK, topology API, continuity.
 | KD20 | **Owner claim requires MMK on agent** (co-sign or allow-claim window); **phone never holds MMK** | Chicken-and-egg fix; no MMK on phone |
 | KD21 | Device `mesh_role` is `member\|guest` only; person owner only in mesh-owner.json | No Owner-on-device conflation |
 | KD22 | PairSessionStore on agent Paths; carrier HTTP is facade; `mymesh pair` works without carrier process | Process split honesty |
-| KD23 | After A3, `pair dual` emits v2; `mymesh carrier` stays v1 until **D5** | Single default policy |
+| KD23 | After A3, `pair dual` emits v2; after **D5**, `mymesh carrier` defaults v2 (`--pair-v1` escape) | Single default policy |
 | KD24 | Topology authenticity Wave C = mesh-auth session; signature optional S9 | Threat alignment |
 | KD25 | S7 UI and mesh enforcement same release; S7–S8 Wave E after harden Wave D | Least-placeholder / slip risk |
 | KD26 | Claim auth = agent co-sign (preferred) + CLI `allow-claim` window; phone person-sig only | Operational MMK without vault contamination |
@@ -1547,7 +1547,7 @@ Each PR mergeable; MyMesh-only for trust mutations; dependency-correct.
 | **D2** | MyMesh | `pair: optional TLS pin / harden` | S9 | A3 |
 | **D3** | carrier | `audit persistent + TLS pin client` | S9 | D2 |
 | **D4** | both | `docs SECURITY/THREATS + control checklist C1–C7` | S9 | — |
-| **D5** | MyMesh | `carrier default QR v2; --pair-v1 escape` | KD23 complete | A3, D4 |
+| **D5** | MyMesh | `carrier default QR v2; --pair-v1 escape` | KD23 complete (**done**) | A3, D4 |
 
 ### Wave E — Multi-id + continuity
 
@@ -1589,8 +1589,8 @@ Do **not** claim multi-id/continuity until Wave E exit. Do **not** claim dual au
 |-------|--------|
 | v1 QR host required | Accepted through Wave B+ |
 | v2 without host | `pair dual` after A3 (KD23) |
-| `/pair/v1/*` | Until D5; then `--pair-v1` |
-| carrier process | Optional facade; serve owns state |
+| `/pair/v1/*` | Compat endpoints remain; QR via `--pair-v1` after D5 |
+| carrier process | Optional facade; serve owns state; **default QR v2** after D5 |
 | Admin on upgrade | Not auto-granted; host-local CLI + mesh init Admin on creator |
 | JoinStore | Still SoT for accept/deny outcomes |
 | Full snapshot on member accept | Unchanged; guest path diverges S5 |

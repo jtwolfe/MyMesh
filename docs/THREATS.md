@@ -94,7 +94,7 @@ Normative IDs from [CARRIER-NEXT.md](CARRIER-NEXT.md) §S9. Status reflects **th
 - Required **16-byte nonce** in v2 QR / status / SessionDecision (missing nonce → parse fail).
 - Session **`until` TTL**; expired → `Expired` phase; open phases only `Armed` \| `Bound`.
 
-**Honest residual:** v1 pair without nonce still accepted for LAN carrier until D5 default-v2; use `pair dual` / v2 for the full control.
+**Honest residual:** v1 pair without nonce remains available only via `mymesh carrier --pair-v1` (compat escape); product default is pair/v2 (sid+nonce+TTL).
 
 ### C2 — Wrong joiner accept (detail)
 
@@ -176,7 +176,7 @@ Normative IDs from [CARRIER-NEXT.md](CARRIER-NEXT.md) §S9. Status reflects **th
 | Optional TLS pin `tlspin=` on direct ep | **D2** | Wire + parse + fail-closed verify hook (MyMesh); Carrier release denies cleartext; client TLS stack wiring is **D3** |
 | Persistent Carrier audit (redacted) | **D3** | Carrier repo |
 | This document + SECURITY cross-link | **D4** | This PR |
-| Carrier default QR v2 | **D5** | Completes KD23; `--pair-v1` escape |
+| Carrier default QR v2 | **D5** | **Done** — default v2; `--pair-v1` escape |
 | Facet enforce | **E2** | Completes **C6** |
 | Continuity wipe | **E4–E5** | Completes **C4** residual path |
 

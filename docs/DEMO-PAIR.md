@@ -9,7 +9,7 @@
 |------|------|-------------|
 | **A — dual-scan + confirm** | **Primary product demo** | Two machines + phone; phone **need not** reach host HTTP |
 | **B — dual-scan + direct host** | LAN optimization | Optional `--host` in QR_A; phone can `POST /pair/v2/decide` |
-| **C — v1 single-host LAN** | Migration / alpha.1 | `mymesh carrier` still emits v1 until D5 |
+| **C — carrier single-host LAN** | Migration / LAN helper | Default **v2** after D5; `--pair-v1` for alpha.1 |
 | **Lab — mock-pair-host** | **Lab only** | Lives in **Carrier** repo; emulator / unit fixtures — **not** product |
 
 **Honesty (KD14):** `mock-pair-host` (Carrier `tools/mock-pair-host`) implements **pair/v1** fixtures for unit/ceremony tests and emulator loops. It is **not** a substitute for dual-scan + iroh completion. Do not present mock accept as “internet-first pair.” This MyMesh tree does **not** ship mock-pair-host.
@@ -179,27 +179,28 @@ mymesh pair dual --join --resident <did_or_words_from_A>
 
 ---
 
-## Path C — v1 single-host LAN (migration)
+## Path C — carrier single-host LAN (default v2; `--pair-v1` escape)
 
-Alpha.1 path still supported during migration. **Not** the Wave A product exit.
+Single-host LAN helper via `mymesh carrier`. Default QR is **pair/v2** after D5; `--pair-v1` restores alpha.1. **Not** the Wave A dual-scan product exit.
 
 ```bash
 # --- Host A ---
 mymesh serve &
 mymesh firewall ufw allow          # or firewalld / ufw 17878/tcp
-mymesh carrier                     # arms; prints pair API base + carrier://pair?v=1&… QR
+mymesh carrier                     # arms; prints pair API base + carrier://pair?v=2&… QR (default)
+# mymesh carrier --pair-v1         # escape: alpha.1 carrier://pair?v=1&… LAN QR
 
 # --- Joiner B ---
 mymesh link '<host-hex-or-words-or-uri>'
 
 # --- Phone ---
-# Unlock → Pair mesh join → paste/open v1 QR
+# Unlock → Pair mesh join → paste/open QR (v2 default; v1 if --pair-v1)
 # Wait for pending → verify words → Accept (L2)
 ```
 
 | Note | Detail |
 |------|--------|
-| Default QR from `mymesh carrier` | **v1** until D5; then v2 default with `--pair-v1` escape |
+| Default QR from `mymesh carrier` | **v2** (`ep=direct` + LAN `host`; PairSession armed). Escape: `--pair-v1` |
 | `mymesh pair dual` | Emits **v2** (post A3) |
 | Port | **17878** |
 

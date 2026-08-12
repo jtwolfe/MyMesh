@@ -1393,10 +1393,11 @@ async fn start_carrier(app: &mut App) {
         Ok((url, pair_qr)) => {
             app.carrier_url = Some(url.clone());
             app.detail = format!(
-                "Connect-by-carrier (pair/v1)\n\n\
+                "Connect-by-carrier (pair/v2 default)\n\n\
 Carrier QR (scan with app):\n  {pair_qr}\n\n\
 HTML fallback:\n  {url}\n\n\
 Other machine: mymesh link <host-id>  then approve on phone.\n\
+CLI escape: mymesh carrier --pair-v1  (alpha.1 LAN QR)\n\
 Firewall: if phone times out, Status → [F] Open or:\n  {}\n",
                 crate::firewall::sudo_firewall_cmd("ufw allow")
             );

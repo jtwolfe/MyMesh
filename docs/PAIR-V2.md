@@ -94,14 +94,14 @@ mymesh pair dual --host https://pair.example:8443 --tlspin 'sha256/<base64…>'
 |-------|--------|
 | v1 QR `host` required | Accepted through Wave B+ compat window |
 | v2 without `host` | `mymesh pair dual` after A3 (KD23) |
-| `/pair/v1/*` | Until D5; then `--pair-v1` escape |
-| After A3 | `pair dual` emits **v2**; `mymesh carrier` stays **v1** until D5, then v2 default with `--pair-v1` |
+| `/pair/v1/*` | Compat endpoints remain; **QR** default is v2 after D5 (`mymesh carrier --pair-v1` for v1 QR) |
+| After D5 | `pair dual` **and** `mymesh carrier` emit **v2**; carrier `--pair-v1` LAN escape |
 
 ```text
 T0     S0 docs
 T0+A3  pair dual → v2; carrier → v1
 T0+A5  confirm path product internet exit
-T0+D5  carrier default v2
+T0+D5  carrier default v2  (this release; --pair-v1 escape)
 T+6mo  optional remove v1 (major)
 ```
 
