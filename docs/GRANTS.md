@@ -1,0 +1,201 @@
+# Grants — S0 contract
+
+| Field | Value |
+|-------|--------|
+| **Status** | Normative contract freeze (S0) |
+| **Slice** | S5 implements store + session enforcement; this doc freezes schema and authz |
+| **Source** | [CARRIER-NEXT.md](CARRIER-NEXT.md) § grant model, §S5 |
+| **Related** | [GUEST.md](GUEST.md), [MASTER-KEY.md](MASTER-KEY.md), [JOIN.md](JOIN.md), [SECURITY.md](SECURITY.md) |
+
+---
+
+## Role
+
+A **Grant** is first-class authorization: subject device, object, role, capabilities, and constraints. It is federation-ready in shape; Wave C (S5) implements **object = one Device**, **role = guest**.
+
+**Person ownership is not a grant role.** Owner lives only in `mesh-owner.json` / topology `owner` object. Device mesh roles are `member` | `guest` only (never `owner` on a device). See [GUEST.md](GUEST.md) and [MASTER-KEY.md](MASTER-KEY.md).
+
+---
+
+## Grant JSON schema (S0 golden)
+
+```json
+{
+  "grant_id": "<ULID>",
+  "mesh_id": "<UUID>",
+  "subject_device_id": "<DeviceId hex or canonical bytes encoding>",
+  "object": {
+    "kind": "device",
+    "device_id": "<DeviceId>"
+  },
+  "role": "guest",
+  "capabilities": ["terminal", "files", "desktop", "tcp"],
+  "constraints": {
+    "not_after": null,
+    "max_sessions": null,
+    "location_allowlist": null,
+    "identity_facet": null
+  },
+  "issued_by": {
+    "kind": "device_id | person_id | master_key_proof",
+    "value": "..."
+  },
+  "issued_at": "<RFC3339>",
+  "revoked_at": null
+}
+```
+
+### Field notes
+
+| Field | Normative |
+|-------|-----------|
+| `grant_id` | ULID |
+| `mesh_id` | Mesh UUID |
+| `subject_device_id` | Who receives access |
+| `object` | S5: **Device only**. Later: Mesh \| Service (federation) |
+| `role` | `member` \| `guest` — **not** `owner` |
+| `capabilities` | Subset of `terminal`, `files`, `desktop`, `tcp`, `admin` |
+| `constraints.not_after` | Optional expiry |
+| `constraints.max_sessions` | Optional session cap |
+| `constraints.location_allowlist` | S7 thin; optional |
+| `constraints.identity_facet` | S7: `personal` \| `work`; optional |
+| `issued_by` | DeviceId \| PersonId \| MasterKeyProof |
+| `revoked_at` | Set on revoke; grant becomes inactive |
+
+### Rust-shaped sketch (non-binding syntax; wire is JSON)
+
+```text
+Grant {
+  grant_id: ULID,
+  mesh_id: UUID,
+  subject_device_id: DeviceId,
+  object: Device | Mesh | Service,   // S5: Device only
+  role: member | guest,              // NOT owner
+  capabilities: [terminal, files, desktop, tcp, admin],
+  constraints: {
+    not_after: Option<DateTime>,
+    max_sessions: Option<u32>,
+    location_allowlist: Option<[LocationTag]>,
+    identity_facet: Option<personal|work>,
+  },
+  issued_by: DeviceId | PersonId | MasterKeyProof,
+  issued_at: DateTime,
+  revoked_at: Option<DateTime>,
+}
+```
+
+---
+
+## On-disk: `grants.json`
+
+Mode **0600** under agent `Paths`. Implementation may store an array of Grant objects or a map keyed by `grant_id`; JSON field shapes above are normative.
+
+---
+
+## S5 scope (first implementation)
+
+| Constraint | Value |
+|------------|-------|
+| Object | **One Device** (the host being shared) |
+| Role | **`guest`** |
+| Roster | Guests do **not** receive mesh-wide `MembershipSnapshot` — see [GUEST.md](GUEST.md) |
+| Facet / location | Enforced when present (S7); ignored if absent in S5 |
+
+---
+
+## Session enforcement
+
+```text
+allows(peer, cap):
+  if peer.trust != Trusted: deny
+  if peer.mesh_role == Guest:
+    require active Grant covering this node as object with cap
+    check not_after, facet constraints
+  else:
+    peer.capabilities.contains(cap)  // member path (alpha.1)
+```
+
+- **Active grant** = `revoked_at` is null and `not_after` not expired.
+- Guest caps come from the Grant, not from a full mesh Admin path.
+- Other mesh members (non-object hosts) deny guest sessions by default.
+
+---
+
+## CLI / API (target shape — S5)
+
+```bash
+mymesh grant create --to <guest> --on <device> --caps terminal,files --days 7
+mymesh grant list
+mymesh grant revoke <grant_id>
+```
+
+```text
+POST /mesh/v1/grants
+GET  /mesh/v1/grants
+POST /mesh/v1/grants/{id}/revoke
+```
+
+### Authz for grant mutate
+
+| Actor | Allowed |
+|-------|---------|
+| `person_owner` session | Yes |
+| `mrk_proof` | Yes |
+| `device_member` with Admin | Yes |
+| Host-local CLI | Yes |
+| Guest / unauthenticated | No |
+
+---
+
+## Revoke vs kick
+
+| | Grant revoke | Kick |
+|--|--------------|------|
+| Scope | One grant / object access | Mesh-wide member removal |
+| Guest | **Primary tool** | N/A (guest not full member) |
+| Member | Rare (if grant-shaped later) | **Primary** |
+
+Revoke effects:
+
+1. Set `revoked_at`
+2. Kill sessions subject → object (target ≤60s in S5 done criteria)
+3. Optional `GrantRevoke` control message / gossip to object host replicas (not full guest identity flood)
+4. Audit
+
+---
+
+## Wire deltas (protocol — S5 / C1b)
+
+| Message | Change |
+|---------|--------|
+| `JoinAccept` | Unchanged crypto |
+| `MembershipSnapshot` after guest accept | **Skip** or single-host only |
+| `GrantAnnounce` / `GrantRevoke` | New control messages as needed; not full guest flood |
+| `build_snapshot` | Exclude `mesh_role=guest` from member snapshots |
+
+---
+
+## Capabilities and Admin
+
+- Default member grant remains **without** Admin (alpha.1 `Capability::all()` = terminal/files/desktop/tcp).
+- Admin may appear on a Grant only when explicitly issued (rare for guests; do not issue Admin to guests by default product policy).
+- See [MASTER-KEY.md](MASTER-KEY.md) Admin migration and [JOIN.md](JOIN.md).
+
+---
+
+## Independence
+
+| Mode | Grants |
+|------|--------|
+| MyMesh only | CLI `grant create/list/revoke` without Carrier |
+| Carrier + MyMesh | Preferred share/revoke UX; same store |
+
+---
+
+## See also
+
+- [GUEST.md](GUEST.md) — guest onboarding and roster isolation
+- [MASTER-KEY.md](MASTER-KEY.md) — who may issue grants
+- [JOIN.md](JOIN.md) — member join still uses full snapshot
+- [CARRIER-NEXT.md](CARRIER-NEXT.md) — S5 sequences and done criteria
+- [PAIR-V2.md](PAIR-V2.md) — dual-scan may bind `guest=true` + `grant_id` (S5)

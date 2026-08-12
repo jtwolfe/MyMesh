@@ -333,7 +333,7 @@ Freeze nouns, versioning, error codes, Wave A protocol, mesh auth methods, guest
 
 1. **Documents (normative, dual-repo):**
    - Carrier: `docs/protocol/PAIR-V2.md`, `MESH-API.md`, `OWNERSHIP.md`, `CONTINUITY.md`, `GUEST.md`; update `PAIR-HTTP.md` deprecation of required `host`.
-   - MyMesh: `docs/MASTER-KEY.md`, `docs/GRANTS.md`, update `JOIN.md`, `SECURITY.md`.
+   - MyMesh (this repo, PR A0): [`docs/MASTER-KEY.md`](MASTER-KEY.md), [`docs/GRANTS.md`](GRANTS.md), [`docs/GUEST.md`](GUEST.md), [`docs/PAIR-V2.md`](PAIR-V2.md); update [`JOIN.md`](JOIN.md), [`SECURITY.md`](SECURITY.md).
 2. **Wire versioning:** v1 required host; v2 optional host + sid/did/ep.
 3. **S0 must freeze (goldens / fixtures), not defer:**
    - `PairBootstrapV2` (incl. **nonce**), `SessionDecision`, confirm-code algorithm note

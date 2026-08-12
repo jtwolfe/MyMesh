@@ -152,7 +152,12 @@ Linking model: **[docs/JOIN.md](docs/JOIN.md)**
 |-----|----------|
 | **[docs/USAGE.md](docs/USAGE.md)** | Comprehensive CLI + TUI + SSH + SOCKS + ops |
 | [docs/ALPHA-3.md](docs/ALPHA-3.md) | Magic plane design & limits |
-| [docs/JOIN.md](docs/JOIN.md) | Arming, ids, carrier, SPAKE |
+| [docs/JOIN.md](docs/JOIN.md) | Arming, ids, carrier, SPAKE, pair v1→v2 migration |
+| [docs/PAIR-V2.md](docs/PAIR-V2.md) | S0: pair v2 wire, nonce, confirm 4-4, not_bound |
+| [docs/MASTER-KEY.md](docs/MASTER-KEY.md) | S0: mesh master key / policy root |
+| [docs/GRANTS.md](docs/GRANTS.md) | S0: grant schema |
+| [docs/GUEST.md](docs/GUEST.md) | S0: guest membership (no full roster) |
+| [docs/CARRIER-NEXT.md](docs/CARRIER-NEXT.md) | S0–S9 design (MyMesh + Carrier next phase) |
 | [docs/SECURITY.md](docs/SECURITY.md) | Threat model (alpha) |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crate layout, endpoint ownership |
 | [docs/INSTALL-POLICY.md](docs/INSTALL-POLICY.md) | User vs root install |

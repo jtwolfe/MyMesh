@@ -1,28 +1,51 @@
 # Security model (alpha)
 
-**Audience:** operators running MyMesh v0.1.0-alpha.1  
-**Status:** best-effort documentation; not a formal audit.
+**Audience:** operators running MyMesh v0.1.0-alpha.x  
+**Status:** best-effort documentation; not a formal audit.  
+**S0 contracts:** [MASTER-KEY.md](MASTER-KEY.md), [GRANTS.md](GRANTS.md), [GUEST.md](GUEST.md), [PAIR-V2.md](PAIR-V2.md), [CARRIER-NEXT.md](CARRIER-NEXT.md)
 
 ## Trust model
 
 1. **Long-term identity** — each node has an Ed25519 keypair. Device id = public key bytes.
-2. **Allowlist** — only devices in `devices.json` with `Trusted` may use terminal/files.
+2. **Allowlist** — only devices in `devices.json` with `Trusted` may use terminal/files (member path).
 3. **Join gate** — unknown peers may only present a **JoinRequest** when the host is **armed** (`connect-request allow`). Otherwise connections from unknowns are dropped.
-4. **Human approval** — host operator must `requests accept` (or deny). Arming auto-clears after accept and expires by timeout.
+4. **Human approval** — host operator must `requests accept` (or deny), or pair decide / confirm-on-machine. Arming auto-clears after accept and expires by timeout.
 5. **Transport** — iroh provides encrypted QUIC paths; relays should not see plaintext app data (trust iroh’s design; MyMesh does not re-encrypt beyond session/protocol layering already in place).
+
+### Dual authority (S0 freeze; S3–S4 implement)
+
+| Authority | Role |
+|-----------|------|
+| **Mesh master key (MMK / MRK)** | **Root of mesh policy** for mesh-destructive ops |
+| **Carrier person owner claim** | Portable person binding; subordinate to MMK for destructive ops |
+| **Host-local CLI** | Filesystem access to agent `Paths` = node admin on that machine |
+| **Remote Admin cap** | Explicit grant only; **not** in default member capabilities |
+
+Default member grant remains **without** Admin (`terminal` / `files` / `desktop` / `tcp`). See [MASTER-KEY.md](MASTER-KEY.md).
+
+### Member vs guest (S0 freeze; S5 implement)
+
+- Device `mesh_role` is `member` | `guest` only — never `owner` on a device.
+- **Guests do not receive mesh-wide membership snapshots** ([GUEST.md](GUEST.md)).
+- Guest access is Grant-scoped to one object host ([GRANTS.md](GRANTS.md)).
+
+### Pair control plane
+
+- **v1:** LAN `host` required in QR; phone HTTP decide ([JOIN.md](JOIN.md)).
+- **v2:** optional host; **required session nonce**; confirm codes as Crockford base32 **4-4**; unbound confirm fails **`not_bound`** closed (no hang). See [PAIR-V2.md](PAIR-V2.md).
 
 ## What linking proves
 
 - Joiner proved possession of the private key matching the device id (signed JoinRequest).
 - Host proved possession of its key on JoinAccept.
-- Operator intent on the host (accept).
+- Operator intent on the host (accept / pair decide / confirm).
 
 It does **not** prove the joiner machine is free of malware. A trusted peer with Terminal+Files can act as your user on the agent host.
 
 ## Privilege
 
-| Component | Alpha.1 behavior |
-|-----------|------------------|
+| Component | Alpha behavior |
+|-----------|----------------|
 | `mymesh serve` | Runs as the invoking OS user |
 | Shell | PTY as that user |
 | Files | Sandbox under configured root (default: home) |
@@ -33,6 +56,7 @@ There is **no** separate “remote user” mapping yet. Future system installs m
 
 - Default path uses public iroh infrastructure for NAT traversal. Peers with internet can find each other by id; expect **some metadata leakage** to discovery/relay infrastructure (similar class to Syncthing global discovery / other P2P tools).
 - Local/SPAKE mailbox modes reduce reliance on public pairing helpers but are not the default multi-machine path.
+- Pair HTTP (carrier) is LAN-oriented for v1; v2 confirm path does not require phone → private LAN IP.
 
 ## Reporting issues
 
@@ -52,4 +76,9 @@ Prefer private disclosure for exploitable bugs until a security contact is forma
 - **Carrier** listens on a LAN-reachable HTTP port only while you run `mymesh carrier`; use firewall helpers explicitly.
 - **SOCKS** is bound to loopback by default — do not rebind to `0.0.0.0` without understanding exposure.
 - System DNS is **not** rewritten by MyMesh; that limits surprise traffic hijack.
+
+## See also
+
+- [MASTER-KEY.md](MASTER-KEY.md) · [GRANTS.md](GRANTS.md) · [GUEST.md](GUEST.md) · [PAIR-V2.md](PAIR-V2.md)  
+- [JOIN.md](JOIN.md) · [CARRIER-NEXT.md](CARRIER-NEXT.md) · [ARCHITECTURE.md](ARCHITECTURE.md)
 
