@@ -3,6 +3,7 @@
 mod config;
 mod device;
 mod error;
+mod event_metrics;
 mod grants;
 mod identity;
 mod join;
@@ -12,6 +13,7 @@ mod metrics;
 mod pair_confirm;
 mod pair_session;
 mod paths;
+mod rate_limit;
 
 pub use config::{Config, DaemonConfig, Limits, MagicConfig};
 pub use device::{
@@ -19,6 +21,10 @@ pub use device::{
     TrustState,
 };
 pub use error::{Error, Result};
+pub use event_metrics::{
+    record_grant_mutate, record_mesh_auth_challenge, record_owner_backup_unwrap,
+    record_pair_decide, record_pair_status, with_counters, EventCounters,
+};
 pub use grants::{
     allows, allows_at, apply_guest_device_record, new_grant_id, not_after_days, parse_capabilities,
     Grant, GrantConstraints, GrantObject, GrantRole, GrantStore, IdentityFacet, IssuedBy,
@@ -42,3 +48,10 @@ pub use pair_session::{
     PairConfirmError, PairEndpointClass, PairPhase, PairSessionFile, PairSessionStore,
 };
 pub use paths::Paths;
+pub use rate_limit::{
+    check as rate_limit_check, check_shared as rate_limit_check_shared,
+    clear_shared_for_tests as rate_limit_clear_shared_for_tests, client_ip_key,
+    metrics_dir_from_pair_sessions, reset_for_tests as rate_limit_reset_for_tests,
+    trust_proxy_enabled, LimitKind, Policy, RateLimitState, RateLimited, GRANT_MUTATE,
+    HOST_LOCAL_SESSION, MESH_AUTH_CHALLENGE, OWNER_BACKUP_UNWRAP, PAIR_DECIDE, PAIR_STATUS,
+};

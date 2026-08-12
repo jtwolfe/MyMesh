@@ -535,6 +535,8 @@ pub enum PairConfirmError {
     SessionGone,
     AmbiguousPending,
     BadCode,
+    /// S9: decide/confirm share 10 / min / token.
+    RateLimited { retry_after_secs: u64 },
     Other(String),
 }
 
@@ -547,6 +549,7 @@ impl PairConfirmError {
             Self::SessionGone => "session_gone",
             Self::AmbiguousPending => "ambiguous_pending",
             Self::BadCode => "bad_code",
+            Self::RateLimited { .. } => "rate_limited",
             Self::Other(_) => "error",
         }
     }
@@ -565,6 +568,9 @@ impl PairConfirmError {
                 "multiple pending joiners — pass --joiner <did>".into()
             }
             Self::BadCode => "confirm code does not match accept or deny for bound joiner".into(),
+            Self::RateLimited { retry_after_secs } => {
+                format!("too many decide/confirm attempts; retry after {retry_after_secs}s")
+            }
             Self::Other(s) => s.clone(),
         }
     }
@@ -619,6 +625,18 @@ pub fn apply_pair_confirm(
         return Err(PairConfirmError::AlreadyDecided);
     }
 
+    // S9: decide + confirm share 10 / min / token (file-backed under metrics_dir).
+    let metrics_dir = crate::rate_limit::metrics_dir_from_pair_sessions(store.root());
+    if let Err(rl) = crate::rate_limit::check_shared(
+        &metrics_dir,
+        crate::rate_limit::LimitKind::PairDecide,
+        &sess.token_hash,
+    ) {
+        return Err(PairConfirmError::RateLimited {
+            retry_after_secs: rl.retry_after_secs,
+        });
+    }
+
     let pepper = store
         .load_token_raw(&sess.sid)
         .map_err(|e| PairConfirmError::Other(e.to_string()))?
@@ -636,6 +654,7 @@ pub fn apply_pair_confirm(
     let is_accept = confirm_codes_equal(code, &codes.accept);
     let is_deny = confirm_codes_equal(code, &codes.deny);
     if !is_accept && !is_deny {
+        // Metrics: optional caller can also record; bad_code is counted when metrics_dir known.
         return Err(PairConfirmError::BadCode);
     }
 

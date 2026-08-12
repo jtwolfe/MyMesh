@@ -4,8 +4,8 @@
 //! under `/pair/v1` (status / pending / decide), `/pair/v2`, and `/mesh/v1`
 //! (auth challenge + topology) using the same `Paths` as serve.
 //! PairSessionStore is source of truth for v2 (PAIR-V2.md).
-use axum::extract::{Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{ConnectInfo, FromRequestParts, Query, State};
+use axum::http::{header, request::Parts, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -13,8 +13,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
 use mymesh_core::{
-    ArmState, Config, DeviceId, JoinDecision, JoinStore, MeshState, NodeFingerprint,
-    PairEndpointClass, PairPhase, PairSessionFile, PairSessionStore, Paths, PendingJoin,
+    client_ip_key, hash_pair_token, record_pair_decide, record_pair_status, ArmState, Config,
+    DeviceId, JoinDecision, JoinStore, LimitKind, MeshState, NodeFingerprint, PairEndpointClass,
+    PairPhase, PairSessionFile, PairSessionStore, Paths, PendingJoin, RateLimitState,
 };
 use mymesh_crypto::{device_id_to_words, device_join_uri, Identity};
 use rand::rngs::OsRng;
@@ -49,6 +50,8 @@ struct CarrierState {
     bootstrap: Arc<Mutex<Option<BootstrapToken>>>,
     /// In-memory mesh/v1 auth challenges + sessions.
     mesh_auth: Arc<Mutex<MeshAuthStore>>,
+    /// S9 in-process rate limits (IP-scoped status/challenge; isolated per process).
+    rate_limits: Arc<RateLimitState>,
 }
 
 #[derive(Clone)]
@@ -165,6 +168,7 @@ pub async fn start_carrier(
     }
 
     let bootstrap = Arc::new(Mutex::new(None));
+    let rate_limits = Arc::new(RateLimitState::new());
     let st = CarrierState {
         paths: paths.clone(),
         secret: identity.to_secret_bytes(),
@@ -173,6 +177,7 @@ pub async fn start_carrier(
         status: Arc::new(Mutex::new("waiting for phone".into())),
         bootstrap: bootstrap.clone(),
         mesh_auth: Arc::new(Mutex::new(MeshAuthStore::default())),
+        rate_limits: rate_limits.clone(),
     };
 
     // Mint arm-scoped token so QR is valid immediately.
@@ -196,7 +201,13 @@ pub async fn start_carrier(
     info!(%url, %host_base, "carrier + pair/v1 + mesh/v1 listening");
 
     tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+        // ConnectInfo peer IP for S9 IP-scoped rate limits (not client-spoofable XFF).
+        if let Err(e) = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        {
             tracing::warn!(%e, "carrier server exit");
         }
     });
@@ -216,6 +227,7 @@ fn build_router(st: CarrierState) -> Router {
         secret: st.secret,
         label: st.label.clone(),
         auth: st.mesh_auth.clone(),
+        rate_limits: st.rate_limits.clone(),
     };
     let pair_app = Router::new()
         // Deprecated HTML / phone-paste fallback
@@ -523,13 +535,63 @@ fn pair_err(status: StatusCode, code: &'static str, error: impl Into<String>) ->
         .into_response()
 }
 
+fn pair_rate_limited(retry_after_secs: u64) -> Response {
+    let mut resp = pair_err(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limited",
+        format!("rate limit exceeded; retry after {retry_after_secs}s"),
+    );
+    let hv = header::HeaderValue::from_str(&retry_after_secs.to_string())
+        .unwrap_or_else(|_| header::HeaderValue::from_static("60"));
+    resp.headers_mut().insert(header::RETRY_AFTER, hv);
+    resp
+}
+
+/// Optional TCP peer (present when served with `into_make_service_with_connect_info`).
+struct OptionalPeer(Option<SocketAddr>);
+
+impl<S> FromRequestParts<S> for OptionalPeer
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0);
+        Ok(OptionalPeer(peer))
+    }
+}
+
+/// IP rate-limit key: peer addr primary; XFF only if `MYMESH_TRUST_PROXY` (see core).
+fn rate_limit_ip(peer: Option<SocketAddr>, headers: &HeaderMap) -> String {
+    let xff = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok());
+    let rip = headers.get("x-real-ip").and_then(|v| v.to_str().ok());
+    client_ip_key(peer, xff, rip)
+}
+
 fn rfc3339(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 // --- pair/v1 handlers ---
 
-async fn pair_status(State(st): State<CarrierState>) -> Response {
+async fn pair_status(
+    State(st): State<CarrierState>,
+    OptionalPeer(peer): OptionalPeer,
+    headers: HeaderMap,
+) -> Response {
+    let ip = rate_limit_ip(peer, &headers);
+    if let Err(rl) = st.rate_limits.check(LimitKind::PairStatus, &ip) {
+        record_pair_status(st.paths.metrics_dir());
+        return pair_rate_limited(rl.retry_after_secs);
+    }
+    record_pair_status(st.paths.metrics_dir());
+
     let id = st.identity().device_id();
     let mesh = match MeshState::load(st.paths.mesh_file()) {
         Ok(m) => m,
@@ -617,8 +679,19 @@ async fn pair_decide(
     headers: HeaderMap,
     Json(body): Json<DecideRequest>,
 ) -> Response {
-    if let Err(resp) = require_bootstrap(&st, &headers).await {
-        return resp;
+    let token_raw = match require_bootstrap(&st, &headers).await {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    // S9: 10 / min / token — file-backed so CLI confirm shares budget.
+    let token_key = hash_pair_token(&token_raw);
+    if let Err(rl) = mymesh_core::rate_limit_check_shared(
+        st.paths.metrics_dir(),
+        LimitKind::PairDecide,
+        &token_key,
+    ) {
+        record_pair_decide(st.paths.metrics_dir(), "rate_limited");
+        return pair_rate_limited(rl.retry_after_secs);
     }
 
     let device_id: DeviceId = match body.device_id_hex.parse() {
@@ -655,6 +728,7 @@ async fn pair_decide(
         }
     };
     if !pending.iter().any(|p| p.device_id == device_id) {
+        record_pair_decide(st.paths.metrics_dir(), "not_found");
         return Json(DecideResponse {
             ok: true,
             state: "not_found",
@@ -688,6 +762,7 @@ async fn pair_decide(
         decision = state,
         "pair/v1 decide written to JoinStore"
     );
+    record_pair_decide(st.paths.metrics_dir(), state);
     Json(DecideResponse { ok: true, state }).into_response()
 }
 
@@ -846,7 +921,19 @@ fn resolve_status_session(
 
 // --- pair/v2 handlers ---
 
-async fn pair_v2_status(State(st): State<CarrierState>, Query(q): Query<StatusQuery>) -> Response {
+async fn pair_v2_status(
+    State(st): State<CarrierState>,
+    OptionalPeer(peer): OptionalPeer,
+    headers: HeaderMap,
+    Query(q): Query<StatusQuery>,
+) -> Response {
+    let ip = rate_limit_ip(peer, &headers);
+    if let Err(rl) = st.rate_limits.check(LimitKind::PairStatus, &ip) {
+        record_pair_status(st.paths.metrics_dir());
+        return pair_rate_limited(rl.retry_after_secs);
+    }
+    record_pair_status(st.paths.metrics_dir());
+
     let id = st.identity().device_id();
     let store = match pair_sessions(&st.paths) {
         Ok(s) => s,
@@ -952,10 +1039,20 @@ async fn pair_v2_decide(
     headers: HeaderMap,
     Json(body): Json<SessionDecisionBody>,
 ) -> Response {
-    let (store, mut sess, _raw) = match require_v2_session(&st.paths, &headers, Some(&body.sid)) {
+    let (store, mut sess, raw) = match require_v2_session(&st.paths, &headers, Some(&body.sid)) {
         Ok(x) => x,
         Err(r) => return r,
     };
+    // S9: 10 / min / token — file-backed under metrics_dir (shared with CLI confirm).
+    let token_key = hash_pair_token(&raw);
+    if let Err(rl) = mymesh_core::rate_limit_check_shared(
+        st.paths.metrics_dir(),
+        LimitKind::PairDecide,
+        &token_key,
+    ) {
+        record_pair_decide(st.paths.metrics_dir(), "rate_limited");
+        return pair_rate_limited(rl.retry_after_secs);
+    }
 
     // Optional person fields unused in Wave A (audit only).
     let _ = (body.person_id, body.sig_hex);
@@ -1049,6 +1146,7 @@ async fn pair_v2_decide(
                 | (Some(JoinDecision::Deny { .. }), JoinDecision::Deny { .. })
         );
         if same_joiner && same_decision {
+            record_pair_decide(st.paths.metrics_dir(), "already_decided");
             return Json(DecideV2Response {
                 ok: true,
                 state: "already_decided",
@@ -1057,6 +1155,7 @@ async fn pair_v2_decide(
             })
             .into_response();
         }
+        record_pair_decide(st.paths.metrics_dir(), "conflict");
         return pair_err(
             StatusCode::CONFLICT,
             "already_decided",
@@ -1176,6 +1275,7 @@ async fn pair_v2_decide(
         decision = state,
         "pair/v2 decide written to JoinStore + PairSessionStore"
     );
+    record_pair_decide(st.paths.metrics_dir(), state);
     Json(DecideV2Response {
         ok: true,
         state,
@@ -1283,9 +1383,10 @@ pub fn carrier_pending_path(paths: &Paths) -> std::path::PathBuf {
 mod tests {
     use super::*;
     use axum::body::Body;
+    use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
     use chrono::Duration;
-    use mymesh_core::{Capability, DeviceId, NodeFingerprint};
+    use mymesh_core::{apply_pair_confirm, Capability, DeviceId, NodeFingerprint};
     use tower::ServiceExt;
 
     fn tmp_paths() -> Paths {
@@ -1313,6 +1414,7 @@ mod tests {
             status: Arc::new(Mutex::new("test".into())),
             bootstrap: Arc::new(Mutex::new(None)),
             mesh_auth: Arc::new(Mutex::new(MeshAuthStore::default())),
+            rate_limits: Arc::new(RateLimitState::new()),
         }
     }
 
@@ -1995,5 +2097,221 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(json_body(resp).await["protocol_version"], 1);
+    }
+
+    fn with_peer(mut req: Request<Body>, ip: [u8; 4]) -> Request<Body> {
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::from((ip, 50_000))));
+        req
+    }
+
+    /// S9: pair status unauth — 60 / min / peer IP → 429 + Retry-After.
+    /// X-Forwarded-For is ignored without MYMESH_TRUST_PROXY.
+    #[tokio::test]
+    async fn pair_status_rate_limit_per_ip() {
+        std::env::remove_var("MYMESH_TRUST_PROXY");
+        let paths = tmp_paths();
+        let secret = [0x81u8; 32];
+        ArmState::arm(paths.arm_file(), 600).unwrap();
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        let metrics = paths.metrics_dir();
+        let st = test_state(paths, secret, "host");
+        let app = build_router(st);
+
+        let peer = [203, 0, 113, 50];
+        let limit = mymesh_core::PAIR_STATUS.max as usize;
+        for i in 0..limit {
+            let req = with_peer(
+                Request::builder()
+                    .uri("/pair/v2/status")
+                    // Spoofed XFF must NOT bypass peer key when trust proxy is off.
+                    .header("x-forwarded-for", "198.51.100.1")
+                    .body(Body::empty())
+                    .unwrap(),
+                peer,
+            );
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert!(
+                resp.status() == StatusCode::NOT_FOUND || resp.status() == StatusCode::OK,
+                "hit {i}: unexpected {}",
+                resp.status()
+            );
+        }
+        let resp = app
+            .clone()
+            .oneshot(with_peer(
+                Request::builder()
+                    .uri("/pair/v2/status")
+                    .header("x-forwarded-for", "198.51.100.1")
+                    .body(Body::empty())
+                    .unwrap(),
+                peer,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            resp.headers().get(header::RETRY_AFTER).is_some(),
+            "429 must include Retry-After"
+        );
+        let body = json_body(resp).await;
+        assert_eq!(body["code"], "rate_limited");
+
+        // Different peer still allowed.
+        let resp = app
+            .oneshot(with_peer(
+                Request::builder()
+                    .uri("/pair/v2/status")
+                    .body(Body::empty())
+                    .unwrap(),
+                [203, 0, 113, 51],
+            ))
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let counters = mymesh_core::EventCounters::load(&metrics).unwrap();
+        assert!(counters.pair_status_total > limit as u64);
+    }
+
+    /// S9: pair decide — 10 / min / token → 429 + Retry-After; metrics.
+    #[tokio::test]
+    async fn pair_v2_decide_rate_limit_per_token() {
+        let paths = tmp_paths();
+        mymesh_core::rate_limit_clear_shared_for_tests(paths.metrics_dir());
+        let secret = [0x82u8; 32];
+        let id = Identity::from_secret_bytes(secret);
+        ArmState::arm(paths.arm_file(), 600).unwrap();
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        let (sid, token, nonce, _) =
+            arm_v2_session(&paths, id.device_id(), PairEndpointClass::Direct);
+        let metrics = paths.metrics_dir();
+
+        let st = test_state(paths.clone(), secret, "host");
+        let app = build_router(st);
+
+        // Body fails early (not_bound) but still consumes decide budget.
+        let body = serde_json::json!({
+            "sid": sid,
+            "decision": "deny",
+            "joiner_device_id_hex": DeviceId::from_bytes([0x99u8; 32]).to_string(),
+            "resident_device_id_hex": id.device_id().to_string(),
+            "ts": rfc3339(Utc::now()),
+            "nonce": encode_pair_nonce(&nonce),
+        });
+        let limit = mymesh_core::PAIR_DECIDE.max as usize;
+        for i in 0..limit {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/pair/v2/decide")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "hit {i} should not be limited yet"
+            );
+        }
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/pair/v2/decide")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().get(header::RETRY_AFTER).is_some());
+        assert_eq!(json_body(resp).await["code"], "rate_limited");
+
+        let counters = mymesh_core::EventCounters::load(&metrics).unwrap();
+        assert_eq!(
+            counters.pair_decide_total.get("rate_limited").copied(),
+            Some(1)
+        );
+    }
+
+    /// S9: HTTP decide hits and CLI confirm share one file-backed token budget.
+    #[tokio::test]
+    async fn decide_and_confirm_share_token_budget() {
+        let paths = tmp_paths();
+        mymesh_core::rate_limit_clear_shared_for_tests(paths.metrics_dir());
+        let secret = [0x83u8; 32];
+        let id = Identity::from_secret_bytes(secret);
+        ArmState::arm(paths.arm_file(), 600).unwrap();
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        let (sid, token, nonce, _) =
+            arm_v2_session(&paths, id.device_id(), PairEndpointClass::Direct);
+
+        let st = test_state(paths.clone(), secret, "host");
+        let app = build_router(st);
+        let body = serde_json::json!({
+            "sid": sid,
+            "decision": "deny",
+            "joiner_device_id_hex": DeviceId::from_bytes([0x77u8; 32]).to_string(),
+            "resident_device_id_hex": id.device_id().to_string(),
+            "ts": rfc3339(Utc::now()),
+            "nonce": encode_pair_nonce(&nonce),
+        });
+        // Burn 9 of 10 via HTTP decide
+        for _ in 0..9 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/pair/v2/decide")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        // 10th via confirm (same token_hash / metrics_dir file store)
+        let store = PairSessionStore::open(paths.pair_sessions_dir()).unwrap();
+        let joins = JoinStore::open(paths.join_dir()).unwrap();
+        // First confirm attempt consumes last slot (may fail not_bound / bad_code)
+        let r1 = apply_pair_confirm(&store, &joins, "ZZZZ-ZZZZ", Some(&sid), None);
+        assert!(
+            !matches!(r1, Err(mymesh_core::PairConfirmError::RateLimited { .. })),
+            "10th attempt should still be allowed: {r1:?}"
+        );
+        // 11th → RateLimited
+        let r2 = apply_pair_confirm(&store, &joins, "ZZZZ-ZZZZ", Some(&sid), None);
+        match r2 {
+            Err(mymesh_core::PairConfirmError::RateLimited { retry_after_secs }) => {
+                assert!(retry_after_secs >= 1);
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        // HTTP also blocked
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/pair/v2/decide")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().get(header::RETRY_AFTER).is_some());
     }
 }
