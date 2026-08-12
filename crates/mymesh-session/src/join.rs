@@ -110,6 +110,7 @@ pub async fn run_join_as_guest(
 
                     aliases: Vec::new(),
                     groups: Vec::new(),
+                    mesh_role: mymesh_core::MeshRole::Member,
                 };
                 store.upsert(rec.clone())?;
                 host_rec = Some(rec);
@@ -348,6 +349,7 @@ pub async fn handle_join_as_host(
                 mesh_id: Some(mesh.mesh_id.clone()),
                 aliases: Vec::new(),
                 groups: Vec::new(),
+                mesh_role: mymesh_core::MeshRole::Member,
             };
             store.upsert(rec)?;
 

@@ -96,4 +96,9 @@ impl Paths {
     pub fn mesh_owner_file(&self) -> PathBuf {
         self.data_dir.join("mesh-owner.json")
     }
+
+    /// Guest / object grants store (mode 0600). S5 / docs/GRANTS.md.
+    pub fn grants_file(&self) -> PathBuf {
+        self.data_dir.join("grants.json")
+    }
 }

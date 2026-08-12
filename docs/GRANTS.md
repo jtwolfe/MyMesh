@@ -2,8 +2,8 @@
 
 | Field | Value |
 |-------|--------|
-| **Status** | Normative contract freeze (S0) |
-| **Slice** | S5 implements store + session enforcement; this doc freezes schema and authz |
+| **Status** | Normative contract freeze (S0) · **store + `allows()` landed (C1)** |
+| **Slice** | S5: GrantStore + session enforcement (this doc); guest join wire delta in C1b |
 | **Source** | [CARRIER-NEXT.md](CARRIER-NEXT.md) § grant model, §S5 |
 | **Related** | [GUEST.md](GUEST.md), [MASTER-KEY.md](MASTER-KEY.md), [JOIN.md](JOIN.md), [SECURITY.md](SECURITY.md) |
 
@@ -88,7 +88,19 @@ Grant {
 
 ## On-disk: `grants.json`
 
-Mode **0600** under agent `Paths`. Implementation may store an array of Grant objects or a map keyed by `grant_id`; JSON field shapes above are normative.
+Mode **0600** under agent `Paths` (`Paths::grants_file()`).
+
+**Implementation (C1):** map keyed by `grant_id`:
+
+```json
+{
+  "grants": {
+    "<ULID>": { /* Grant object — field shapes above */ }
+  }
+}
+```
+
+Rust: `mymesh_core::{GrantStore, Grant, allows}`. Session paths use `allows(devices, grants, local_id, peer, cap)`.
 
 ---
 
@@ -121,13 +133,23 @@ allows(peer, cap):
 
 ---
 
-## CLI / API (target shape — S5)
+## CLI / API
+
+### CLI (C1 — host-local)
 
 ```bash
-mymesh grant create --to <guest> --on <device> --caps terminal,files --days 7
-mymesh grant list
+mymesh grant create --to <guest> [--on <device>] --caps terminal,files --days 7
+mymesh grant list [--json] [--all]
 mymesh grant revoke <grant_id>
 ```
+
+- Host-local CLI always may mutate `grants.json` (filesystem trust / `AdminAuthority::HostLocal`).
+- `--on` defaults to **this node** (object host).
+- `--to` accepts linked name/alias/prefix **or** bare 64-hex device id (guest may not be linked yet).
+- Guest grants **reject** `admin` capability (product policy).
+- `list` shows active grants by default; `--all` includes revoked/expired.
+
+### HTTP (C2)
 
 ```text
 POST /mesh/v1/grants

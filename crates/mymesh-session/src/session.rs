@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use mymesh_core::{Capability, DeviceId, DeviceStore, Result};
+use mymesh_core::{allows, Capability, DeviceId, DeviceStore, GrantStore, Result};
 use mymesh_crypto::Identity;
 use mymesh_net::PeerConnection;
 use mymesh_protocol::{decode_msg, encode_msg, ChannelId, ControlMessage, Frame, ALPN};
@@ -26,6 +26,18 @@ impl Session {
         store: &DeviceStore,
         offered: Vec<Capability>,
     ) -> Result<Self> {
+        Self::handshake_dialer_with_grants(conn, identity, label, store, None, offered).await
+    }
+
+    /// Dialer handshake with optional grant-aware path (S5 guests).
+    pub async fn handshake_dialer_with_grants(
+        conn: Box<dyn PeerConnection>,
+        identity: &Identity,
+        label: &str,
+        store: &DeviceStore,
+        grants: Option<&GrantStore>,
+        offered: Vec<Capability>,
+    ) -> Result<Self> {
         let peer_id = conn.peer_id();
         if !store.is_trusted(&peer_id) {
             return Err(mymesh_core::Error::PermissionDenied(format!(
@@ -33,6 +45,8 @@ impl Session {
             )));
         }
         let local_id = identity.device_id();
+        // Filter offered caps for guests when grants present (fail-closed if guest + no grants).
+        let offered = filter_offered_caps(store, grants, &local_id, &peer_id, offered);
         let material = [local_id.as_bytes().as_slice(), label.as_bytes()].concat();
         let hello = ControlMessage::Hello {
             protocol_version: 1,
@@ -84,6 +98,18 @@ impl Session {
         store: &DeviceStore,
         offered: Vec<Capability>,
     ) -> Result<Self> {
+        Self::handshake_acceptor_with_grants(conn, identity, label, store, None, offered).await
+    }
+
+    /// Acceptor handshake with grant-aware capability intersection (S5).
+    pub async fn handshake_acceptor_with_grants(
+        conn: Box<dyn PeerConnection>,
+        identity: &Identity,
+        label: &str,
+        store: &DeviceStore,
+        grants: Option<&GrantStore>,
+        offered: Vec<Capability>,
+    ) -> Result<Self> {
         let peer_id = conn.peer_id();
         if !store.is_trusted(&peer_id) {
             return Err(mymesh_core::Error::PermissionDenied(format!(
@@ -119,17 +145,15 @@ impl Session {
             }
         };
 
-        // Intersect capabilities with what we offer and what's stored.
+        let local_id = identity.device_id();
+        // Intersect offered ∩ peer_caps ∩ policy (member caps or active grant).
         let mut accepted: Vec<Capability> = offered
             .iter()
             .filter(|c| peer_caps.contains(c))
             .cloned()
             .collect();
-        if let Some(rec) = store.get(&peer_id) {
-            accepted.retain(|c| rec.capabilities.contains(c));
-        }
+        accepted.retain(|c| peer_allows(store, grants, &local_id, &peer_id, c));
 
-        let local_id = identity.device_id();
         let material = [local_id.as_bytes().as_slice(), label.as_bytes()].concat();
         let ack = ControlMessage::HelloAck {
             device_id: local_id,
@@ -202,5 +226,37 @@ impl Session {
 
     pub async fn close(self) -> Result<()> {
         self.conn.close().await
+    }
+}
+
+/// Policy check: members via device caps; guests via GrantStore (fail-closed without grants).
+fn peer_allows(
+    store: &DeviceStore,
+    grants: Option<&GrantStore>,
+    local_id: &DeviceId,
+    peer: &DeviceId,
+    cap: &Capability,
+) -> bool {
+    match grants {
+        Some(g) => allows(store, g, local_id, peer, cap),
+        None => store.allows(peer, cap),
+    }
+}
+
+fn filter_offered_caps(
+    store: &DeviceStore,
+    grants: Option<&GrantStore>,
+    local_id: &DeviceId,
+    peer: &DeviceId,
+    offered: Vec<Capability>,
+) -> Vec<Capability> {
+    // Dialer is the initiator; policy is primarily enforced on acceptor.
+    // Still drop caps the local store would deny for this peer when grants known.
+    match grants {
+        Some(g) => offered
+            .into_iter()
+            .filter(|c| allows(store, g, local_id, peer, c))
+            .collect(),
+        None => offered,
     }
 }

@@ -1,7 +1,7 @@
 //! Background agent: join, sessions, mesh gossip, pending kicks, periodic sync.
 use mymesh_core::{
-    ArmState, Capability, Config, DeviceStore, MeshState, PendingKick, PendingKickStore, Paths,
-    Result,
+    allows, ArmState, Capability, Config, DeviceStore, GrantStore, MeshState, PendingKick,
+    PendingKickStore, Paths, Result,
 };
 use mymesh_crypto::Identity;
 use mymesh_files::{apply_host_message, FileTransferEngine, PathSandbox};
@@ -31,6 +31,7 @@ pub struct Agent {
     secret: [u8; 32],
     label: String,
     devices_path: PathBuf,
+    grants_path: PathBuf,
     arm_path: PathBuf,
     join_dir: PathBuf,
     mesh_path: PathBuf,
@@ -56,15 +57,18 @@ impl Agent {
         mesh_dirty_path: PathBuf,
         config: Config,
     ) -> Result<Self> {
-        // Derive pair-sessions dir from join_dir parent (data_dir/join → data_dir/pair-sessions).
-        let pair_sessions_dir = join_dir
+        // Derive pair-sessions / grants from join_dir parent (data_dir/join → data_dir/…).
+        let data_dir = join_dir
             .parent()
-            .map(|p| p.join("pair-sessions"))
-            .unwrap_or_else(|| PathBuf::from("pair-sessions"));
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let pair_sessions_dir = data_dir.join("pair-sessions");
+        let grants_path = data_dir.join("grants.json");
         Self::new_with_pair_dir(
             identity,
             label,
             devices_path,
+            grants_path,
             arm_path,
             join_dir,
             mesh_path,
@@ -82,6 +86,7 @@ impl Agent {
             identity,
             config.device_label.clone(),
             paths.devices_file(),
+            paths.grants_file(),
             paths.arm_file(),
             paths.join_dir(),
             paths.mesh_file(),
@@ -98,6 +103,7 @@ impl Agent {
         identity: &Identity,
         label: String,
         devices_path: PathBuf,
+        grants_path: PathBuf,
         arm_path: PathBuf,
         join_dir: PathBuf,
         mesh_path: PathBuf,
@@ -112,6 +118,7 @@ impl Agent {
             secret: identity.to_secret_bytes(),
             label,
             devices_path,
+            grants_path,
             arm_path,
             join_dir,
             mesh_path,
@@ -130,6 +137,10 @@ impl Agent {
 
     fn store(&self) -> Result<DeviceStore> {
         DeviceStore::open(&self.devices_path)
+    }
+
+    fn grants(&self) -> Result<GrantStore> {
+        GrantStore::open(&self.grants_path)
     }
 
     fn pending(&self) -> Result<PendingKickStore> {
@@ -263,6 +274,7 @@ impl Agent {
     async fn handle_session(&self, conn: Box<dyn mymesh_net::PeerConnection>) -> Result<()> {
         let identity = self.identity();
         let store = self.store()?;
+        let grants = self.grants()?;
         let mut offered = Vec::new();
         if self.config.daemon.enable_terminal {
             offered.push(Capability::Terminal);
@@ -276,8 +288,15 @@ impl Agent {
         // Always offer TCP tunnels when agent is up (magic / proxy-ssh / expose).
         offered.push(Capability::Tcp);
 
-        let session =
-            Session::handshake_acceptor(conn, &identity, &self.label, &store, offered).await?;
+        let session = Session::handshake_acceptor_with_grants(
+            conn,
+            &identity,
+            &self.label,
+            &store,
+            Some(&grants),
+            offered,
+        )
+        .await?;
         let peer = session.peer_id();
         info!(peer = %peer.short(), "session established");
 
@@ -346,7 +365,9 @@ impl Agent {
                     match frame.channel.kind {
                         ChannelKind::Terminal => {
                             let store = self.store()?;
-                            if !store.allows(&peer, &Capability::Terminal) {
+                            let grants = self.grants()?;
+                            let local = self.identity().device_id();
+                            if !allows(&store, &grants, &local, &peer, &Capability::Terminal) {
                                 continue;
                             }
                             let msg: TerminalMessage = decode_msg(&frame.payload)?;
@@ -365,7 +386,9 @@ impl Agent {
                         }
                         ChannelKind::Files => {
                             let store = self.store()?;
-                            if !store.allows(&peer, &Capability::Files) {
+                            let grants = self.grants()?;
+                            let local = self.identity().device_id();
+                            if !allows(&store, &grants, &local, &peer, &Capability::Files) {
                                 continue;
                             }
                             let msg: FileMessage = decode_msg(&frame.payload)?;
@@ -891,6 +914,7 @@ impl Agent {
 
                     aliases: Vec::new(),
                     groups: Vec::new(),
+                    mesh_role: mymesh_core::MeshRole::Member,
                 })?;
             }
         }
