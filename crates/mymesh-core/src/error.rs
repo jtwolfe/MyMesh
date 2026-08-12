@@ -31,6 +31,9 @@ pub enum Error {
     #[error("permission denied: {0}")]
     PermissionDenied(String),
 
+    #[error("master key: {0}")]
+    MasterKey(String),
+
     #[error("serialize: {0}")]
     Serialize(String),
 

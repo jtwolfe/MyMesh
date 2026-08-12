@@ -80,4 +80,15 @@ impl Paths {
     pub fn pair_sessions_dir(&self) -> PathBuf {
         self.data_dir.join("pair-sessions")
     }
+
+    /// Mesh master key wrap file (Argon2id + XChaCha20-Poly1305 over MRK), mode 0600.
+    pub fn mesh_master_file(&self) -> PathBuf {
+        self.data_dir.join("mesh-master.json")
+    }
+
+    /// Host-local unlock cache for unwrapped MRK (mode 0600). Cleared by `mesh lock`.
+    /// Not an OS keyring — default policy remains re-prompt after lock / reboot.
+    pub fn mmk_runtime_file(&self) -> PathBuf {
+        self.data_dir.join("mmk-runtime.json")
+    }
 }

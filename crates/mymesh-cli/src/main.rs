@@ -14,7 +14,10 @@ use console::style;
 use mymesh_core::{
     ArmState, Capability, Config, DeviceStore, JoinDecision, JoinStore, MeshState, Paths,
 };
-use mymesh_crypto::{device_id_to_words, device_join_uri, parse_device_id, Identity};
+use mymesh_crypto::{
+    device_id_to_words, device_join_uri, mesh_init, mesh_recover_with_code, mesh_rotate_password,
+    mesh_unlock_password, parse_device_id, Identity, MeshMasterFile, MmkRuntime, RecoveryCode,
+};
 use mymesh_net::{
     run_mailbox_server, FsMailbox, HttpMailbox, IrohTransport, LocalFabric, LocalRendezvous,
     Rendezvous, Transport,
@@ -334,10 +337,46 @@ impl CompletionShell {
 
 #[derive(Subcommand, Debug)]
 enum MeshCmd {
-    /// Show mesh id and trusted roster
+    /// Initialize mesh master key (password wrap + recovery codes once)
+    Init {
+        /// Read password from file (otherwise prompt; or MYMESH_MMK_PASSWORD)
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+        /// Overwrite existing mesh-master.json (destructive)
+        #[arg(long)]
+        force: bool,
+    },
+    /// Unlock MMK into host-local runtime cache (re-prompt after lock; not OS keyring)
+    Unlock {
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+    },
+    /// Clear host-local unlock cache (MRK no longer available without re-prompt)
+    Lock,
+    /// Show mesh id, roster, and mesh master key status
     Status,
     /// Pull/push membership with all trusted peers (gossip sync)
     Sync,
+    /// Re-wrap MRK with a new password (requires current password)
+    #[command(name = "rotate-master")]
+    RotateMaster {
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+        #[arg(long, value_name = "PATH")]
+        new_password_file: Option<PathBuf>,
+    },
+    /// Recover master with a one-time recovery code (new MRK + new password)
+    #[command(name = "recover-master")]
+    RecoverMaster {
+        /// One-time recovery code (256-bit hex printed at mesh init)
+        #[arg(long)]
+        code: Option<String>,
+        /// Owner-proof recovery (S4; not yet implemented)
+        #[arg(long)]
+        owner_proof: bool,
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -612,8 +651,23 @@ async fn main() -> Result<()> {
             DemoCmd::Session => demo_session().await?,
         },
         Commands::Mesh { action } => match action {
+            MeshCmd::Init {
+                password_file,
+                force,
+            } => cmd_mesh_init(&paths, password_file, force)?,
+            MeshCmd::Unlock { password_file } => cmd_mesh_unlock(&paths, password_file)?,
+            MeshCmd::Lock => cmd_mesh_lock(&paths)?,
             MeshCmd::Status => cmd_mesh_status(&paths).await?,
             MeshCmd::Sync => cmd_mesh_sync(&paths).await?,
+            MeshCmd::RotateMaster {
+                password_file,
+                new_password_file,
+            } => cmd_mesh_rotate_master(&paths, password_file, new_password_file)?,
+            MeshCmd::RecoverMaster {
+                code,
+                owner_proof,
+                password_file,
+            } => cmd_mesh_recover_master(&paths, code, owner_proof, password_file)?,
         },
         Commands::Kick {
             device,
@@ -1453,6 +1507,8 @@ async fn cmd_mesh_status(paths: &Paths) -> Result<()> {
         id.device_id().short(),
         Config::load(paths.config_file())?.device_label
     );
+    // Mesh master key (MMK / MRK)
+    print_mmk_status(paths)?;
     if let Some(k) = &mesh.last_kick_notice {
         println!(
             "  last kick notice: you were kicked by {} — {}",
@@ -1490,6 +1546,195 @@ async fn cmd_mesh_status(paths: &Paths) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn print_mmk_status(paths: &Paths) -> Result<()> {
+    match MeshMasterFile::try_load(paths.mesh_master_file())? {
+        None => {
+            println!("  master    not initialized (mymesh mesh init)");
+            println!("  unlock    policy=re-prompt (default; no OS keyring)");
+        }
+        Some(mf) => {
+            let unlocked = MmkRuntime::load(paths.mmk_runtime_file())?
+                .map(|r| r.mrk_fingerprint == mf.mrk_fingerprint)
+                .unwrap_or(false);
+            println!(
+                "  master    initialized  fingerprint={}  recovery_codes={}",
+                mf.mrk_fingerprint,
+                mf.recovery_code_hashes.len()
+            );
+            println!(
+                "  unlock    {}  policy=re-prompt (host-local cache; not OS keyring)",
+                if unlocked {
+                    style("unlocked").green()
+                } else {
+                    style("locked").yellow()
+                }
+            );
+            if let Some(rot) = mf.rotated_at {
+                println!("  rotated   {}", rot.to_rfc3339());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_mesh_init(paths: &Paths, password_file: Option<PathBuf>, force: bool) -> Result<()> {
+    paths.ensure()?;
+    let path = paths.mesh_master_file();
+    if MeshMasterFile::exists(&path) && !force {
+        bail!(
+            "mesh-master.json already exists at {} (pass --force to overwrite)",
+            path.display()
+        );
+    }
+    let password = read_mmk_password(password_file.as_deref(), "New mesh master password", true)?;
+    let init = mesh_init(password.as_bytes(), None)?;
+    init.file.save(&path)?;
+    // Ensure mesh.json exists for this node.
+    let _ = MeshState::load(paths.mesh_file())?;
+    // Default re-prompt: do not leave runtime unlocked unless user runs unlock.
+    let _ = MmkRuntime::clear(paths.mmk_runtime_file());
+
+    println!("{}", style("Mesh master key initialized").green().bold());
+    println!("  file          {}", path.display());
+    println!("  fingerprint   {}", init.file.mrk_fingerprint);
+    println!("  kdf           argon2id m={} t={} p={}", init.file.kdf_params.m, init.file.kdf_params.t, init.file.kdf_params.p);
+    println!("  unlock policy re-prompt (default; OS keyring not enabled)");
+    println!();
+    println!(
+        "{}",
+        style("RECOVERY CODES — save these now; they are shown once")
+            .red()
+            .bold()
+    );
+    println!("  Each code is 256-bit hex. One code recovers the master (new MRK + password).");
+    for (i, code) in init.recovery_codes.iter().enumerate() {
+        println!("  {:2}.  {}", i + 1, code.display_hex());
+    }
+    println!();
+    println!("Next: mymesh mesh unlock   # then use host-local admin / future mesh API");
+    Ok(())
+}
+
+fn cmd_mesh_unlock(paths: &Paths, password_file: Option<PathBuf>) -> Result<()> {
+    let file = MeshMasterFile::load(paths.mesh_master_file())?;
+    let password = read_mmk_password(password_file.as_deref(), "Mesh master password", false)?;
+    let mrk = mesh_unlock_password(&file, password.as_bytes())?;
+    let rt = MmkRuntime::from_mrk(&mrk);
+    rt.save(paths.mmk_runtime_file())?;
+    println!(
+        "{} fingerprint={}",
+        style("unlocked").green().bold(),
+        mrk.fingerprint()
+    );
+    println!(
+        "  host-local cache {} (mode 0600; cleared by mesh lock / not OS keyring)",
+        paths.mmk_runtime_file().display()
+    );
+    Ok(())
+}
+
+fn cmd_mesh_lock(paths: &Paths) -> Result<()> {
+    let cleared = MmkRuntime::clear(paths.mmk_runtime_file())?;
+    if cleared {
+        println!("{}", style("locked").yellow().bold());
+        println!("  cleared host-local unlock cache; re-prompt required");
+    } else {
+        println!("already locked (no host-local unlock cache)");
+    }
+    Ok(())
+}
+
+fn cmd_mesh_rotate_master(
+    paths: &Paths,
+    password_file: Option<PathBuf>,
+    new_password_file: Option<PathBuf>,
+) -> Result<()> {
+    let file = MeshMasterFile::load(paths.mesh_master_file())?;
+    let current = read_mmk_password(password_file.as_deref(), "Current mesh master password", false)?;
+    let new_pass = read_mmk_password(new_password_file.as_deref(), "New mesh master password", true)?;
+    let (new_file, mrk) =
+        mesh_rotate_password(&file, current.as_bytes(), new_pass.as_bytes(), None)?;
+    new_file.save(paths.mesh_master_file())?;
+    // Keep unlocked if we were unlocked, with same MRK under new wrap.
+    if MmkRuntime::load(paths.mmk_runtime_file())?.is_some() {
+        MmkRuntime::from_mrk(&mrk).save(paths.mmk_runtime_file())?;
+    }
+    println!(
+        "{} fingerprint={} (same MRK, new wrap)",
+        style("rotated").green().bold(),
+        new_file.mrk_fingerprint
+    );
+    Ok(())
+}
+
+fn cmd_mesh_recover_master(
+    paths: &Paths,
+    code: Option<String>,
+    owner_proof: bool,
+    password_file: Option<PathBuf>,
+) -> Result<()> {
+    if owner_proof {
+        bail!("--owner-proof recovery requires owner claim (S4); not available yet");
+    }
+    let code_str = code.ok_or_else(|| {
+        anyhow::anyhow!("pass --code <recovery-hex> (printed once at mesh init)")
+    })?;
+    let file = MeshMasterFile::load(paths.mesh_master_file())?;
+    let recovery = RecoveryCode::parse(&code_str)?;
+    let new_pass = read_mmk_password(password_file.as_deref(), "New mesh master password", true)?;
+    let (new_file, mrk) =
+        mesh_recover_with_code(&file, &recovery, new_pass.as_bytes(), None)?;
+    new_file.save(paths.mesh_master_file())?;
+    // Force re-unlock after recovery (new MRK).
+    let _ = MmkRuntime::clear(paths.mmk_runtime_file());
+    println!(
+        "{} new fingerprint={}  remaining recovery codes={}",
+        style("recovered").green().bold(),
+        new_file.mrk_fingerprint,
+        new_file.recovery_code_hashes.len()
+    );
+    println!("  old MRK invalidated; run mymesh mesh unlock with the new password");
+    let _ = mrk; // zeroized on drop
+    Ok(())
+}
+
+/// Read MMK password from (in order): `--password-file`, `MYMESH_MMK_PASSWORD`, interactive prompt.
+fn read_mmk_password(
+    password_file: Option<&Path>,
+    prompt: &str,
+    confirm: bool,
+) -> Result<String> {
+    if let Some(p) = password_file {
+        let s = std::fs::read_to_string(p)
+            .with_context(|| format!("read password file {}", p.display()))?;
+        let pass = s.trim_end_matches(['\n', '\r']).to_string();
+        if pass.is_empty() {
+            bail!("password file is empty");
+        }
+        return Ok(pass);
+    }
+    if let Ok(env) = std::env::var("MYMESH_MMK_PASSWORD") {
+        if !env.is_empty() {
+            return Ok(env);
+        }
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        bail!("no TTY for password prompt; set MYMESH_MMK_PASSWORD or --password-file");
+    }
+    let pass = rpassword::prompt_password(format!("{prompt}: "))
+        .context("read password")?;
+    if pass.is_empty() {
+        bail!("password must not be empty");
+    }
+    if confirm {
+        let again = rpassword::prompt_password("Confirm password: ").context("confirm password")?;
+        if pass != again {
+            bail!("passwords do not match");
+        }
+    }
+    Ok(pass)
 }
 
 async fn cmd_mesh_sync(paths: &Paths) -> Result<()> {
