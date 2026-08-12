@@ -3,6 +3,7 @@
 **Audience:** operators running MyMesh v0.1.0-alpha.x  
 **Status:** best-effort documentation; not a formal audit.  
 **Threat model & S9 controls:** **[THREATS.md](THREATS.md)** (C1–C7 checklist, implemented vs planned)  
+**Recovery runbooks (dual authority):** **[RECOVERY.md](RECOVERY.md)** (lost phone/MMK, compromised guest, MMK rotate, sealed backup)  
 **S0 contracts:** [MASTER-KEY.md](MASTER-KEY.md), [GRANTS.md](GRANTS.md), [GUEST.md](GUEST.md), [PAIR-V2.md](PAIR-V2.md), [CARRIER-NEXT.md](CARRIER-NEXT.md)
 
 ## Trust model
@@ -100,5 +101,6 @@ Prefer private disclosure for exploitable bugs until a security contact is forma
 ## See also
 
 - **[THREATS.md](THREATS.md)** — threat catalog + C1–C7 implemented vs planned  
+- **[RECOVERY.md](RECOVERY.md)** — dual-authority recovery runbooks  
 - [MASTER-KEY.md](MASTER-KEY.md) · [GRANTS.md](GRANTS.md) · [GUEST.md](GUEST.md) · [PAIR-V2.md](PAIR-V2.md)  
-- [JOIN.md](JOIN.md) · [CARRIER-NEXT.md](CARRIER-NEXT.md) · [ARCHITECTURE.md](ARCHITECTURE.md)
+- [DEMO-PAIR.md](DEMO-PAIR.md) · [JOIN.md](JOIN.md) · [CARRIER-NEXT.md](CARRIER-NEXT.md) · [ARCHITECTURE.md](ARCHITECTURE.md)

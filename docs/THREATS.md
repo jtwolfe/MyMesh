@@ -4,7 +4,7 @@
 |-------|--------|
 | **Audience** | Operators, reviewers, implementers |
 | **Status** | Living threat model aligned with [CARRIER-NEXT.md](CARRIER-NEXT.md) §S9 — **not** a formal audit |
-| **Related** | [SECURITY.md](SECURITY.md) (operator model), [PAIR-V2.md](PAIR-V2.md), [MASTER-KEY.md](MASTER-KEY.md), [GRANTS.md](GRANTS.md), [GUEST.md](GUEST.md) |
+| **Related** | [SECURITY.md](SECURITY.md) (operator model), [RECOVERY.md](RECOVERY.md) (ops runbooks), [PAIR-V2.md](PAIR-V2.md), [MASTER-KEY.md](MASTER-KEY.md), [GRANTS.md](GRANTS.md), [GUEST.md](GUEST.md), [DEMO-PAIR.md](DEMO-PAIR.md) |
 
 ---
 
@@ -63,8 +63,8 @@ MyMesh is a **personal mesh**: machines you explicitly link, plus optional Carri
 | Cross-facet bleed | Work ↔ personal leak | **C6** separate keys + allowlists | S7 |
 | Confirm / decide brute force | Wrong accept / token grind | **C7** rate limits; single-use confirm | S2, S9 |
 | Confirm shoulder-surf | Wrong accept | TTL; single-use; dual fps shown first | S2 |
-| MMK lost, owner alive | Admin lockout | `recover-master` + owner proof | S3/S4 |
-| Owner lost, MMK alive | Person lockout | MMK clear owner; new claim | S4 |
+| MMK lost, owner alive | Admin lockout | `recover-master --code` (today); owner-proof planned — [RECOVERY.md](RECOVERY.md) R4 | S3/S4 |
+| Owner lost, MMK alive | Person lockout | MMK clear owner; new claim — [RECOVERY.md](RECOVERY.md) R2 | S4 |
 | Audit secret leak | Tokens in logs | Redaction (Carrier S9) | S9 |
 | Compromised Trusted peer | Full agent-user power | Unlink / kick; no remote-user isolation yet | alpha |
 
@@ -189,12 +189,14 @@ Normative IDs from [CARRIER-NEXT.md](CARRIER-NEXT.md) §S9. Status reflects **th
 3. **Revoke grants** and unlink/kick devices promptly when a share ends or a peer is suspect.
 4. Do not rebind SOCKS or carrier HTTP to `0.0.0.0` without understanding exposure ([SECURITY.md](SECURITY.md)).
 5. Treat every **Trusted** peer with Terminal/Files/TCP as equivalent to local user access on the agent host.
+6. Store **MMK recovery codes** offline at `mesh init`; export sealed owner backup — full procedures in **[RECOVERY.md](RECOVERY.md)**.
 
 ---
 
 ## See also
 
 - [SECURITY.md](SECURITY.md) — alpha trust model, privilege, reporting  
+- **[RECOVERY.md](RECOVERY.md)** — dual-authority recovery runbooks (lost phone/MMK, guest, rotate, backup)  
 - [CARRIER-NEXT.md](CARRIER-NEXT.md) — full S0–S9 design, control checklist source  
 - [PAIR-V2.md](PAIR-V2.md) · [DEMO-PAIR.md](DEMO-PAIR.md) · [MASTER-KEY.md](MASTER-KEY.md)  
 - [GRANTS.md](GRANTS.md) · [GUEST.md](GUEST.md) · [JOIN.md](JOIN.md)

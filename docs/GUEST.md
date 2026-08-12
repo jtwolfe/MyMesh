@@ -87,6 +87,7 @@ if peer.mesh_role == Guest:
 - Guest may open sessions only to the **object host** under grant caps.
 - Other devices deny guest sessions.
 - Compromising a guest never yields MMK or person seed ([MASTER-KEY.md](MASTER-KEY.md)).
+- Operator response when a guest device is compromised: [RECOVERY.md](RECOVERY.md) runbook **G** (revoke grant; optional unlink).
 
 ---
 
@@ -165,6 +166,7 @@ H: kill sessions; revoked_at
 - [GRANTS.md](GRANTS.md) — Grant schema and `allows()`
 - [JOIN.md](JOIN.md) — member join still sends full snapshot
 - [MASTER-KEY.md](MASTER-KEY.md) — dual authority; guest never holds MMK
+- [RECOVERY.md](RECOVERY.md) — compromised guest runbook
 - [PAIR-V2.md](PAIR-V2.md) — dual-scan guest flag (S5)
-- [SECURITY.md](SECURITY.md) — trust model
+- [SECURITY.md](SECURITY.md) · [THREATS.md](THREATS.md) — trust model + C4 residual
 - [CARRIER-NEXT.md](CARRIER-NEXT.md) — S5 full design

@@ -1,6 +1,6 @@
 # MyMesh usage guide (v0.1.0-alpha.3)
 
-This is the practical reference for day-to-day use. For design limits of the magic plane see [ALPHA-3.md](ALPHA-3.md). For linking security see [JOIN.md](JOIN.md) and [SECURITY.md](SECURITY.md). Next-phase contracts: [PAIR-V2.md](PAIR-V2.md), [MASTER-KEY.md](MASTER-KEY.md), [GRANTS.md](GRANTS.md), [GUEST.md](GUEST.md), [CARRIER-NEXT.md](CARRIER-NEXT.md). Wave A pair demo (dual-scan + confirm): [DEMO-PAIR.md](DEMO-PAIR.md).
+This is the practical reference for day-to-day use. For design limits of the magic plane see [ALPHA-3.md](ALPHA-3.md). For linking security see [JOIN.md](JOIN.md) and [SECURITY.md](SECURITY.md). Next-phase contracts: [PAIR-V2.md](PAIR-V2.md), [MASTER-KEY.md](MASTER-KEY.md), [GRANTS.md](GRANTS.md), [GUEST.md](GUEST.md), [CARRIER-NEXT.md](CARRIER-NEXT.md). Wave A pair demo (dual-scan + confirm): [DEMO-PAIR.md](DEMO-PAIR.md). Dual-authority recovery (lost phone/MMK, guest, rotate, sealed backup): [RECOVERY.md](RECOVERY.md).
 
 ---
 
@@ -445,6 +445,7 @@ carrier phone timeout?
 - [ALPHA-3.md](ALPHA-3.md) — magic plane  
 - [JOIN.md](JOIN.md) — pairing details  
 - [PAIR-V2.md](PAIR-V2.md) · [DEMO-PAIR.md](DEMO-PAIR.md) · [MASTER-KEY.md](MASTER-KEY.md) · [GRANTS.md](GRANTS.md) · [GUEST.md](GUEST.md)  
+- [RECOVERY.md](RECOVERY.md) — dual-authority recovery runbooks  
 - [SECURITY.md](SECURITY.md) — operator security model  
 - [THREATS.md](THREATS.md) — threat catalog + S9 control checklist C1–C7  
 - [CARRIER-NEXT.md](CARRIER-NEXT.md) — S0–S9 design  

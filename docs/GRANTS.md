@@ -5,7 +5,7 @@
 | **Status** | Normative contract freeze (S0) · **store + `allows()` (C1) · HTTP grants API (C2)** |
 | **Slice** | S5: GrantStore + session enforcement (this doc); guest join wire delta in C1b; mesh/v1 grants in C2 |
 | **Source** | [CARRIER-NEXT.md](CARRIER-NEXT.md) § grant model, §S5 |
-| **Related** | [GUEST.md](GUEST.md), [MASTER-KEY.md](MASTER-KEY.md), [JOIN.md](JOIN.md), [SECURITY.md](SECURITY.md) |
+| **Related** | [GUEST.md](GUEST.md), [MASTER-KEY.md](MASTER-KEY.md), [RECOVERY.md](RECOVERY.md) (compromised guest), [JOIN.md](JOIN.md), [SECURITY.md](SECURITY.md) |
 
 ---
 
