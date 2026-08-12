@@ -10,6 +10,9 @@ mod pair;
 mod session;
 mod tcp_tunnel;
 
+#[cfg(test)]
+mod two_agent_harness;
+
 pub use agent::Agent;
 pub use carrier::{
     build_pair_qr, build_pair_qr_v2, carrier_pending_path, decode_pair_nonce, encode_pair_nonce,
