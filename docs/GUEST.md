@@ -102,6 +102,8 @@ if peer.mesh_role == Guest:
 
 **Product:** Guest token / guest session **cannot** pull full roster.
 
+**HTTP (`GET /mesh/v1/topology`, C4):** Enforced in `mymesh-session` `mesh_api.rs`. Active `grants_summary` for elevated/own sessions; empty for guest + `pair_read`. Guest `device_member` session scope is `minimal` (self + object host(s) from active grants + serving host).
+
 ---
 
 ## Revoke
