@@ -50,10 +50,7 @@ impl PairPhase {
 
     /// Terminal or post-decide phases for idempotent decide checks.
     pub fn is_post_decide(self) -> bool {
-        matches!(
-            self,
-            Self::Decided | Self::Completing | Self::Completed
-        )
+        matches!(self, Self::Decided | Self::Completing | Self::Completed)
     }
 }
 
@@ -278,9 +275,8 @@ impl PairSessionStore {
             return Ok(None);
         }
         let s = std::fs::read_to_string(path)?;
-        let raw = hex::decode(s.trim()).map_err(|e| {
-            crate::Error::Session(format!("pair token decode: {e}"))
-        })?;
+        let raw = hex::decode(s.trim())
+            .map_err(|e| crate::Error::Session(format!("pair token decode: {e}")))?;
         if raw.len() != 32 {
             return Err(crate::Error::Session(format!(
                 "pair token must be 32 bytes, got {}",
@@ -402,10 +398,7 @@ impl PairSessionStore {
         };
         self.save(&session)?;
         self.save_token_raw(&session.sid, &token_raw)?;
-        Ok(ArmedPairSession {
-            session,
-            token_raw,
-        })
+        Ok(ArmedPairSession { session, token_raw })
     }
 
     /// Bind joiner to an armed session (phase → bound).
@@ -498,7 +491,10 @@ impl PairSessionStore {
     }
 
     /// Resolve active open session: exact sid, or unique active non-expired session.
-    pub fn resolve_session(&self, sid: Option<&str>) -> std::result::Result<PairSessionFile, PairConfirmError> {
+    pub fn resolve_session(
+        &self,
+        sid: Option<&str>,
+    ) -> std::result::Result<PairSessionFile, PairConfirmError> {
         if let Some(sid) = sid {
             let s = self
                 .load(sid)
@@ -627,9 +623,7 @@ pub fn apply_pair_confirm(
         .load_token_raw(&sess.sid)
         .map_err(|e| PairConfirmError::Other(e.to_string()))?
         .ok_or_else(|| {
-            PairConfirmError::Other(
-                "bootstrap token missing for session (re-run pair dual)".into(),
-            )
+            PairConfirmError::Other("bootstrap token missing for session (re-run pair dual)".into())
         })?;
 
     // --- Binding gate ---
@@ -637,13 +631,7 @@ pub fn apply_pair_confirm(
 
     let resident_hex = sess.resident_device_id.to_string();
     let joiner_hex = joiner.to_string();
-    let codes = compute_confirm_codes(
-        &pepper,
-        &sess.sid,
-        &joiner_hex,
-        &resident_hex,
-        &sess.nonce,
-    );
+    let codes = compute_confirm_codes(&pepper, &sess.sid, &joiner_hex, &resident_hex, &sess.nonce);
 
     let is_accept = confirm_codes_equal(code, &codes.accept);
     let is_deny = confirm_codes_equal(code, &codes.deny);
@@ -727,20 +715,12 @@ fn resolve_bind_joiner(
             let p = many
                 .iter()
                 .find(|p| p.device_id == hint)
-                .ok_or_else(|| {
-                    PairConfirmError::Other("no pending join for --joiner".into())
-                })?;
+                .ok_or_else(|| PairConfirmError::Other("no pending join for --joiner".into()))?;
             let resident_hex = sess.resident_device_id.to_string();
             let joiner_hex = p.device_id.to_string();
-            let codes = compute_confirm_codes(
-                pepper,
-                &sess.sid,
-                &joiner_hex,
-                &resident_hex,
-                &sess.nonce,
-            );
-            if !confirm_codes_equal(code, &codes.accept)
-                && !confirm_codes_equal(code, &codes.deny)
+            let codes =
+                compute_confirm_codes(pepper, &sess.sid, &joiner_hex, &resident_hex, &sess.nonce);
+            if !confirm_codes_equal(code, &codes.accept) && !confirm_codes_equal(code, &codes.deny)
             {
                 return Err(PairConfirmError::BadCode);
             }
@@ -792,10 +772,7 @@ mod tests {
         assert_eq!(armed.session.phase, PairPhase::Armed);
         assert_eq!(armed.session.nonce.len(), 16);
         assert_eq!(armed.token_raw.len(), 32);
-        assert_eq!(
-            armed.session.token_hash,
-            hash_pair_token(&armed.token_raw)
-        );
+        assert_eq!(armed.session.token_hash, hash_pair_token(&armed.token_raw));
         // disk has hash, not raw token bytes as base64
         let raw = std::fs::read_to_string(store.path_for(&armed.session.sid)).unwrap();
         assert!(!raw.contains(&hex::encode(armed.token_raw)));
@@ -820,12 +797,7 @@ mod tests {
         let sid = armed.session.sid.clone();
 
         let bound = store
-            .bind_joiner(
-                &sid,
-                joiner,
-                Some("laptop".into()),
-                Some("fp".into()),
-            )
+            .bind_joiner(&sid, joiner, Some("laptop".into()), Some("fp".into()))
             .unwrap();
         assert_eq!(bound.phase, PairPhase::Bound);
         assert_eq!(bound.joiner_device_id, Some(joiner));
@@ -865,9 +837,8 @@ mod tests {
     fn sid_is_ulid_shaped() {
         let s = new_pair_sid();
         assert_eq!(s.len(), 26);
-        assert!(s
-            .chars()
-            .all(|c| CROCKFORD.contains(&(c as u8)) || CROCKFORD.contains(&(c.to_ascii_uppercase() as u8))));
+        assert!(s.chars().all(|c| CROCKFORD.contains(&(c as u8))
+            || CROCKFORD.contains(&(c.to_ascii_uppercase() as u8))));
     }
 
     #[test]
@@ -993,14 +964,8 @@ mod tests {
             &resident.to_string(),
             &armed.session.nonce,
         );
-        let res = apply_pair_confirm(
-            &store,
-            &joins,
-            &codes.deny,
-            Some(&armed.session.sid),
-            None,
-        )
-        .unwrap();
+        let res = apply_pair_confirm(&store, &joins, &codes.deny, Some(&armed.session.sid), None)
+            .unwrap();
         assert!(matches!(res.decision, JoinDecision::Deny { .. }));
         let _ = std::fs::remove_dir_all(root);
     }

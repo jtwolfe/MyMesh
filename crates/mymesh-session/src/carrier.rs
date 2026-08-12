@@ -846,10 +846,7 @@ fn resolve_status_session(
 
 // --- pair/v2 handlers ---
 
-async fn pair_v2_status(
-    State(st): State<CarrierState>,
-    Query(q): Query<StatusQuery>,
-) -> Response {
+async fn pair_v2_status(State(st): State<CarrierState>, Query(q): Query<StatusQuery>) -> Response {
     let id = st.identity().device_id();
     let store = match pair_sessions(&st.paths) {
         Ok(s) => s,
@@ -860,11 +857,7 @@ async fn pair_v2_status(
         Err(r) => return r,
     };
     let Some(sess) = sess else {
-        return pair_err(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "no active pair session",
-        );
+        return pair_err(StatusCode::NOT_FOUND, "not_found", "no active pair session");
     };
 
     let cfg = Config::load(st.paths.config_file()).unwrap_or_else(|_| Config {
@@ -886,7 +879,10 @@ async fn pair_v2_status(
         host_fingerprint: NodeFingerprint::from_device_id(&id).as_str().to_string(),
         host_short_id: id.short(),
         armed,
-        arm_until: arm.until.map(rfc3339).unwrap_or_else(|| rfc3339(sess.until)),
+        arm_until: arm
+            .until
+            .map(rfc3339)
+            .unwrap_or_else(|| rfc3339(sess.until)),
         until: rfc3339(sess.until),
         phase: phase.as_str(),
         nonce: encode_pair_nonce(&sess.nonce),
@@ -902,11 +898,7 @@ async fn pair_v2_pending(State(st): State<CarrierState>, headers: HeaderMap) -> 
         Err(r) => return r,
     };
     if sess.is_expired_now() {
-        return pair_err(
-            StatusCode::GONE,
-            "session_gone",
-            "pair session expired",
-        );
+        return pair_err(StatusCode::GONE, "session_gone", "pair session expired");
     }
 
     let joins = match JoinStore::open(st.paths.join_dir()) {
@@ -1022,11 +1014,7 @@ async fn pair_v2_decide(
     let ts = match DateTime::parse_from_rfc3339(&body.ts) {
         Ok(t) => t.with_timezone(&Utc),
         Err(_) => {
-            return pair_err(
-                StatusCode::BAD_REQUEST,
-                "bad_request",
-                "ts must be RFC3339",
-            );
+            return pair_err(StatusCode::BAD_REQUEST, "bad_request", "ts must be RFC3339");
         }
     };
     let skew = (Utc::now() - ts).num_seconds().abs();
@@ -1039,11 +1027,7 @@ async fn pair_v2_decide(
     }
 
     if sess.is_expired_now() {
-        return pair_err(
-            StatusCode::GONE,
-            "session_gone",
-            "pair session expired",
-        );
+        return pair_err(StatusCode::GONE, "session_gone", "pair session expired");
     }
 
     let decision = match body.decision {
@@ -1724,12 +1708,7 @@ mod tests {
         let store = PairSessionStore::open(paths.pair_sessions_dir()).unwrap();
         let armed = store.arm_new(&mesh.mesh_id, resident, 900, ep).unwrap();
         let token = URL_SAFE_NO_PAD.encode(armed.token_raw);
-        (
-            armed.session.sid,
-            token,
-            armed.session.nonce,
-            mesh.mesh_id,
-        )
+        (armed.session.sid, token, armed.session.nonce, mesh.mesh_id)
     }
 
     #[test]

@@ -233,9 +233,7 @@ mod tests {
         let cfg_a = test_config("agent-a", sandbox_a);
         let cfg_b = test_config("agent-b", sandbox_b);
 
-        MeshState::new_mesh()
-            .save(paths_a.mesh_file())
-            .unwrap();
+        MeshState::new_mesh().save(paths_a.mesh_file()).unwrap();
         ArmState::arm(paths_a.arm_file(), 120).unwrap();
         let pair_store = PairSessionStore::open(paths_a.pair_sessions_dir()).unwrap();
         let mesh = MeshState::load(paths_a.mesh_file()).unwrap();
@@ -295,9 +293,14 @@ mod tests {
             &id_a.device_id().to_string(),
             &armed.session.nonce,
         );
-        let applied =
-            apply_pair_confirm(&pair_store, &joins, &codes.deny, Some(&armed.session.sid), None)
-                .unwrap();
+        let applied = apply_pair_confirm(
+            &pair_store,
+            &joins,
+            &codes.deny,
+            Some(&armed.session.sid),
+            None,
+        )
+        .unwrap();
         assert!(matches!(
             applied.decision,
             mymesh_core::JoinDecision::Deny { .. }
@@ -435,8 +438,7 @@ mod tests {
             }
         };
 
-        let (host_res, guest_res, _confirm_res) =
-            tokio::join!(host_fut, guest_fut, confirm_fut);
+        let (host_res, guest_res, _confirm_res) = tokio::join!(host_fut, guest_fut, confirm_fut);
         host_res.expect("host join");
         let (host_rec, store_b) = guest_res.expect("guest join");
         assert_eq!(host_rec.trust, TrustState::Trusted);
@@ -448,10 +450,7 @@ mod tests {
             "host must Trust joiner after confirm accept"
         );
 
-        let sess = pair_store
-            .load(&armed.session.sid)
-            .unwrap()
-            .unwrap();
+        let sess = pair_store.load(&armed.session.sid).unwrap().unwrap();
         assert_eq!(sess.phase, PairPhase::Decided);
         assert!(sess.confirm_consumed);
 

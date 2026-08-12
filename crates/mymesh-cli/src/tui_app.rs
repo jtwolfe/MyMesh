@@ -1473,7 +1473,7 @@ async fn submit_prompt(app: &mut App) {
                     }
                 }
             };
-            match crate::cmd_arm(&app.paths, secs).await {
+            match crate::cmd_arm(&app.paths, secs, None).await {
                 Ok(()) => app.status = format!("armed ({secs:?} secs)"),
                 Err(e) => app.status = format!("arm: {e}"),
             }

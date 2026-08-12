@@ -59,14 +59,24 @@ pub struct MagicConfig {
     pub reconnect_probe_secs: u64,
 }
 
-fn default_true() -> bool { true }
-fn default_domain() -> String { "mym".into() }
-fn default_dns_bind() -> String { "127.0.0.1:5353".into() }
-fn default_socks_bind() -> String { "127.0.0.1:18080".into() }
+fn default_true() -> bool {
+    true
+}
+fn default_domain() -> String {
+    "mym".into()
+}
+fn default_dns_bind() -> String {
+    "127.0.0.1:5353".into()
+}
+fn default_socks_bind() -> String {
+    "127.0.0.1:18080".into()
+}
 fn default_auto_ports() -> Vec<u16> {
     vec![22, 80, 443, 3000, 7878, 8000, 8080, 8443, 9090]
 }
-fn default_reconnect_secs() -> u64 { 30 }
+fn default_reconnect_secs() -> u64 {
+    30
+}
 
 impl Default for MagicConfig {
     fn default() -> Self {

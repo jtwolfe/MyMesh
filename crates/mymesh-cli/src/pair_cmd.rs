@@ -22,11 +22,7 @@ use qrcode::QrCode;
 use crate::mesh_conn;
 
 /// Resident: arm join window, mint PairSession, print QR_A v2 (required nonce).
-pub async fn cmd_pair_dual(
-    paths: &Paths,
-    host: Option<String>,
-    ttl: Option<u64>,
-) -> Result<()> {
+pub async fn cmd_pair_dual(paths: &Paths, host: Option<String>, ttl: Option<u64>) -> Result<()> {
     paths.ensure()?;
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file()).unwrap_or_default();
@@ -42,12 +38,7 @@ pub async fn cmd_pair_dual(
     } else {
         PairEndpointClass::Confirm
     };
-    let armed = store.arm_new(
-        mesh.mesh_id.clone(),
-        identity.device_id(),
-        ttl,
-        ep,
-    )?;
+    let armed = store.arm_new(mesh.mesh_id.clone(), identity.device_id(), ttl, ep)?;
 
     let token_b64 = URL_SAFE_NO_PAD.encode(armed.token_raw);
     let did = identity.device_id().to_string();
@@ -92,7 +83,10 @@ pub async fn cmd_pair_dual(
     }
     println!();
     println!("Ensure `mymesh serve` is running on this machine.");
-    println!("Joiner:  mymesh pair dual --join --resident {}", identity.device_id());
+    println!(
+        "Joiner:  mymesh pair dual --join --resident {}",
+        identity.device_id()
+    );
     println!("Then:    mymesh pair confirm <code>   # code from phone after dual-scan");
     Ok(())
 }
@@ -134,10 +128,7 @@ pub async fn cmd_pair_dual_join(paths: &Paths, resident: &str) -> Result<()> {
         println!("{rendered}");
     }
     println!();
-    println!(
-        "dialing join to {}…",
-        style(host_id.short()).cyan()
-    );
+    println!("dialing join to {}…", style(host_id.short()).cyan());
 
     let (conn, transport) = mesh_conn::connect_raw(&identity, &cfg, host_id).await?;
     let peer = run_join_as_guest(
@@ -176,13 +167,7 @@ pub async fn cmd_pair_confirm(
         None
     };
 
-    match apply_pair_confirm(
-        &store,
-        &joins,
-        code,
-        sid.as_deref(),
-        joiner_id,
-    ) {
+    match apply_pair_confirm(&store, &joins, code, sid.as_deref(), joiner_id) {
         Ok(res) => {
             let kind = match &res.decision {
                 JoinDecision::Accept => "accept",

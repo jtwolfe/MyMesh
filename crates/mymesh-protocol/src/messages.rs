@@ -166,6 +166,31 @@ pub enum ControlMessage {
     KickAck {
         accepted: bool,
     },
+    /// Gossip: a grant was issued (minimal; not a full guest identity flood).
+    GrantAnnounce {
+        grant_id: String,
+        mesh_id: String,
+        subject_device_id: DeviceId,
+        object_device_id: DeviceId,
+        capabilities: Vec<Capability>,
+        /// Unix seconds; None if no expiry.
+        not_after_unix: Option<i64>,
+        by_id: DeviceId,
+        ts: i64,
+        #[serde(with = "crate::ser_fixed::array64")]
+        signature: [u8; 64],
+    },
+    /// Gossip: grant revoked — object host / replicas apply `revoked_at`.
+    GrantRevoke {
+        grant_id: String,
+        mesh_id: String,
+        subject_device_id: DeviceId,
+        object_device_id: DeviceId,
+        by_id: DeviceId,
+        ts: i64,
+        #[serde(with = "crate::ser_fixed::array64")]
+        signature: [u8; 64],
+    },
 }
 
 /// Wire form of a mesh member (protocol crate — mirrors core::MeshMember fields).
@@ -353,7 +378,6 @@ pub enum PairingMessage {
         reason: String,
     },
 }
-
 
 /// TCP tunnel control/data on ChannelKind::Tcp.
 #[derive(Clone, Debug, Serialize, Deserialize)]

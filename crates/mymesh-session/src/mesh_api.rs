@@ -223,7 +223,10 @@ pub fn mesh_v1_routes(st: MeshApiState) -> Router {
         .route("/mesh/v1/auth/challenge", get(auth_challenge))
         .route("/mesh/v1/auth/session", post(auth_session))
         .route("/mesh/v1/topology", get(topology))
-        .route("/mesh/v1/owner/claim", post(owner_claim).delete(owner_clear))
+        .route(
+            "/mesh/v1/owner/claim",
+            post(owner_claim).delete(owner_clear),
+        )
         .route("/mesh/v1/owner", get(owner_get))
         .route(
             "/mesh/v1/owner/backup",
@@ -405,7 +408,9 @@ async fn auth_challenge(State(st): State<MeshApiState>) -> Response {
     {
         let mut store = st.auth.lock().await;
         // Opportunistic GC of expired challenges.
-        store.challenges.retain(|_, c| c.expires_at > Utc::now() && !c.consumed);
+        store
+            .challenges
+            .retain(|_, c| c.expires_at > Utc::now() && !c.consumed);
         store.challenges.insert(
             challenge_id.clone(),
             PendingChallenge {
@@ -447,11 +452,7 @@ async fn auth_session(
                 );
             }
             Some(c) if c.expires_at <= Utc::now() => {
-                return mesh_err(
-                    StatusCode::GONE,
-                    "challenge_expired",
-                    "challenge expired",
-                );
+                return mesh_err(StatusCode::GONE, "challenge_expired", "challenge expired");
             }
             Some(c) => {
                 c.consumed = true;
@@ -765,20 +766,22 @@ fn prove_pair_read(
             format!("pair session store: {e}"),
         )
     })?;
-    let sess = store.find_by_token_raw(&raw).map_err(|e| {
-        mesh_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            format!("session lookup: {e}"),
-        )
-    })?
-    .ok_or_else(|| {
-        mesh_err(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "unknown pair bootstrap token",
-        )
-    })?;
+    let sess = store
+        .find_by_token_raw(&raw)
+        .map_err(|e| {
+            mesh_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("session lookup: {e}"),
+            )
+        })?
+        .ok_or_else(|| {
+            mesh_err(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "unknown pair bootstrap token",
+            )
+        })?;
 
     if let Some(want) = body.sid.as_deref() {
         if sess.sid != want {
@@ -797,11 +800,7 @@ fn prove_pair_read(
         ));
     }
 
-    Ok((
-        Some(sess.resident_device_id),
-        None,
-        Some(sess.sid.clone()),
-    ))
+    Ok((Some(sess.resident_device_id), None, Some(sess.sid.clone())))
 }
 
 async fn topology(State(st): State<MeshApiState>, headers: HeaderMap) -> Response {
@@ -954,10 +953,7 @@ struct OwnerPublicResponse {
     backup_stored: bool,
 }
 
-async fn owner_claim(
-    State(st): State<MeshApiState>,
-    Json(body): Json<OwnerClaimBody>,
-) -> Response {
+async fn owner_claim(State(st): State<MeshApiState>, Json(body): Json<OwnerClaimBody>) -> Response {
     // Agent-local MMK auth (co-sign or claim window). Phone never holds MMK.
     let auth = match check_claim_authorized(
         st.paths.mmk_runtime_file(),
@@ -1084,10 +1080,7 @@ async fn owner_get(State(st): State<MeshApiState>) -> Response {
         }
     };
     let backup_stored = st.paths.owner_backup_file().exists()
-        || owner
-            .as_ref()
-            .and_then(|o| o.backup_stored_at)
-            .is_some();
+        || owner.as_ref().and_then(|o| o.backup_stored_at).is_some();
     match owner {
         Some(o) => Json(OwnerPublicResponse {
             claimed: true,
@@ -1337,10 +1330,7 @@ fn build_pair_read_members(
         groups: vec![],
     });
     if let Some(joiner) = sess.joiner_device_id {
-        let label = sess
-            .joiner_label
-            .clone()
-            .unwrap_or_else(|| "joiner".into());
+        let label = sess.joiner_label.clone().unwrap_or_else(|| "joiner".into());
         let fp = sess.joiner_fp.clone().unwrap_or_else(|| {
             NodeFingerprint::from_device_id(&joiner)
                 .as_str()
@@ -1449,12 +1439,7 @@ mod tests {
     async fn get_challenge(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
         let resp = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(uri)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
         let status = resp.status();
@@ -1599,7 +1584,10 @@ mod tests {
         let topo = json_body(resp).await;
         assert_eq!(topo["mesh_id"], mesh.mesh_id);
         assert_eq!(topo["auth_mode"], "device_member");
-        assert_eq!(topo["served_by_device_id_hex"], host.device_id().to_string());
+        assert_eq!(
+            topo["served_by_device_id_hex"],
+            host.device_id().to_string()
+        );
         let members = topo["members"].as_array().unwrap();
         // host + trusted peer only (not pending)
         assert_eq!(members.len(), 2);
@@ -1667,11 +1655,14 @@ mod tests {
         MeshState::new_mesh().save(paths.mesh_file()).unwrap();
 
         let password = b"test-mmk-password-ok";
-        let init = mesh_init(password, Some(mymesh_crypto::KdfParams {
-            m: 64_000,
-            t: 2,
-            p: 1,
-        }))
+        let init = mesh_init(
+            password,
+            Some(mymesh_crypto::KdfParams {
+                m: 64_000,
+                t: 2,
+                p: 1,
+            }),
+        )
         .unwrap();
         init.file.save(paths.mesh_master_file()).unwrap();
         // locked — no runtime

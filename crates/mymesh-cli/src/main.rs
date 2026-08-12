@@ -19,8 +19,8 @@ use mymesh_crypto::{
     accept_owner_claim, admin_verifying_key_bytes, check_claim_authorized, device_id_to_words,
     device_join_uri, mesh_init, mesh_recover_with_code, mesh_rotate_password, mesh_unlock_password,
     parse_device_id, resolve_claim_fingerprint, seal_owner_backup, sign_mrk_proof_ed25519,
-    unseal_owner_backup, ClaimAuthMethod, ClaimWindowFile, Identity, MeshMasterFile,
-    MeshOwnerFile, MmkRuntime, OwnerBackupSealed, OwnerClaimRequest, RecoveryCode,
+    unseal_owner_backup, ClaimAuthMethod, ClaimWindowFile, Identity, MeshMasterFile, MeshOwnerFile,
+    MmkRuntime, OwnerBackupSealed, OwnerClaimRequest, RecoveryCode,
 };
 use mymesh_net::{
     run_mailbox_server, FsMailbox, HttpMailbox, IrohTransport, LocalFabric, LocalRendezvous,
@@ -554,6 +554,9 @@ enum ConnectRequestCmd {
         /// Arm duration in seconds
         #[arg(long)]
         secs: Option<u64>,
+        /// Guest grant id — accepted joiners get Guest role, no full roster (GUEST.md)
+        #[arg(long = "guest-grant", value_name = "GRANT_ID")]
+        guest_grant: Option<String>,
     },
     /// Stop accepting join requests
     Deny,
@@ -721,7 +724,9 @@ async fn main() -> Result<()> {
             }
         }
         Commands::ConnectRequest { action } => match action {
-            ConnectRequestCmd::Allow { secs } => cmd_arm(&paths, secs).await?,
+            ConnectRequestCmd::Allow { secs, guest_grant } => {
+                cmd_arm(&paths, secs, guest_grant.as_deref()).await?
+            }
             ConnectRequestCmd::Deny => {
                 ArmState::disarm(paths.arm_file())?;
                 println!("{} disarmed", style("ok").green().bold());
@@ -1047,10 +1052,45 @@ async fn cmd_link_help(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn cmd_arm(paths: &Paths, secs: Option<u64>) -> Result<()> {
+pub(crate) async fn cmd_arm(
+    paths: &Paths,
+    secs: Option<u64>,
+    guest_grant: Option<&str>,
+) -> Result<()> {
     let cfg = Config::load(paths.config_file())?;
     let ttl = secs.unwrap_or(cfg.limits.arm_timeout_secs);
-    let state = ArmState::arm(paths.arm_file(), ttl)?;
+    let state = if let Some(gid) = guest_grant {
+        let gid = gid.trim();
+        if gid.is_empty() {
+            bail!("--guest-grant requires a non-empty grant id");
+        }
+        let grants = GrantStore::open(paths.grants_file())?;
+        let g = grants.get(gid).ok_or_else(|| {
+            anyhow::anyhow!("grant {gid} not found — create with: mymesh grant create")
+        })?;
+        if g.role != mymesh_core::GrantRole::Guest {
+            bail!("grant {gid} is not a guest grant");
+        }
+        if !g.is_active(chrono::Utc::now()) {
+            bail!("grant {gid} is revoked or expired");
+        }
+        let identity = Identity::load_or_create(paths.identity_file())?;
+        let local = identity.device_id();
+        if !g.covers_object(&local) {
+            bail!("grant {gid} object is not this host");
+        }
+        let state = ArmState::arm_with_guest_grant(paths.arm_file(), ttl, gid)?;
+        let words = device_id_to_words(&local)?;
+        println!("{} until {:?}", style("ARMED").green().bold(), state.until);
+        println!("  guest-grant {gid}");
+        println!("  subject {}", g.subject_device_id.short());
+        println!("  hex   {local}");
+        println!("  words {words}");
+        println!("  join path: guest (no full membership snapshot)");
+        return Ok(());
+    } else {
+        ArmState::arm(paths.arm_file(), ttl)?
+    };
     let id = Identity::load_or_create(paths.identity_file())?;
     let words = device_id_to_words(&id.device_id())?;
     println!("{} until {:?}", style("ARMED").green().bold(), state.until);
@@ -1062,7 +1102,11 @@ pub(crate) async fn cmd_arm(paths: &Paths, secs: Option<u64>) -> Result<()> {
 pub(crate) async fn cmd_arm_status(paths: &Paths) -> Result<()> {
     let arm = ArmState::load(paths.arm_file())?;
     if arm.is_effectively_armed() {
-        println!("armed until {:?}", arm.until);
+        print!("armed until {:?}", arm.until);
+        if let Some(ref g) = arm.guest_grant_id {
+            print!("  guest-grant {g}");
+        }
+        println!();
     } else {
         println!("disarmed");
     }
@@ -1882,7 +1926,11 @@ async fn cmd_mesh_status(paths: &Paths) -> Result<()> {
         Config::load(paths.config_file())?.device_label
     );
     if let Some(c) = &mesh.creator_device_id {
-        let mark = if *c == id.device_id() { " (this node)" } else { "" };
+        let mark = if *c == id.device_id() {
+            " (this node)"
+        } else {
+            ""
+        };
         println!("  creator   {}{mark}", c.short());
     }
     if let Some(fp) = &mesh.mrk_fingerprint {
@@ -1912,12 +1960,7 @@ async fn cmd_mesh_status(paths: &Paths) -> Result<()> {
             } else {
                 ""
             };
-            println!(
-                "    {}  {}  {:?}{admin}",
-                d.id.short(),
-                d.label,
-                d.mesh_id
-            );
+            println!("    {}  {}  {:?}{admin}", d.id.short(), d.label, d.mesh_id);
             println!("      {}", d.id);
         }
     }
@@ -2026,7 +2069,10 @@ fn cmd_mesh_init(paths: &Paths, password_file: Option<PathBuf>, force: bool) -> 
         "  creator       {} (host-local admin on this node)",
         identity.device_id().short()
     );
-    println!("  kdf           argon2id m={} t={} p={}", init.file.kdf_params.m, init.file.kdf_params.t, init.file.kdf_params.p);
+    println!(
+        "  kdf           argon2id m={} t={} p={}",
+        init.file.kdf_params.m, init.file.kdf_params.t, init.file.kdf_params.p
+    );
     println!("  unlock policy re-prompt (default; OS keyring not enabled)");
     println!("  remote Admin  not auto-granted to existing peers (default grant has no Admin)");
     if trusted_no_admin > 0 {
@@ -2054,9 +2100,8 @@ fn cmd_mesh_init(paths: &Paths, password_file: Option<PathBuf>, force: bool) -> 
 /// Sign challenge with unlocked MRK (Ed25519 admin proof). Demonstrates B2 without Carrier.
 fn cmd_mesh_prove(paths: &Paths, challenge_hex: Option<String>) -> Result<()> {
     let file = MeshMasterFile::load(paths.mesh_master_file())?;
-    let rt = MmkRuntime::load(paths.mmk_runtime_file())?.ok_or_else(|| {
-        anyhow::anyhow!("MMK locked — run `mymesh mesh unlock` first")
-    })?;
+    let rt = MmkRuntime::load(paths.mmk_runtime_file())?
+        .ok_or_else(|| anyhow::anyhow!("MMK locked — run `mymesh mesh unlock` first"))?;
     if rt.mrk_fingerprint != file.mrk_fingerprint {
         bail!("runtime fingerprint mismatch — re-run mesh unlock");
     }
@@ -2121,8 +2166,16 @@ fn cmd_mesh_rotate_master(
     new_password_file: Option<PathBuf>,
 ) -> Result<()> {
     let file = MeshMasterFile::load(paths.mesh_master_file())?;
-    let current = read_mmk_password(password_file.as_deref(), "Current mesh master password", false)?;
-    let new_pass = read_mmk_password(new_password_file.as_deref(), "New mesh master password", true)?;
+    let current = read_mmk_password(
+        password_file.as_deref(),
+        "Current mesh master password",
+        false,
+    )?;
+    let new_pass = read_mmk_password(
+        new_password_file.as_deref(),
+        "New mesh master password",
+        true,
+    )?;
     let (new_file, mrk) =
         mesh_rotate_password(&file, current.as_bytes(), new_pass.as_bytes(), None)?;
     new_file.save(paths.mesh_master_file())?;
@@ -2149,14 +2202,12 @@ fn cmd_mesh_recover_master(
             "--owner-proof recovery: challenge/sign flow not yet wired; use --code recovery for now"
         );
     }
-    let code_str = code.ok_or_else(|| {
-        anyhow::anyhow!("pass --code <recovery-hex> (printed once at mesh init)")
-    })?;
+    let code_str = code
+        .ok_or_else(|| anyhow::anyhow!("pass --code <recovery-hex> (printed once at mesh init)"))?;
     let file = MeshMasterFile::load(paths.mesh_master_file())?;
     let recovery = RecoveryCode::parse(&code_str)?;
     let new_pass = read_mmk_password(password_file.as_deref(), "New mesh master password", true)?;
-    let (new_file, mrk) =
-        mesh_recover_with_code(&file, &recovery, new_pass.as_bytes(), None)?;
+    let (new_file, mrk) = mesh_recover_with_code(&file, &recovery, new_pass.as_bytes(), None)?;
     new_file.save(paths.mesh_master_file())?;
     // KD28: update owner claim fingerprint without clearing person binding.
     if let Some(mut owner) = MeshOwnerFile::try_load(paths.mesh_owner_file())? {
@@ -2334,17 +2385,13 @@ fn cmd_owner_backup_export(paths: &Paths, out: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     sealed.save(out)?;
-    println!(
-        "{} → {}",
-        style("exported").green().bold(),
-        out.display()
-    );
+    println!("{} → {}", style("exported").green().bold(), out.display());
     Ok(())
 }
 
 fn cmd_owner_backup_import(paths: &Paths, input: &Path) -> Result<()> {
-    let raw = std::fs::read_to_string(input)
-        .with_context(|| format!("read {}", input.display()))?;
+    let raw =
+        std::fs::read_to_string(input).with_context(|| format!("read {}", input.display()))?;
     let sealed: OwnerBackupSealed = serde_json::from_str(&raw)?;
     OwnerBackupSealed::store_blob(paths.owner_backup_file(), &sealed)?;
     if let Some(mut owner) = MeshOwnerFile::try_load(paths.mesh_owner_file())? {
@@ -2367,10 +2414,7 @@ fn cmd_owner_backup_store(
     password_file: Option<PathBuf>,
     hint: Option<String>,
 ) -> Result<()> {
-    let cleaned: String = seed_hex
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
+    let cleaned: String = seed_hex.chars().filter(|c| !c.is_whitespace()).collect();
     let bytes = hex::decode(&cleaned).context("seed_hex")?;
     if bytes.len() != 32 {
         bail!("seed must be 32 bytes (64 hex chars), got {}", bytes.len());
@@ -2415,11 +2459,7 @@ fn cmd_owner_backup_store(
 }
 
 /// Read MMK password from (in order): `--password-file`, `MYMESH_MMK_PASSWORD`, interactive prompt.
-fn read_mmk_password(
-    password_file: Option<&Path>,
-    prompt: &str,
-    confirm: bool,
-) -> Result<String> {
+fn read_mmk_password(password_file: Option<&Path>, prompt: &str, confirm: bool) -> Result<String> {
     if let Some(p) = password_file {
         let s = std::fs::read_to_string(p)
             .with_context(|| format!("read password file {}", p.display()))?;
@@ -2437,8 +2477,7 @@ fn read_mmk_password(
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         bail!("no TTY for password prompt; set MYMESH_MMK_PASSWORD or --password-file");
     }
-    let pass = rpassword::prompt_password(format!("{prompt}: "))
-        .context("read password")?;
+    let pass = rpassword::prompt_password(format!("{prompt}: ")).context("read password")?;
     if pass.is_empty() {
         bail!("password must not be empty");
     }

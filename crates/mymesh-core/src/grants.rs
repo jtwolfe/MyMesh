@@ -271,9 +271,7 @@ impl GrantStore {
         self.grants
             .values()
             .filter(|g| {
-                g.subject_device_id == *subject
-                    && g.covers_object(object)
-                    && g.is_active(now)
+                g.subject_device_id == *subject && g.covers_object(object) && g.is_active(now)
             })
             .collect()
     }
@@ -355,9 +353,7 @@ pub fn allows_at(
         return false;
     }
     match rec.mesh_role {
-        MeshRole::Guest => {
-            grants.grant_allows(peer, local_device_id, cap, now)
-        }
+        MeshRole::Guest => grants.grant_allows(peer, local_device_id, cap, now),
         MeshRole::Member => rec.capabilities.contains(cap),
     }
 }
@@ -485,10 +481,7 @@ mod tests {
 
         let mut store3 = GrantStore::open(&path).unwrap();
         store3.revoke(&g.grant_id).unwrap();
-        assert!(!store3
-            .get(&g.grant_id)
-            .unwrap()
-            .is_active(Utc::now()));
+        assert!(!store3.get(&g.grant_id).unwrap().is_active(Utc::now()));
         assert!(!store3.grant_allows(&subject, &object, &Capability::Terminal, Utc::now()));
 
         // mode 0600

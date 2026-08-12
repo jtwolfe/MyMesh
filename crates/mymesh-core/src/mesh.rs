@@ -144,10 +144,7 @@ impl PendingKickStore {
         let kicks = if path.exists() {
             let raw = std::fs::read_to_string(&path)?;
             let file: PendingKickFile = serde_json::from_str(&raw)?;
-            file.kicks
-                .into_values()
-                .map(|k| (k.target_id, k))
-                .collect()
+            file.kicks.into_values().map(|k| (k.target_id, k)).collect()
         } else {
             HashMap::new()
         };
@@ -185,7 +182,10 @@ impl PendingKickStore {
             let complete = k.delivered_to_target
                 && k.expected.iter().all(|e| k.acks.contains(e) || *e == from);
             // also complete if force and delivered
-            let complete = complete || (k.force && k.delivered_to_target && k.acks.len() >= k.expected.len().saturating_sub(0));
+            let complete = complete
+                || (k.force
+                    && k.delivered_to_target
+                    && k.acks.len() >= k.expected.len().saturating_sub(0));
             Some(complete)
         } else {
             None

@@ -9,6 +9,9 @@ pub struct ArmState {
     pub armed: bool,
     pub until: Option<DateTime<Utc>>,
     pub armed_at: Option<DateTime<Utc>>,
+    /// When set, accepted joins use the guest path for this grant (GUEST.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_grant_id: Option<String>,
 }
 
 impl ArmState {
@@ -20,6 +23,11 @@ impl ArmState {
             None => true,
             Some(t) => Utc::now() < t,
         }
+    }
+
+    /// Guest-join arming (host expects grant-scoped accept, no full roster).
+    pub fn is_guest_arm(&self) -> bool {
+        self.is_effectively_armed() && self.guest_grant_id.is_some()
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
@@ -41,11 +49,29 @@ impl ArmState {
     }
 
     pub fn arm(path: impl AsRef<Path>, ttl_secs: u64) -> Result<Self> {
+        Self::arm_inner(path, ttl_secs, None)
+    }
+
+    /// Arm for guest join bound to an existing grant id (object host).
+    pub fn arm_with_guest_grant(
+        path: impl AsRef<Path>,
+        ttl_secs: u64,
+        grant_id: impl Into<String>,
+    ) -> Result<Self> {
+        Self::arm_inner(path, ttl_secs, Some(grant_id.into()))
+    }
+
+    fn arm_inner(
+        path: impl AsRef<Path>,
+        ttl_secs: u64,
+        guest_grant_id: Option<String>,
+    ) -> Result<Self> {
         let now = Utc::now();
         let state = Self {
             armed: true,
             until: Some(now + chrono::Duration::seconds(ttl_secs as i64)),
             armed_at: Some(now),
+            guest_grant_id,
         };
         state.save(path.as_ref())?;
         Ok(state)
@@ -103,7 +129,10 @@ impl JoinStore {
     pub fn write_pending(&self, p: &PendingJoin) -> Result<()> {
         // Clear stale decision
         let _ = std::fs::remove_file(self.decision_path(&p.device_id));
-        std::fs::write(self.pending_path(&p.device_id), serde_json::to_string_pretty(p)?)?;
+        std::fs::write(
+            self.pending_path(&p.device_id),
+            serde_json::to_string_pretty(p)?,
+        )?;
         Ok(())
     }
 

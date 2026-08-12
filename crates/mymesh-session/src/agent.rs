@@ -1,7 +1,7 @@
 //! Background agent: join, sessions, mesh gossip, pending kicks, periodic sync.
 use mymesh_core::{
-    allows, ArmState, Capability, Config, DeviceStore, GrantStore, MeshState, PendingKick,
-    PendingKickStore, Paths, Result,
+    allows, ArmState, Capability, Config, DeviceStore, GrantStore, MeshState, Paths, PendingKick,
+    PendingKickStore, Result,
 };
 use mymesh_crypto::Identity;
 use mymesh_files::{apply_host_message, FileTransferEngine, PathSandbox};
@@ -15,10 +15,11 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-use crate::join::handle_join_as_host;
+use crate::join::handle_join_as_host_with_grants;
 use crate::mesh_sync::{
-    apply_kick_notice_local, apply_kick_target, apply_membership, build_announce, build_snapshot,
-    sign_leave_ack, verify_kick, verify_leave_ack, verify_membership,
+    apply_grant_revoke, apply_kick_notice_local, apply_kick_target, apply_membership,
+    build_announce, build_snapshot, sign_leave_ack, verify_grant_announce, verify_grant_revoke,
+    verify_kick, verify_leave_ack, verify_membership,
 };
 use crate::session::Session;
 use crate::tcp_tunnel;
@@ -215,11 +216,12 @@ impl Agent {
 
     async fn handle_join(&self, conn: Box<dyn mymesh_net::PeerConnection>) -> Result<()> {
         let identity = self.identity();
-        handle_join_as_host(
+        handle_join_as_host_with_grants(
             conn,
             &identity,
             &self.label,
             &self.devices_path,
+            &self.grants_path,
             &self.arm_path,
             &self.join_dir,
             &self.mesh_path,
@@ -227,7 +229,7 @@ impl Agent {
             Some(&self.pair_sessions_dir),
         )
         .await?;
-        // roster changed
+        // roster changed (member joins); guest joins stay local to object host
         let _ = crate::mesh_sync::bump_mesh_dirty(&self.mesh_path, &self.mesh_dirty_path);
         Ok(())
     }
@@ -500,8 +502,16 @@ impl Agent {
                 .await?;
             }
             ControlMessage::MembershipRequest { nonce } => {
-                let mesh = MeshState::load(&self.mesh_path)?;
                 let store = self.store()?;
+                // Guests must not pull mesh-wide roster (GUEST.md fail closed).
+                if store
+                    .get(&peer)
+                    .map(|d| d.mesh_role == mymesh_core::MeshRole::Guest)
+                    .unwrap_or(false)
+                {
+                    return Ok(());
+                }
+                let mesh = MeshState::load(&self.mesh_path)?;
                 let snap = build_snapshot(identity, &self.label, &store, &mesh, nonce);
                 conn.send_frame(Frame {
                     channel: ChannelId::control(),
@@ -715,6 +725,89 @@ impl Agent {
             ControlMessage::KickAck { .. }
             | ControlMessage::MetricsPollEnable { .. }
             | ControlMessage::MetricsPollDisable => {}
+            ControlMessage::GrantRevoke {
+                grant_id,
+                mesh_id,
+                subject_device_id,
+                object_device_id,
+                by_id,
+                ts,
+                signature,
+            } => {
+                // Accept revoke from trusted members only (fail closed).
+                let store = self.store()?;
+                if !store.is_trusted(&by_id) || by_id != peer {
+                    return Ok(());
+                }
+                if verify_grant_revoke(
+                    &mesh_id,
+                    &grant_id,
+                    &subject_device_id,
+                    &object_device_id,
+                    &by_id,
+                    ts,
+                    &signature,
+                )
+                .is_err()
+                {
+                    return Ok(());
+                }
+                // Only apply if we are the object host or already hold the grant.
+                let local = identity.device_id();
+                if object_device_id != local && self.grants()?.get(&grant_id).is_none() {
+                    return Ok(());
+                }
+                let mut grants = self.grants()?;
+                match apply_grant_revoke(&mut grants, &grant_id) {
+                    Ok(g) => {
+                        info!(
+                            grant = %g.grant_id,
+                            subject = %g.subject_device_id.short(),
+                            "applied GrantRevoke"
+                        );
+                    }
+                    Err(e) => {
+                        // Unknown grant id is not an error on replicas that never held it.
+                        warn!(%e, grant = %grant_id, "GrantRevoke apply skipped");
+                    }
+                }
+            }
+            ControlMessage::GrantAnnounce {
+                grant_id,
+                mesh_id,
+                subject_device_id,
+                object_device_id,
+                by_id,
+                ts,
+                signature,
+                ..
+            } => {
+                let store = self.store()?;
+                if !store.is_trusted(&by_id) || by_id != peer {
+                    return Ok(());
+                }
+                if verify_grant_announce(
+                    &mesh_id,
+                    &grant_id,
+                    &subject_device_id,
+                    &object_device_id,
+                    &by_id,
+                    ts,
+                    &signature,
+                )
+                .is_err()
+                {
+                    return Ok(());
+                }
+                // Announce is informational for S5; object host already has the grant
+                // from local create. Log only (no full guest identity flood).
+                info!(
+                    grant = %grant_id,
+                    subject = %subject_device_id.short(),
+                    object = %object_device_id.short(),
+                    "GrantAnnounce received"
+                );
+            }
             _ => {}
         }
         Ok(())
@@ -728,7 +821,10 @@ impl Agent {
         let peers: Vec<_> = store
             .list()
             .into_iter()
-            .filter(|d| d.trust == mymesh_core::TrustState::Trusted)
+            .filter(|d| {
+                d.trust == mymesh_core::TrustState::Trusted
+                    && d.mesh_role != mymesh_core::MeshRole::Guest
+            })
             .map(|d| d.id)
             .collect();
         let announce = build_announce(&identity, &cfg_label, &store, &mesh);
@@ -750,7 +846,10 @@ impl Agent {
         let peers: Vec<_> = store
             .list()
             .into_iter()
-            .filter(|d| d.trust == mymesh_core::TrustState::Trusted)
+            .filter(|d| {
+                d.trust == mymesh_core::TrustState::Trusted
+                    && d.mesh_role != mymesh_core::MeshRole::Guest
+            })
             .map(|d| d.id)
             .collect();
         for peer in peers {
