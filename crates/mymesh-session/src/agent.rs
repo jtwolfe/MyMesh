@@ -1,6 +1,7 @@
 //! Background agent: join, sessions, mesh gossip, pending kicks, periodic sync.
 use mymesh_core::{
-    ArmState, Capability, Config, DeviceStore, MeshState, PendingKick, PendingKickStore, Result,
+    ArmState, Capability, Config, DeviceStore, MeshState, PendingKick, PendingKickStore, Paths,
+    Result,
 };
 use mymesh_crypto::Identity;
 use mymesh_files::{apply_host_message, FileTransferEngine, PathSandbox};
@@ -36,11 +37,13 @@ pub struct Agent {
     kick_notice_path: PathBuf,
     pending_kicks_path: PathBuf,
     mesh_dirty_path: PathBuf,
+    pair_sessions_dir: PathBuf,
     config: Config,
     files: std::sync::Arc<FileTransferEngine>,
 }
 
 impl Agent {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         identity: &Identity,
         label: String,
@@ -51,6 +54,57 @@ impl Agent {
         kick_notice_path: PathBuf,
         pending_kicks_path: PathBuf,
         mesh_dirty_path: PathBuf,
+        config: Config,
+    ) -> Result<Self> {
+        // Derive pair-sessions dir from join_dir parent (data_dir/join → data_dir/pair-sessions).
+        let pair_sessions_dir = join_dir
+            .parent()
+            .map(|p| p.join("pair-sessions"))
+            .unwrap_or_else(|| PathBuf::from("pair-sessions"));
+        Self::new_with_pair_dir(
+            identity,
+            label,
+            devices_path,
+            arm_path,
+            join_dir,
+            mesh_path,
+            kick_notice_path,
+            pending_kicks_path,
+            mesh_dirty_path,
+            pair_sessions_dir,
+            config,
+        )
+    }
+
+    /// Construct agent with explicit Paths (preferred).
+    pub fn from_paths(identity: &Identity, paths: &Paths, config: Config) -> Result<Self> {
+        Self::new_with_pair_dir(
+            identity,
+            config.device_label.clone(),
+            paths.devices_file(),
+            paths.arm_file(),
+            paths.join_dir(),
+            paths.mesh_file(),
+            paths.kick_notice_file(),
+            paths.pending_kicks_file(),
+            paths.mesh_dirty_file(),
+            paths.pair_sessions_dir(),
+            config,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_pair_dir(
+        identity: &Identity,
+        label: String,
+        devices_path: PathBuf,
+        arm_path: PathBuf,
+        join_dir: PathBuf,
+        mesh_path: PathBuf,
+        kick_notice_path: PathBuf,
+        pending_kicks_path: PathBuf,
+        mesh_dirty_path: PathBuf,
+        pair_sessions_dir: PathBuf,
         config: Config,
     ) -> Result<Self> {
         let sandbox = PathSandbox::new(config.effective_sandbox_root())?;
@@ -64,6 +118,7 @@ impl Agent {
             kick_notice_path,
             pending_kicks_path,
             mesh_dirty_path,
+            pair_sessions_dir,
             config,
             files: std::sync::Arc::new(FileTransferEngine::new(sandbox)),
         })
@@ -158,6 +213,7 @@ impl Agent {
             &self.join_dir,
             &self.mesh_path,
             self.config.limits.arm_timeout_secs,
+            Some(&self.pair_sessions_dir),
         )
         .await?;
         // roster changed

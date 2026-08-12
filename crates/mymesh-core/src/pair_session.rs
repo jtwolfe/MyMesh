@@ -2,7 +2,11 @@
 //!
 //! See docs/PAIR-V2.md — sid, token_hash, 16B nonce, phase machine, arm TTL,
 //! optional joiner bind. Source of truth lives on disk; carrier HTTP is a facade.
-use crate::{DeviceId, JoinDecision, Result};
+//!
+//! Raw bootstrap token is stored only as a sidecar (`<sid>.token`, mode 0600)
+//! for local confirm HMAC; the session JSON keeps **hash only**.
+use crate::pair_confirm::{compute_confirm_codes, confirm_codes_equal};
+use crate::{DeviceId, JoinDecision, JoinStore, PendingJoin, Result};
 use chrono::{DateTime, Utc};
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -236,13 +240,63 @@ impl PairSessionStore {
         &self.root
     }
 
-    pub fn path_for(&self, sid: &str) -> PathBuf {
+    fn safe_sid(sid: &str) -> String {
         // sid is ULID / alphanumeric — still sanitize path separators
-        let safe: String = sid
-            .chars()
+        sid.chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect();
-        self.root.join(format!("{safe}.json"))
+            .collect()
+    }
+
+    pub fn path_for(&self, sid: &str) -> PathBuf {
+        self.root.join(format!("{}.json", Self::safe_sid(sid)))
+    }
+
+    /// Sidecar path for raw 32B bootstrap token (hex, mode 0600).
+    pub fn token_path_for(&self, sid: &str) -> PathBuf {
+        self.root.join(format!("{}.token", Self::safe_sid(sid)))
+    }
+
+    /// Persist raw token for local confirm (never logged; mode 0600).
+    pub fn save_token_raw(&self, sid: &str, raw: &[u8; 32]) -> Result<()> {
+        let path = self.token_path_for(sid);
+        if let Some(p) = path.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        std::fs::write(&path, hex::encode(raw))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    /// Load raw bootstrap token for confirm HMAC, if present.
+    pub fn load_token_raw(&self, sid: &str) -> Result<Option<[u8; 32]>> {
+        let path = self.token_path_for(sid);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let s = std::fs::read_to_string(path)?;
+        let raw = hex::decode(s.trim()).map_err(|e| {
+            crate::Error::Session(format!("pair token decode: {e}"))
+        })?;
+        if raw.len() != 32 {
+            return Err(crate::Error::Session(format!(
+                "pair token must be 32 bytes, got {}",
+                raw.len()
+            )));
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&raw);
+        Ok(Some(out))
+    }
+
+    /// Remove sidecar token (e.g. after consume / expire).
+    pub fn clear_token_raw(&self, sid: &str) -> Result<()> {
+        let path = self.token_path_for(sid);
+        let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     pub fn save(&self, session: &PairSessionFile) -> Result<()> {
@@ -347,6 +401,7 @@ impl PairSessionStore {
             updated_at: now,
         };
         self.save(&session)?;
+        self.save_token_raw(&session.sid, &token_raw)?;
         Ok(ArmedPairSession {
             session,
             token_raw,
@@ -441,6 +496,274 @@ impl PairSessionStore {
         }
         Ok(Some(s))
     }
+
+    /// Resolve active open session: exact sid, or unique active non-expired session.
+    pub fn resolve_session(&self, sid: Option<&str>) -> std::result::Result<PairSessionFile, PairConfirmError> {
+        if let Some(sid) = sid {
+            let s = self
+                .load(sid)
+                .map_err(|e| PairConfirmError::Other(e.to_string()))?
+                .ok_or(PairConfirmError::SessionGone)?;
+            return Ok(s);
+        }
+        let now = Utc::now();
+        let open: Vec<_> = self
+            .list()
+            .map_err(|e| PairConfirmError::Other(e.to_string()))?
+            .into_iter()
+            .filter(|s| {
+                s.until > now
+                    && matches!(
+                        s.phase,
+                        PairPhase::Armed
+                            | PairPhase::Bound
+                            | PairPhase::Decided
+                            | PairPhase::Completing
+                    )
+            })
+            .collect();
+        match open.as_slice() {
+            [] => Err(PairConfirmError::SessionGone),
+            [one] => Ok(one.clone()),
+            _ => Err(PairConfirmError::AmbiguousSession),
+        }
+    }
+}
+
+/// Operator/CLI confirm error codes (PAIR-V2.md).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PairConfirmError {
+    NotBound,
+    AmbiguousSession,
+    AlreadyDecided,
+    SessionGone,
+    AmbiguousPending,
+    BadCode,
+    Other(String),
+}
+
+impl PairConfirmError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotBound => "not_bound",
+            Self::AmbiguousSession => "ambiguous_session",
+            Self::AlreadyDecided => "already_decided",
+            Self::SessionGone => "session_gone",
+            Self::AmbiguousPending => "ambiguous_pending",
+            Self::BadCode => "bad_code",
+            Self::Other(_) => "error",
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::NotBound => {
+                "Joiner has not dialed yet — wait for JoinRequest / finish dual-scan order, then re-run confirm.".into()
+            }
+            Self::AmbiguousSession => {
+                "multiple active pair sessions — pass --sid <sid>".into()
+            }
+            Self::AlreadyDecided => "pair session already decided / confirm consumed".into(),
+            Self::SessionGone => "no active pair session (expired or missing)".into(),
+            Self::AmbiguousPending => {
+                "multiple pending joiners — pass --joiner <did>".into()
+            }
+            Self::BadCode => "confirm code does not match accept or deny for bound joiner".into(),
+            Self::Other(s) => s.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for PairConfirmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code(), self.message())
+    }
+}
+
+impl std::error::Error for PairConfirmError {}
+
+/// Result of a successful `apply_pair_confirm`.
+#[derive(Clone, Debug)]
+pub struct ConfirmApplyResult {
+    pub session: PairSessionFile,
+    pub decision: JoinDecision,
+    pub joiner: DeviceId,
+}
+
+/// Fail-closed confirm-on-machine (PAIR-V2.md §Confirm CLI).
+///
+/// 1. Resolve session (`sid` or unique active).
+/// 2. Binding gate: bound joiner, or arm+single pending → bind, or zero → `not_bound`.
+/// 3. HMAC verify accept/deny; write JoinStore + session phase `decided`.
+pub fn apply_pair_confirm(
+    store: &PairSessionStore,
+    joins: &JoinStore,
+    code: &str,
+    sid: Option<&str>,
+    joiner_hint: Option<DeviceId>,
+) -> std::result::Result<ConfirmApplyResult, PairConfirmError> {
+    let mut sess = store.resolve_session(sid)?;
+
+    if sess.is_expired_now() {
+        let _ = store.expire_if_needed(&sess.sid);
+        return Err(PairConfirmError::SessionGone);
+    }
+
+    // Terminal / already consumed
+    if sess.confirm_consumed
+        || matches!(
+            sess.phase,
+            PairPhase::Decided
+                | PairPhase::Completing
+                | PairPhase::Completed
+                | PairPhase::Expired
+                | PairPhase::FailedPartial
+        )
+    {
+        return Err(PairConfirmError::AlreadyDecided);
+    }
+
+    let pepper = store
+        .load_token_raw(&sess.sid)
+        .map_err(|e| PairConfirmError::Other(e.to_string()))?
+        .ok_or_else(|| {
+            PairConfirmError::Other(
+                "bootstrap token missing for session (re-run pair dual)".into(),
+            )
+        })?;
+
+    // --- Binding gate ---
+    let joiner = resolve_bind_joiner(store, joins, &mut sess, joiner_hint, &pepper, code)?;
+
+    let resident_hex = sess.resident_device_id.to_string();
+    let joiner_hex = joiner.to_string();
+    let codes = compute_confirm_codes(
+        &pepper,
+        &sess.sid,
+        &joiner_hex,
+        &resident_hex,
+        &sess.nonce,
+    );
+
+    let is_accept = confirm_codes_equal(code, &codes.accept);
+    let is_deny = confirm_codes_equal(code, &codes.deny);
+    if !is_accept && !is_deny {
+        return Err(PairConfirmError::BadCode);
+    }
+
+    let decision = if is_accept {
+        JoinDecision::Accept
+    } else {
+        JoinDecision::Deny {
+            reason: "denied via pair confirm".into(),
+        }
+    };
+
+    joins
+        .write_decision(&joiner, decision.clone())
+        .map_err(|e| PairConfirmError::Other(e.to_string()))?;
+
+    let sess = store
+        .write_decision(&sess.sid, decision.clone(), true)
+        .map_err(|e| PairConfirmError::Other(e.to_string()))?;
+
+    // On accept, disarm rules are applied by the join host loop (alpha.1).
+    Ok(ConfirmApplyResult {
+        session: sess,
+        decision,
+        joiner,
+    })
+}
+
+/// Resolve which joiner to verify against; may bind armed session to a pending peer.
+fn resolve_bind_joiner(
+    store: &PairSessionStore,
+    joins: &JoinStore,
+    sess: &mut PairSessionFile,
+    joiner_hint: Option<DeviceId>,
+    pepper: &[u8; 32],
+    code: &str,
+) -> std::result::Result<DeviceId, PairConfirmError> {
+    // Already bound
+    if sess.phase == PairPhase::Bound {
+        if let Some(j) = sess.joiner_device_id {
+            if let Some(hint) = joiner_hint {
+                if hint != j {
+                    return Err(PairConfirmError::Other(
+                        "session bound to a different joiner than --joiner".into(),
+                    ));
+                }
+            }
+            return Ok(j);
+        }
+    }
+
+    if sess.phase != PairPhase::Armed {
+        return Err(PairConfirmError::Other(format!(
+            "cannot confirm in phase {}",
+            sess.phase.as_str()
+        )));
+    }
+
+    let pending = joins
+        .list_pending()
+        .map_err(|e| PairConfirmError::Other(e.to_string()))?;
+
+    match pending.as_slice() {
+        [] => Err(PairConfirmError::NotBound),
+        [one] => {
+            if let Some(hint) = joiner_hint {
+                if hint != one.device_id {
+                    return Err(PairConfirmError::Other(
+                        "pending joiner does not match --joiner".into(),
+                    ));
+                }
+            }
+            bind_pending(store, sess, one)
+        }
+        many => {
+            // Multiple pending: require --joiner whose recomputed code matches input.
+            let hint = joiner_hint.ok_or(PairConfirmError::AmbiguousPending)?;
+            let p = many
+                .iter()
+                .find(|p| p.device_id == hint)
+                .ok_or_else(|| {
+                    PairConfirmError::Other("no pending join for --joiner".into())
+                })?;
+            let resident_hex = sess.resident_device_id.to_string();
+            let joiner_hex = p.device_id.to_string();
+            let codes = compute_confirm_codes(
+                pepper,
+                &sess.sid,
+                &joiner_hex,
+                &resident_hex,
+                &sess.nonce,
+            );
+            if !confirm_codes_equal(code, &codes.accept)
+                && !confirm_codes_equal(code, &codes.deny)
+            {
+                return Err(PairConfirmError::BadCode);
+            }
+            bind_pending(store, sess, p)
+        }
+    }
+}
+
+fn bind_pending(
+    store: &PairSessionStore,
+    sess: &mut PairSessionFile,
+    p: &PendingJoin,
+) -> std::result::Result<DeviceId, PairConfirmError> {
+    let bound = store
+        .bind_joiner(
+            &sess.sid,
+            p.device_id,
+            Some(p.label.clone()),
+            Some(p.fingerprint.clone()),
+        )
+        .map_err(|e| PairConfirmError::Other(e.to_string()))?;
+    *sess = bound;
+    Ok(p.device_id)
 }
 
 #[cfg(test)]
@@ -560,6 +883,125 @@ mod tests {
         let joiner = DeviceId::from_bytes([0x66u8; 32]);
         let err = store.bind_joiner(&armed.session.sid, joiner, None, None);
         assert!(err.is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn arm_saves_token_sidecar() {
+        let (store, root) = tmp_store();
+        let resident = DeviceId::from_bytes([0x77u8; 32]);
+        let armed = store
+            .arm_new("m", resident, 600, PairEndpointClass::Confirm)
+            .unwrap();
+        let loaded = store.load_token_raw(&armed.session.sid).unwrap().unwrap();
+        assert_eq!(loaded, armed.token_raw);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn confirm_not_bound_fail_closed() {
+        let (store, root) = tmp_store();
+        let join_root = root.join("join");
+        let joins = JoinStore::open(&join_root).unwrap();
+        let resident = DeviceId::from_bytes([0xa1u8; 32]);
+        let armed = store
+            .arm_new("m", resident, 600, PairEndpointClass::Confirm)
+            .unwrap();
+        let err = apply_pair_confirm(&store, &joins, "ZCRE-1R14", Some(&armed.session.sid), None)
+            .unwrap_err();
+        assert_eq!(err, PairConfirmError::NotBound);
+        // stay armed
+        let s = store.load(&armed.session.sid).unwrap().unwrap();
+        assert_eq!(s.phase, PairPhase::Armed);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn confirm_bind_single_pending_and_accept() {
+        use crate::pair_confirm::compute_confirm_codes;
+        use crate::PendingJoin;
+
+        let (store, root) = tmp_store();
+        let join_root = root.join("join");
+        let joins = JoinStore::open(&join_root).unwrap();
+        let resident = DeviceId::from_bytes([0xa1u8; 32]);
+        let joiner = DeviceId::from_bytes([0xb2u8; 32]);
+        let armed = store
+            .arm_new("m", resident, 600, PairEndpointClass::Confirm)
+            .unwrap();
+        joins
+            .write_pending(&PendingJoin {
+                device_id: joiner,
+                label: "laptop".into(),
+                capabilities: vec![],
+                received_at: Utc::now(),
+                fingerprint: "fp".into(),
+            })
+            .unwrap();
+
+        let codes = compute_confirm_codes(
+            &armed.token_raw,
+            &armed.session.sid,
+            &joiner.to_string(),
+            &resident.to_string(),
+            &armed.session.nonce,
+        );
+        let res = apply_pair_confirm(
+            &store,
+            &joins,
+            &codes.accept,
+            Some(&armed.session.sid),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(res.decision, JoinDecision::Accept));
+        assert_eq!(res.joiner, joiner);
+        assert_eq!(res.session.phase, PairPhase::Decided);
+        assert!(res.session.confirm_consumed);
+
+        // single-use
+        let err = apply_pair_confirm(
+            &store,
+            &joins,
+            &codes.accept,
+            Some(&armed.session.sid),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err, PairConfirmError::AlreadyDecided);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn confirm_deny_code_writes_deny() {
+        use crate::pair_confirm::compute_confirm_codes;
+
+        let (store, root) = tmp_store();
+        let joins = JoinStore::open(root.join("join")).unwrap();
+        let resident = DeviceId::from_bytes([0xa1u8; 32]);
+        let joiner = DeviceId::from_bytes([0xb2u8; 32]);
+        let armed = store
+            .arm_new("m", resident, 600, PairEndpointClass::Confirm)
+            .unwrap();
+        store
+            .bind_joiner(&armed.session.sid, joiner, Some("x".into()), None)
+            .unwrap();
+        let codes = compute_confirm_codes(
+            &armed.token_raw,
+            &armed.session.sid,
+            &joiner.to_string(),
+            &resident.to_string(),
+            &armed.session.nonce,
+        );
+        let res = apply_pair_confirm(
+            &store,
+            &joins,
+            &codes.deny,
+            Some(&armed.session.sid),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(res.decision, JoinDecision::Deny { .. }));
         let _ = std::fs::remove_dir_all(root);
     }
 }

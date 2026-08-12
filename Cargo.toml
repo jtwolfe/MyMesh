@@ -45,6 +45,7 @@ clap = { version = "4", features = ["derive", "env"] }
 rand = "0.8"
 hex = "0.4"
 sha2 = "0.10"
+hmac = "0.12"
 hkdf = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }

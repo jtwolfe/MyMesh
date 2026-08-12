@@ -3,6 +3,7 @@ mod firewall;
 mod install;
 mod magic_cmd;
 mod mesh_conn;
+mod pair_cmd;
 mod probe;
 mod term_pane;
 mod tui_app;
@@ -299,6 +300,11 @@ enum Commands {
         #[arg(long, default_value_t = 17878)]
         port: u16,
     },
+    /// Pair v2 dual-scan + confirm-on-machine (no carrier process required)
+    Pair {
+        #[command(subcommand)]
+        action: PairCmd,
+    },
     /// Print magic-plane help (DNS / SOCKS / *.mym)
     Magic,
     /// Host firewall helpers (explicit only; never auto-open)
@@ -426,6 +432,47 @@ enum DemoCmd {
     Pair,
     /// Local fabric session demo
     Session,
+}
+
+#[derive(Subcommand, Debug)]
+enum PairCmd {
+    /// Resident: arm + mint PairSession + print QR_A v2 (required nonce).
+    /// Joiner: `dual --join --resident <id>`.
+    Dual {
+        /// Join as guest toward this resident (hex or 24 words)
+        #[arg(long)]
+        join: bool,
+        /// Resident device id / words (required with --join)
+        #[arg(long, value_name = "DEVICE")]
+        resident: Option<String>,
+        /// Optional direct host base URL for ep=direct (`http://ip:port`)
+        #[arg(long)]
+        host: Option<String>,
+        /// Arm / session TTL seconds (default: config arm_timeout_secs)
+        #[arg(long)]
+        ttl: Option<u64>,
+    },
+    /// Verify confirm code (HMAC Crockford 4-4); write JoinStore decision
+    Confirm {
+        /// Accept or deny code from phone (hyphens optional)
+        code: String,
+        /// Pair session id (default: unique active session)
+        #[arg(long)]
+        sid: Option<String>,
+        /// Joiner device id when multiple pending
+        #[arg(long)]
+        joiner: Option<String>,
+    },
+    /// Show active pair session status
+    Status {
+        #[arg(long)]
+        sid: Option<String>,
+    },
+    /// Expire previous session and arm a fresh dual
+    Retry {
+        /// Session to expire (default: active)
+        sid: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -596,6 +643,28 @@ async fn main() -> Result<()> {
             local,
         } => magic_cmd::cmd_expose(&paths, &device, port, local).await?,
         Commands::Carrier { port } => magic_cmd::cmd_carrier(&paths, port).await?,
+        Commands::Pair { action } => match action {
+            PairCmd::Dual {
+                join,
+                resident,
+                host,
+                ttl,
+            } => {
+                if join {
+                    let r = resident.ok_or_else(|| {
+                        anyhow::anyhow!("--join requires --resident <device-id-or-words>")
+                    })?;
+                    pair_cmd::cmd_pair_dual_join(&paths, &r).await?
+                } else {
+                    pair_cmd::cmd_pair_dual(&paths, host, ttl).await?
+                }
+            }
+            PairCmd::Confirm { code, sid, joiner } => {
+                pair_cmd::cmd_pair_confirm(&paths, &code, sid, joiner).await?
+            }
+            PairCmd::Status { sid } => pair_cmd::cmd_pair_status(&paths, sid).await?,
+            PairCmd::Retry { sid } => pair_cmd::cmd_pair_retry(&paths, sid).await?,
+        },
         Commands::Magic => magic_cmd::print_magic_help(),
         Commands::Firewall { action } => match action {
             FirewallCmd::Explain => firewall::print_help(),
@@ -1010,18 +1079,7 @@ async fn cmd_serve(paths: &Paths) -> Result<()> {
         identity.device_id().short()
     );
     let transport = std::sync::Arc::new(IrohTransport::bind(&identity).await?);
-    let agent = Agent::new(
-        &identity,
-        cfg.device_label.clone(),
-        paths.devices_file(),
-        paths.arm_file(),
-        paths.join_dir(),
-        paths.mesh_file(),
-        paths.kick_notice_file(),
-        paths.pending_kicks_file(),
-        paths.mesh_dirty_file(),
-        cfg.clone(),
-    )?;
+    let agent = Agent::from_paths(&identity, paths, cfg.clone())?;
     // Single iroh endpoint: dial proxy so CLI/TUI never re-bind the same identity.
     let sock = std::path::PathBuf::from(&cfg.daemon.control_socket);
     {

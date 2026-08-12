@@ -2340,6 +2340,7 @@ version = "0.1.0-alpha.3"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "bytes",
  "chrono",
  "clap",
@@ -2377,6 +2378,7 @@ dependencies = [
  "chrono",
  "directories",
  "hex",
+ "hmac",
  "rand 0.8.7",
  "serde",
  "serde_json",

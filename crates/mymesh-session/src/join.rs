@@ -2,7 +2,8 @@
 use chrono::Utc;
 use mymesh_core::{
     ArmState, Capability, DeviceId, DeviceLabel, DeviceRecord, DeviceStore, JoinDecision,
-    JoinStore, MeshState, NodeFingerprint, PendingJoin, Result, TrustState,
+    JoinStore, MeshState, NodeFingerprint, PairPhase, PairSessionStore, PendingJoin, Result,
+    TrustState,
 };
 use mymesh_crypto::Identity;
 use mymesh_net::PeerConnection;
@@ -155,6 +156,10 @@ pub async fn run_join_as_guest(
 }
 
 /// Host agent: handle a join from an untrusted peer while armed.
+///
+/// When a PairSession exists in `armed|bound`, binds (or verifies) the joiner
+/// to that session (PAIR-V2.md join integration).
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_join_as_host(
     conn: Box<dyn PeerConnection>,
     identity: &Identity,
@@ -164,6 +169,7 @@ pub async fn handle_join_as_host(
     join_dir: &Path,
     mesh_path: &Path,
     arm_timeout_hint: u64,
+    pair_sessions_dir: Option<&Path>,
 ) -> Result<()> {
     let peer = conn.peer_id();
     let arm = ArmState::load(arm_path)?;
@@ -261,20 +267,30 @@ pub async fn handle_join_as_host(
     }
 
     let joins = JoinStore::open(join_dir)?;
+    let fp = NodeFingerprint::from_device_id(&joiner_id)
+        .as_str()
+        .to_string();
     joins.write_pending(&PendingJoin {
         device_id: joiner_id,
         label: joiner_label.clone(),
         capabilities: caps.clone(),
         received_at: Utc::now(),
-        fingerprint: NodeFingerprint::from_device_id(&joiner_id)
-            .as_str()
-            .to_string(),
+        fingerprint: fp.clone(),
     })?;
+
+    // Pair v2: bind joiner to active PairSession when present (A3b).
+    if let Some(pair_dir) = pair_sessions_dir {
+        if let Err(e) =
+            bind_joiner_to_pair_session(pair_dir, joiner_id, &joiner_label, &fp)
+        {
+            warn!(%e, peer = %joiner_id.short(), "pair session bind skipped");
+        }
+    }
 
     info!(
         peer = %joiner_id.short(),
         label = %joiner_label,
-        "join request pending — run: mymesh requests accept {}",
+        "join request pending — run: mymesh requests accept {}  (or: mymesh pair confirm <code>)",
         joiner_id.short()
     );
 
@@ -378,4 +394,48 @@ pub async fn handle_join_as_host(
             Ok(())
         }
     }
+}
+
+/// Bind pending joiner to an open PairSession (armed → bound; bound must match).
+fn bind_joiner_to_pair_session(
+    pair_sessions_dir: &Path,
+    joiner_id: DeviceId,
+    joiner_label: &str,
+    fp: &str,
+) -> Result<()> {
+    if !pair_sessions_dir.exists() {
+        return Ok(());
+    }
+    let store = PairSessionStore::open(pair_sessions_dir)?;
+    let Some(sess) = store.active_session()? else {
+        return Ok(());
+    };
+    if !matches!(sess.phase, PairPhase::Armed | PairPhase::Bound) {
+        return Ok(());
+    }
+    // If already bound to a different peer, do not rebind (mismatch).
+    if sess.phase == PairPhase::Bound {
+        if let Some(existing) = sess.joiner_device_id {
+            if existing != joiner_id {
+                return Err(mymesh_core::Error::Session(format!(
+                    "pair session {} already bound to different joiner",
+                    sess.sid
+                )));
+            }
+            // same joiner — refresh
+        }
+    }
+    let bound = store.bind_joiner(
+        &sess.sid,
+        joiner_id,
+        Some(joiner_label.to_string()),
+        Some(fp.to_string()),
+    )?;
+    info!(
+        sid = %bound.sid,
+        peer = %joiner_id.short(),
+        phase = %bound.phase.as_str(),
+        "bound joiner to pair session"
+    );
+    Ok(())
 }
