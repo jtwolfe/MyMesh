@@ -14,6 +14,7 @@ mod pair_confirm;
 mod pair_session;
 mod paths;
 mod rate_limit;
+mod tls_pin;
 
 pub use config::{Config, DaemonConfig, Limits, MagicConfig};
 pub use device::{
@@ -54,4 +55,9 @@ pub use rate_limit::{
     metrics_dir_from_pair_sessions, reset_for_tests as rate_limit_reset_for_tests,
     trust_proxy_enabled, LimitKind, Policy, RateLimitState, RateLimited, GRANT_MUTATE,
     HOST_LOCAL_SESSION, MESH_AUTH_CHALLENGE, OWNER_BACKUP_UNWRAP, PAIR_DECIDE, PAIR_STATUS,
+};
+pub use tls_pin::{
+    check_direct_host_tls_pin, host_is_http_cleartext, host_is_https, parse_tls_pin,
+    require_https_when_pinned, verify_tls_pin, verify_tls_pin_str, TlsPin, TlsPinError,
+    TLS_PIN_SHA256_LEN, TLS_PIN_SHA256_PREFIX,
 };

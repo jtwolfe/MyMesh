@@ -97,6 +97,10 @@ pub struct PairSessionFile {
     /// Advertised endpoint class (direct when host QR hint present).
     #[serde(default)]
     pub ep: PairEndpointClass,
+    /// Optional TLS SPKI pin advertised in QR (`tlspin=sha256/…`). Wire form when set.
+    /// Requires HTTPS host on the client (see `tls_pin` module / PAIR-V2.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_pin: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -393,6 +397,7 @@ impl PairSessionStore {
             decision: None,
             confirm_consumed: false,
             ep,
+            tls_pin: None,
             created_at: now,
             updated_at: now,
         };
@@ -986,6 +991,22 @@ mod tests {
         let res = apply_pair_confirm(&store, &joins, &codes.deny, Some(&armed.session.sid), None)
             .unwrap();
         assert!(matches!(res.decision, JoinDecision::Deny { .. }));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn optional_tls_pin_persists_on_session() {
+        let (store, root) = tmp_store();
+        let resident = DeviceId::from_bytes([0xc3u8; 32]);
+        let mut armed = store
+            .arm_new("m", resident, 600, PairEndpointClass::Direct)
+            .unwrap();
+        assert!(armed.session.tls_pin.is_none());
+        let pin = crate::TlsPin::from_spki_der(&[0x30, 0x02, 0xaa, 0xbb]).to_wire();
+        armed.session.tls_pin = Some(pin.clone());
+        store.save(&armed.session).unwrap();
+        let loaded = store.load(&armed.session.sid).unwrap().unwrap();
+        assert_eq!(loaded.tls_pin.as_deref(), Some(pin.as_str()));
         let _ = std::fs::remove_dir_all(root);
     }
 }
