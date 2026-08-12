@@ -12,6 +12,8 @@ mod session;
 mod tcp_tunnel;
 
 #[cfg(test)]
+mod guest_e2e_harness;
+#[cfg(test)]
 mod two_agent_harness;
 
 pub use agent::Agent;
