@@ -106,4 +106,9 @@ impl Paths {
     pub fn owner_backup_file(&self) -> PathBuf {
         self.data_dir.join("owner-backup.sealed")
     }
+
+    /// Guest / object grants store (mode 0600). S5 / docs/GRANTS.md.
+    pub fn grants_file(&self) -> PathBuf {
+        self.data_dir.join("grants.json")
+    }
 }

@@ -114,6 +114,7 @@ pub async fn run_host_pair(
 
                 aliases: Vec::new(),
                 groups: Vec::new(),
+                mesh_role: mymesh_core::MeshRole::Member,
             }
         }
         PairingMessage::Reject { reason } => {
@@ -221,6 +222,7 @@ pub async fn run_host_pair_code(
 
                 aliases: Vec::new(),
                 groups: Vec::new(),
+                mesh_role: mymesh_core::MeshRole::Member,
             }
         }
         PairingMessage::Reject { reason } => {
@@ -307,6 +309,7 @@ pub async fn run_guest_pair(
 
                 aliases: Vec::new(),
                 groups: Vec::new(),
+                mesh_role: mymesh_core::MeshRole::Member,
             }
         }
         other => {

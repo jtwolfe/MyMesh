@@ -1269,8 +1269,11 @@ fn build_full_members(
     seen.insert(*host_id);
 
     for rec in store.list() {
-        // Full member roster: Trusted only (guests filtered when mesh_role lands in S5).
+        // Full member roster: Trusted members only (guests excluded — GUEST.md / S5).
         if rec.trust != TrustState::Trusted {
+            continue;
+        }
+        if rec.mesh_role.is_guest() {
             continue;
         }
         if !seen.insert(rec.id) {
@@ -1380,7 +1383,7 @@ fn topology_member_from_record(rec: &DeviceRecord) -> TopologyMember {
         label: rec.label.as_str().to_string(),
         fingerprint: rec.fingerprint.clone(),
         short_id: rec.id.short(),
-        mesh_role: "member",
+        mesh_role: rec.mesh_role.as_str(),
         capabilities: rec.capabilities.clone(),
         trust: rec.trust.clone(),
         last_seen: rec.last_seen.map(rfc3339),
@@ -1511,6 +1514,7 @@ mod tests {
                 mesh_id: Some(mesh.mesh_id.clone()),
                 aliases: vec!["nb".into()],
                 groups: vec!["home".into()],
+                mesh_role: mymesh_core::MeshRole::Member,
             })
             .unwrap();
         // Pending peer must not appear.
@@ -1530,6 +1534,7 @@ mod tests {
                 mesh_id: Some(mesh.mesh_id.clone()),
                 aliases: vec![],
                 groups: vec![],
+                mesh_role: mymesh_core::MeshRole::Member,
             })
             .unwrap();
 
@@ -2117,6 +2122,7 @@ mod tests {
                     mesh_id: Some(mesh.mesh_id.clone()),
                     aliases: vec![],
                     groups: vec![],
+                    mesh_role: mymesh_core::MeshRole::Member,
                 })
                 .unwrap();
         }

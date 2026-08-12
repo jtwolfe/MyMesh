@@ -18,6 +18,31 @@ pub enum Capability {
     Admin,
 }
 
+/// Device mesh role: `member` | `guest` only (never `owner` on a device).
+///
+/// Missing field in `devices.json` deserializes as [`MeshRole::Member`] (GUEST.md).
+/// Person ownership lives only in `mesh-owner.json` (MASTER-KEY.md / KD21).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MeshRole {
+    #[default]
+    Member,
+    Guest,
+}
+
+impl MeshRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Member => "member",
+            Self::Guest => "guest",
+        }
+    }
+
+    pub fn is_guest(self) -> bool {
+        matches!(self, Self::Guest)
+    }
+}
+
 impl Capability {
     /// Default member grant: terminal / files / desktop / tcp — **no Admin** (KD15).
     pub fn default_grant() -> Vec<Self> {
@@ -125,6 +150,9 @@ pub struct DeviceRecord {
     /// Optional tags/groups for filtering (e.g. home, lab).
     #[serde(default)]
     pub groups: Vec<String>,
+    /// Member vs guest (default Member when absent — GUEST.md migration).
+    #[serde(default)]
+    pub mesh_role: MeshRole,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -191,11 +219,18 @@ impl DeviceStore {
         )
     }
 
+    /// Member capability check (device-record caps).
+    ///
+    /// **Guests always return false here** — session paths must use
+    /// [`crate::allows`] with [`crate::GrantStore`] so revoke/expiry are enforced.
     pub fn allows(&self, id: &DeviceId, cap: &Capability) -> bool {
         self.devices
             .get(id)
             .filter(|d| d.trust == TrustState::Trusted)
-            .map(|d| d.capabilities.contains(cap))
+            .map(|d| match d.mesh_role {
+                MeshRole::Member => d.capabilities.contains(cap),
+                MeshRole::Guest => false,
+            })
             .unwrap_or(false)
     }
 
@@ -408,6 +443,7 @@ mod tests {
             mesh_id: None,
             aliases: vec![],
             groups: vec![],
+            mesh_role: MeshRole::Member,
         }
     }
 

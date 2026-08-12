@@ -218,6 +218,7 @@ pub fn apply_membership(
             mesh_id: Some(mesh.mesh_id.clone()),
             aliases: Vec::new(),
             groups: Vec::new(),
+            mesh_role: mymesh_core::MeshRole::Member,
         };
         store.upsert(rec)?;
         added += 1;

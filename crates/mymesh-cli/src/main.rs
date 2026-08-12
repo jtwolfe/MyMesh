@@ -12,7 +12,8 @@ use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use console::style;
 use mymesh_core::{
-    ArmState, Capability, Config, DeviceStore, JoinDecision, JoinStore, MeshState, Paths,
+    not_after_days, parse_capabilities, ArmState, Capability, Config, DeviceStore, GrantStore,
+    IssuedBy, JoinDecision, JoinStore, MeshState, Paths,
 };
 use mymesh_crypto::{
     accept_owner_claim, admin_verifying_key_bytes, check_claim_authorized, device_id_to_words,
@@ -121,6 +122,11 @@ enum Commands {
         /// Machine-readable JSON (list mode)
         #[arg(long)]
         json: bool,
+    },
+    /// Guest grants: create / list / revoke (S5; docs/GRANTS.md)
+    Grant {
+        #[command(subcommand)]
+        action: GrantCmd,
     },
     /// Revoke trust for a linked device
     Unlink {
@@ -358,6 +364,39 @@ enum DevicesCmd {
     RevokeAdmin {
         #[arg(value_name = "DEVICE")]
         device: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum GrantCmd {
+    /// Create a guest grant (subject → object device, host-local)
+    Create {
+        /// Guest subject device id (hex) or linked name/alias
+        #[arg(long = "to", value_name = "GUEST")]
+        to: String,
+        /// Object host device (default: this node)
+        #[arg(long = "on", value_name = "DEVICE")]
+        on: Option<String>,
+        /// Comma-separated caps: terminal,files,desktop,tcp (no admin)
+        #[arg(long = "caps", default_value = "terminal,files")]
+        caps: String,
+        /// Optional expiry in days (`constraints.not_after`)
+        #[arg(long = "days")]
+        days: Option<u64>,
+    },
+    /// List grants in grants.json
+    List {
+        /// Machine-readable JSON
+        #[arg(long)]
+        json: bool,
+        /// Include revoked grants
+        #[arg(long)]
+        all: bool,
+    },
+    /// Revoke a grant by id (sets revoked_at)
+    Revoke {
+        #[arg(value_name = "GRANT_ID")]
+        grant_id: String,
     },
 }
 
@@ -702,6 +741,13 @@ async fn main() -> Result<()> {
             None => cmd_devices(&paths, json).await?,
             Some(DevicesCmd::GrantAdmin { device }) => cmd_grant_admin(&paths, &device)?,
             Some(DevicesCmd::RevokeAdmin { device }) => cmd_revoke_admin(&paths, &device)?,
+        },
+        Commands::Grant { action } => match action {
+            GrantCmd::Create { to, on, caps, days } => {
+                cmd_grant_create(&paths, &to, on.as_deref(), &caps, days)?
+            }
+            GrantCmd::List { json, all } => cmd_grant_list(&paths, json, all)?,
+            GrantCmd::Revoke { grant_id } => cmd_grant_revoke(&paths, &grant_id)?,
         },
         Commands::Unlink { device } => cmd_unlink(&paths, &device).await?,
         Commands::Shell { device, shell } => cmd_shell(&paths, &device, shell).await?,
@@ -1252,6 +1298,149 @@ async fn cmd_devices(paths: &Paths, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Host-local: create guest grant (S5). Writes grants.json mode 0600.
+fn cmd_grant_create(
+    paths: &Paths,
+    to: &str,
+    on: Option<&str>,
+    caps: &str,
+    days: Option<u64>,
+) -> Result<()> {
+    let _auth = mymesh_core::AdminAuthority::host_local();
+    debug_assert!(_auth.may_mutate_local_store());
+
+    let identity = Identity::load_or_create(paths.identity_file())?;
+    let local_id = identity.device_id();
+    let mesh = MeshState::load(paths.mesh_file())?;
+    let store = DeviceStore::open(paths.devices_file())?;
+
+    let subject = resolve_device_or_hex(&store, to)?;
+    let object = match on {
+        Some(q) => resolve_device_or_hex(&store, q)?,
+        None => local_id,
+    };
+    let capabilities = parse_capabilities(caps).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if capabilities.contains(&Capability::Admin) {
+        bail!("Admin is not allowed on guest grants (product policy)");
+    }
+
+    let mut grants = GrantStore::open(paths.grants_file())?;
+    let grant = grants
+        .create_guest(
+            mesh.mesh_id.clone(),
+            subject,
+            object,
+            capabilities,
+            not_after_days(days),
+            IssuedBy::device(&local_id),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!(
+        "{} grant {}  guest {} → object {}",
+        style("ok").green().bold(),
+        grant.grant_id,
+        subject.short(),
+        object.short()
+    );
+    println!(
+        "  caps: {}",
+        grant
+            .capabilities
+            .iter()
+            .map(|c| format!("{c:?}").to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    if let Some(na) = grant.constraints.not_after {
+        println!("  not_after: {}", na.to_rfc3339());
+    }
+    println!("  role: guest  mesh: {}", grant.mesh_id);
+    println!("  revoke: mymesh grant revoke {}", grant.grant_id);
+    Ok(())
+}
+
+fn cmd_grant_list(paths: &Paths, json: bool, all: bool) -> Result<()> {
+    let grants = GrantStore::open(paths.grants_file())?;
+    let now = chrono::Utc::now();
+    let list: Vec<_> = grants
+        .list()
+        .into_iter()
+        .filter(|g| all || g.is_active(now))
+        .collect();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&list)?);
+        return Ok(());
+    }
+    if list.is_empty() {
+        println!("No grants.");
+        println!("  mymesh grant create --to <guest> --caps terminal,files --days 7");
+        return Ok(());
+    }
+    for g in list {
+        let status = if g.revoked_at.is_some() {
+            "revoked"
+        } else if !g.is_active(now) {
+            "expired"
+        } else {
+            "active"
+        };
+        let obj = g
+            .object
+            .as_device_id()
+            .map(|d| d.short())
+            .unwrap_or_else(|| "?".into());
+        let caps = g
+            .capabilities
+            .iter()
+            .map(|c| format!("{c:?}").to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "{}  {}  {} → {}  [{}]  {}",
+            g.grant_id,
+            status,
+            g.subject_device_id.short(),
+            obj,
+            caps,
+            g.role.as_str()
+        );
+    }
+    Ok(())
+}
+
+fn cmd_grant_revoke(paths: &Paths, grant_id: &str) -> Result<()> {
+    let _auth = mymesh_core::AdminAuthority::host_local();
+    let mut grants = GrantStore::open(paths.grants_file())?;
+    let g = grants
+        .revoke(grant_id.trim())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!(
+        "{} revoked grant {} (subject {} → object)",
+        style("ok").green().bold(),
+        g.grant_id,
+        g.subject_device_id.short()
+    );
+    if let Some(at) = g.revoked_at {
+        println!("  revoked_at: {}", at.to_rfc3339());
+    }
+    println!("  active sessions subject→object should be killed by agent (≤60s target; C1b wire)");
+    Ok(())
+}
+
+/// Resolve linked device name/alias/prefix, or accept full hex DeviceId.
+fn resolve_device_or_hex(store: &DeviceStore, q: &str) -> Result<mymesh_core::DeviceId> {
+    match store.resolve_query(q) {
+        Ok(id) => Ok(id),
+        Err(_) => {
+            // bare hex device id (guest may not be linked yet)
+            q.trim()
+                .parse::<mymesh_core::DeviceId>()
+                .map_err(|_| anyhow::anyhow!("no device matched '{q}' (name or 64-hex id)"))
+        }
+    }
+}
+
 /// Host-local CLI: grant remote Admin on a Trusted peer (KD15).
 fn cmd_grant_admin(paths: &Paths, device: &str) -> Result<()> {
     let mut store = DeviceStore::open(paths.devices_file())?;
@@ -1626,6 +1815,7 @@ async fn demo_session() -> Result<()> {
 
         aliases: Vec::new(),
         groups: Vec::new(),
+        mesh_role: mymesh_core::MeshRole::Member,
     })?;
     guest_store.upsert(mymesh_core::DeviceRecord {
         id: host_id.device_id(),
@@ -1642,6 +1832,7 @@ async fn demo_session() -> Result<()> {
 
         aliases: Vec::new(),
         groups: Vec::new(),
+        mesh_role: mymesh_core::MeshRole::Member,
     })?;
     let host_ep = fabric.endpoint(host_id.device_id());
     let guest_ep = fabric.endpoint(guest_id.device_id());
