@@ -1,7 +1,7 @@
 //! Background agent: join, sessions, mesh gossip, pending kicks, periodic sync.
 use mymesh_core::{
-    allows, ArmState, Capability, Config, DeviceStore, GrantStore, MeshState, Paths, PendingKick,
-    PendingKickStore, Result,
+    allows, ArmState, Capability, Config, DeviceStore, EnrollmentStore, GrantStore, MeshState,
+    Paths, PendingKick, PendingKickStore, Result,
 };
 use mymesh_crypto::Identity;
 use mymesh_files::{apply_host_message, FileTransferEngine, PathSandbox};
@@ -115,6 +115,12 @@ impl Agent {
         config: Config,
     ) -> Result<Self> {
         let sandbox = PathSandbox::new(config.effective_sandbox_root())?;
+        // Load empty enrollments.json if missing. Pair/decide write is F4.
+        let data_dir = grants_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let _ = EnrollmentStore::open_or_create(data_dir.join("enrollments.json"))?;
         Ok(Self {
             secret: identity.to_secret_bytes(),
             label,

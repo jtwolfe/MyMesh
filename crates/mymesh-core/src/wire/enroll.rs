@@ -125,7 +125,7 @@ pub struct EnrollAckPayload {
     pub label: Option<String>,
 }
 
-/// One verified drive binding (`enrollments.json` row). Persistence is F2.
+/// One verified drive binding (`enrollments.json` row).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrollmentRecord {
     pub enrollment_id: String,
@@ -138,7 +138,7 @@ pub struct EnrollmentRecord {
     pub label: Option<String>,
 }
 
-/// Node enrollments file shape (not written in F1).
+/// Node enrollments file shape (`Paths::enrollments_file`, mode 0600).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrollmentsFile {
     pub version: u32,

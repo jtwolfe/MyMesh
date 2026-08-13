@@ -3,6 +3,7 @@
 mod config;
 mod continuity;
 mod device;
+mod enrollments;
 mod error;
 mod event_metrics;
 mod grants;
@@ -28,6 +29,9 @@ pub use continuity::{
 pub use device::{
     remote_admin_authority, AdminAuthority, Capability, DeviceRecord, DeviceStore, MeshRole,
     TrustState,
+};
+pub use enrollments::{
+    parse_enroll_facet, read_enroll_sig_hex, verify_enroll_write, EnrollmentStore, MAX_ENROLLMENTS,
 };
 pub use error::{Error, Result};
 pub use event_metrics::{

@@ -11,10 +11,12 @@ mod tui_app;
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use console::style;
+use mymesh_core::wire::EnrollWriteBody;
 use mymesh_core::{
-    not_after_days, parse_capabilities, status_pack as continuity_status_pack,
-    wipe_pack as continuity_wipe_pack, ArmState, Capability, Config, DeviceStore, GrantStore,
-    IssuedBy, JoinDecision, JoinStore, MeshState, Paths,
+    not_after_days, parse_capabilities, parse_enroll_facet, read_enroll_sig_hex,
+    status_pack as continuity_status_pack, wipe_pack as continuity_wipe_pack, ArmState, Capability,
+    Config, DeviceStore, EnrollmentStore, GrantStore, IssuedBy, JoinDecision, JoinStore, MeshState,
+    Paths,
 };
 use mymesh_crypto::{
     accept_owner_claim, admin_verifying_key_bytes, check_claim_authorized, device_id_to_words,
@@ -128,6 +130,11 @@ enum Commands {
     Grant {
         #[command(subcommand)]
         action: GrantCmd,
+    },
+    /// Person drive bindings on this node (Wave F; host-local)
+    Enroll {
+        #[command(subcommand)]
+        action: EnrollCmd,
     },
     /// Continuity pack status / wipe (S8; host-local)
     Continuity {
@@ -406,6 +413,40 @@ enum GrantCmd {
     Revoke {
         #[arg(value_name = "GRANT_ID")]
         grant_id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum EnrollCmd {
+    /// List verified person drive bindings
+    List,
+    /// Revoke drive for a person (filesystem root)
+    Revoke {
+        #[arg(value_name = "PERSON_ID")]
+        person_id: String,
+    },
+    /// Airgap add: verify carrier-enroll-v1, then write enrollments.json
+    Add {
+        #[arg(long = "person-id")]
+        person_id: String,
+        /// `personal` or `work`
+        #[arg(long)]
+        facet: String,
+        /// RFC3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`) or unix seconds
+        #[arg(long)]
+        ts: String,
+        /// 16-byte nonce as base64url
+        #[arg(long)]
+        nonce: String,
+        /// Person Ed25519 public key (64 hex chars)
+        #[arg(long = "person-pubkey")]
+        person_pubkey: String,
+        /// Signature: 128 hex chars or raw 64 bytes
+        #[arg(long = "sig-file", value_name = "PATH")]
+        sig_file: PathBuf,
+        /// Optional phone / person label
+        #[arg(long)]
+        label: Option<String>,
     },
 }
 
@@ -796,6 +837,28 @@ async fn main() -> Result<()> {
             }
             GrantCmd::List { json, all } => cmd_grant_list(&paths, json, all)?,
             GrantCmd::Revoke { grant_id } => cmd_grant_revoke(&paths, &grant_id)?,
+        },
+        Commands::Enroll { action } => match action {
+            EnrollCmd::List => cmd_enroll_list(&paths)?,
+            EnrollCmd::Revoke { person_id } => cmd_enroll_revoke(&paths, &person_id)?,
+            EnrollCmd::Add {
+                person_id,
+                facet,
+                ts,
+                nonce,
+                person_pubkey,
+                sig_file,
+                label,
+            } => cmd_enroll_add(
+                &paths,
+                &person_id,
+                &facet,
+                &ts,
+                &nonce,
+                &person_pubkey,
+                &sig_file,
+                label,
+            )?,
         },
         Commands::Continuity { action } => match action {
             ContinuityCmd::Status { pack_id, json } => {
@@ -1421,7 +1484,10 @@ fn cmd_grant_create(
         mymesh_core::LimitKind::GrantMutate,
         mymesh_core::HOST_LOCAL_SESSION,
     ) {
-        bail!("rate_limited: grant mutate; retry after {}s", rl.retry_after_secs);
+        bail!(
+            "rate_limited: grant mutate; retry after {}s",
+            rl.retry_after_secs
+        );
     }
 
     let identity = Identity::load_or_create(paths.identity_file())?;
@@ -1526,7 +1592,8 @@ fn cmd_grant_list(paths: &Paths, json: bool, all: bool) -> Result<()> {
 }
 
 fn cmd_continuity_status(paths: &Paths, pack_id: &str, json: bool) -> Result<()> {
-    let status = continuity_status_pack(paths, pack_id.trim()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let status =
+        continuity_status_pack(paths, pack_id.trim()).map_err(|e| anyhow::anyhow!("{e}"))?;
     if json {
         println!(
             "{}",
@@ -1560,6 +1627,129 @@ fn cmd_continuity_wipe(paths: &Paths, pack_id: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_enroll_list(paths: &Paths) -> Result<()> {
+    let store =
+        EnrollmentStore::open(paths.enrollments_file()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let list = store.list();
+    if list.is_empty() {
+        println!("No enrollments.");
+        println!(
+            "  mymesh enroll add --person-id … --facet personal --ts … --nonce … --person-pubkey … --sig-file …"
+        );
+        return Ok(());
+    }
+    for e in list {
+        let drive = if e.can_drive { "drive" } else { "revoked" };
+        let label = e.label.as_deref().unwrap_or("");
+        println!(
+            "{}  {}  {}  {}  {}  {}",
+            e.enrollment_id,
+            e.person_id,
+            e.facet.as_str(),
+            drive,
+            e.enrolled_at,
+            label
+        );
+    }
+    Ok(())
+}
+
+fn cmd_enroll_revoke(paths: &Paths, person_id: &str) -> Result<()> {
+    let _auth = mymesh_core::AdminAuthority::host_local();
+    debug_assert!(_auth.may_mutate_local_store());
+    let pid = person_id.trim();
+    if pid.is_empty() {
+        bail!("person_id is required");
+    }
+    let mut store =
+        EnrollmentStore::open(paths.enrollments_file()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let rec = store.revoke(pid).map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!(
+        "{} revoked enrollment {} ({})",
+        style("ok").green().bold(),
+        rec.person_id,
+        rec.enrollment_id
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_enroll_add(
+    paths: &Paths,
+    person_id: &str,
+    facet: &str,
+    ts: &str,
+    nonce: &str,
+    person_pubkey: &str,
+    sig_file: &Path,
+    label: Option<String>,
+) -> Result<()> {
+    let _auth = mymesh_core::AdminAuthority::host_local();
+    debug_assert!(_auth.may_mutate_local_store());
+
+    let person_id = person_id.trim();
+    if person_id.is_empty() {
+        bail!("--person-id is required");
+    }
+    if let Err(rl) = mymesh_core::rate_limit_check_shared(
+        paths.metrics_dir(),
+        mymesh_core::LimitKind::EnrollWrite,
+        person_id,
+    ) {
+        bail!(
+            "rate_limited: enroll write; retry after {}s",
+            rl.retry_after_secs
+        );
+    }
+
+    let identity = Identity::load(paths.identity_file())
+        .with_context(|| "no identity — run mymesh init first")?;
+    let target = identity.device_id();
+    let facet = parse_enroll_facet(facet).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ts = parse_enroll_ts(ts)?;
+    let sig_hex = read_enroll_sig_hex(sig_file).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let body = EnrollWriteBody {
+        person_id: person_id.to_string(),
+        facet,
+        target_device_id_hex: target.to_string(),
+        ts,
+        nonce: nonce.trim().to_string(),
+        person_public_key_hex: person_pubkey.trim().to_string(),
+        sig_hex,
+        label: label.filter(|s| !s.trim().is_empty()),
+    };
+
+    let mut store =
+        EnrollmentStore::open(paths.enrollments_file()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let rec = store
+        .add(&target, &body)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!(
+        "{} enrolled {}  {}  {}",
+        style("ok").green().bold(),
+        rec.person_id,
+        rec.facet.as_str(),
+        rec.enrollment_id
+    );
+    println!("  can_drive  {}", rec.can_drive);
+    println!("  file       {}", paths.enrollments_file().display());
+    println!("  revoke     mymesh enroll revoke {}", rec.person_id);
+    Ok(())
+}
+
+fn parse_enroll_ts(ts: &str) -> Result<String> {
+    let t = ts.trim();
+    if mymesh_core::wire::parse_rfc3339_unix(t).is_ok() {
+        return Ok(t.to_string());
+    }
+    if let Ok(unix) = t.parse::<i64>() {
+        let dt = chrono::DateTime::from_timestamp(unix, 0)
+            .ok_or_else(|| anyhow::anyhow!("invalid --ts unix timestamp"))?;
+        return Ok(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+    }
+    bail!("--ts must be YYYY-MM-DDTHH:MM:SSZ or unix seconds");
+}
+
 fn cmd_grant_revoke(paths: &Paths, grant_id: &str) -> Result<()> {
     let _auth = mymesh_core::AdminAuthority::host_local();
     if let Err(rl) = mymesh_core::rate_limit_check_shared(
@@ -1567,7 +1757,10 @@ fn cmd_grant_revoke(paths: &Paths, grant_id: &str) -> Result<()> {
         mymesh_core::LimitKind::GrantMutate,
         mymesh_core::HOST_LOCAL_SESSION,
     ) {
-        bail!("rate_limited: grant mutate; retry after {}s", rl.retry_after_secs);
+        bail!(
+            "rate_limited: grant mutate; retry after {}s",
+            rl.retry_after_secs
+        );
     }
     let mut grants = GrantStore::open(paths.grants_file())?;
     let g = grants
@@ -2560,12 +2753,8 @@ fn cmd_owner_backup_store(
         owner.save(paths.mesh_owner_file())?;
     }
     // Smoke-check roundtrip under S9 unwrap rate limit (5 / 15 min / person_id).
-    let (out, _) = rate_limited_unseal_owner_backup(
-        paths,
-        person_id,
-        password.as_bytes(),
-        &sealed,
-    )?;
+    let (out, _) =
+        rate_limited_unseal_owner_backup(paths, person_id, password.as_bytes(), &sealed)?;
     if out != seed {
         bail!("internal: backup roundtrip mismatch");
     }

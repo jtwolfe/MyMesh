@@ -67,7 +67,7 @@ pub const ADMIN_ENVELOPE: Policy = Policy {
     max: 30,
     window: Duration::from_secs(60),
 };
-/// Enroll write — 10 / min / person_id (F1 type; unused this PR).
+/// Enroll write — 10 / min / person_id (CLI add; HTTP F4).
 pub const ENROLL_WRITE: Policy = Policy {
     max: 10,
     window: Duration::from_secs(60),

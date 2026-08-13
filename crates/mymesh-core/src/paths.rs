@@ -112,6 +112,11 @@ impl Paths {
         self.data_dir.join("grants.json")
     }
 
+    /// Verified person drive bindings (`enrollments.json`, mode 0600). Wave F2.
+    pub fn enrollments_file(&self) -> PathBuf {
+        self.data_dir.join("enrollments.json")
+    }
+
     /// Continuity packs root: `continuity/<pack_id>/` mode 0700 (S8).
     pub fn continuity_dir(&self) -> PathBuf {
         self.data_dir.join("continuity")
