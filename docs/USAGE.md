@@ -9,7 +9,7 @@ This is the practical reference for day-to-day use. For design limits of the mag
 | Term | Meaning |
 |------|---------|
 | **Identity** | Ed25519 key; **DeviceId** = iroh EndpointId (hex or 24 BIP39 words) |
-| **Agent / serve** | Long-lived process: accepts sessions, mesh sync, magic plane, **owns the only iroh endpoint** |
+| **Agent / serve** | Long-lived process: sessions, mesh sync, magic plane, **the only iroh endpoint**, and **pair/v2 + mesh/v1 HTTP** (`:17878`) |
 | **Dial proxy** | Unix socket (`$XDG_RUNTIME_DIR/mymesh.sock`) so CLI/TUI dial *through* the agent |
 | **Trust** | Device record `Trusted` / `Pending` / `Revoked` |
 | **Arm** | Host temporarily accepts new join requests |
@@ -103,8 +103,7 @@ Internet-first decide without requiring phone HTTP to the host. Full demo checkl
 ```bash
 # Machine A (resident) — mymesh serve must be running
 mymesh pair dual                    # QR_A v2 (nonce; ep=confirm if no --host)
-# optional LAN HTTP decide (needs mymesh carrier on :17878 — dual --host only sets the QR hint):
-# mymesh carrier &
+# optional LAN HTTP decide (mymesh serve owns :17878 /pair/v2 — dual --host only sets the QR hint):
 # mymesh pair dual --host http://<lan-ip>:17878
 
 # Machine B (joiner)
@@ -124,10 +123,11 @@ mymesh pair status                  # optional
 Phone must reach the **carrier pair API** on one machine (same LAN, or open carrier port carefully). Default bootstrap QR is **pair/v2** with LAN `host` + `ep=direct` (D5 / KD23). Prefer dual-scan + confirm above when phone cannot reach host HTTP.
 
 ```bash
-# Machine A
-mymesh carrier                      # default: pair/v2 QR + /pair/v2 (page on :17878)
+# Machine A — serve owns /pair/v2 + /mesh/v1 on :17878; TUI arms QR via MMA1
+mymesh serve                        # pair HTTP + iroh (required)
+# mymesh carrier                    # lab-only if serve is down; refuses bind when serve owns :17878
 # mymesh carrier --pair-v1          # escape: alpha.1 pair/v1 LAN QR
-# scan QR with phone
+# scan QR with phone (TUI pair / carrier action)
 
 # Machine B
 mymesh id --uri                     # show URI/QR

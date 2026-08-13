@@ -1,12 +1,15 @@
 //! Connect-by-carrier: local web page + pair/v1 + pair/v2 + mesh/v1 HTTP.
 //!
-//! Port 17878 (default). Serves deprecated HTML (`/`, `/api/*`) and machine API
-//! under `/pair/v1` (status / pending / decide), `/pair/v2`, and `/mesh/v1`
-//! (auth challenge + topology) using the same `Paths` as serve.
+//! Port 17878 (default). After F4p / KD-F16, **`mymesh serve` binds this router**
+//! in-process. `mymesh carrier` is lab-only if serve is down.
+//! Serves deprecated HTML (`/`, `/api/*`) and machine API under `/pair/v1`
+//! (status / pending / decide), `/pair/v2`, and `/mesh/v1` (auth challenge +
+//! topology) using the same `Paths` as serve.
 //! PairSessionStore is source of truth for v2 (PAIR-V2.md).
 //!
 //! **Default bootstrap QR is pair/v2** (KD23 / D5) with LAN `host` + `ep=direct`.
 //! Pass `pair_v1: true` (`mymesh carrier --pair-v1`) for the alpha.1 LAN v1 QR escape.
+//! TUI arms QR via MMA1 (`arm_pair_qr`) when serve owns the port.
 use axum::extract::{ConnectInfo, FromRequestParts, Query, State};
 use axum::http::{header, request::Parts, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
@@ -34,6 +37,8 @@ use tracing::info;
 
 use crate::join::run_join_as_guest;
 use crate::mesh_api::{self, MeshApiState, MeshAuthStore};
+use async_trait::async_trait;
+use mymesh_net::LocalAdmin;
 
 /// Pair HTTP listen port (matches `CARRIER_TCP` / PAIR-HTTP.md).
 pub const PAIR_HTTP_PORT: u16 = 17878;
@@ -149,6 +154,18 @@ struct BootstrapPersist {
 
 /// Default arm / pair-session TTL used when carrier starts (seconds).
 const CARRIER_ARM_TTL_SECS: u64 = 900;
+/// MMA1 default TTL when the request omits `ttl_secs`.
+const MMA1_ARM_TTL_SECS: u64 = 600;
+
+pub struct PairHttpHandle {
+    /// HTML page URL (deprecated fallback).
+    pub url: String,
+    pub bind: SocketAddr,
+    /// Base `http://IP:port` for pair API (no trailing slash).
+    pub host_base: String,
+    /// Arm-scoped v1 bootstrap token if join is currently armed.
+    pub v1_bootstrap_token: Option<String>,
+}
 
 pub struct CarrierHandle {
     /// HTML page URL (deprecated fallback).
@@ -170,6 +187,157 @@ pub struct CarrierHandle {
     pub pair_protocol_version: u32,
 }
 
+/// Bind pair/v2 + mesh/v1 (and compat pair/v1) without minting a QR.
+///
+/// Serve owns this listener (KD-F16). QR is armed later via [`arm_pair_qr`] / MMA1.
+pub async fn start_pair_http(
+    paths: Paths,
+    identity: &Identity,
+    label: String,
+    port: u16,
+    lan_ip: Option<String>,
+) -> anyhow::Result<PairHttpHandle> {
+    paths.ensure()?;
+
+    let bootstrap = Arc::new(Mutex::new(None));
+    let rate_limits = Arc::new(RateLimitState::new());
+    let st = CarrierState {
+        paths: paths.clone(),
+        secret: identity.to_secret_bytes(),
+        label,
+        pending_peer: Arc::new(Mutex::new(None)),
+        status: Arc::new(Mutex::new("waiting for phone".into())),
+        bootstrap: bootstrap.clone(),
+        mesh_auth: Arc::new(Mutex::new(MeshAuthStore::default())),
+        rate_limits,
+    };
+
+    // Keep arm-scoped v1 bootstrap if already armed (compat /pair/v1).
+    let v1_bootstrap_token = {
+        let mut guard = st.bootstrap.lock().await;
+        ensure_bootstrap_locked(&st.paths, &mut guard).ok()
+    };
+
+    let app = build_router(st);
+
+    let bind: SocketAddr = format!("0.0.0.0:{port}").parse()?;
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let actual = listener.local_addr()?;
+    let host = lan_ip.unwrap_or_else(|| local_ipv4().unwrap_or_else(|| "127.0.0.1".into()));
+    let url = format!("http://{host}:{}/", actual.port());
+    let host_base = format!("http://{host}:{}", actual.port());
+
+    info!(
+        %url,
+        %host_base,
+        "pair/v2 + mesh/v1 listening (serve-owned)"
+    );
+
+    tokio::spawn(async move {
+        // ConnectInfo peer IP for S9 IP-scoped rate limits (not client-spoofable XFF).
+        if let Err(e) = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        {
+            tracing::warn!(%e, "pair/mesh HTTP server exit");
+        }
+    });
+
+    Ok(PairHttpHandle {
+        url,
+        bind: actual,
+        host_base,
+        v1_bootstrap_token,
+    })
+}
+
+/// Mint a pair/v2 session + QR_A (`host` is for the QR payload only — do not render).
+pub fn arm_pair_qr(
+    paths: &Paths,
+    identity: &Identity,
+    ttl_secs: u64,
+    host_base: &str,
+) -> anyhow::Result<ArmPairQr> {
+    paths.ensure()?;
+    let ttl = ttl_secs.clamp(1, 86_400);
+    let _ = ArmState::arm(paths.arm_file(), ttl);
+    let store = PairSessionStore::open(paths.pair_sessions_dir())?;
+    let id = identity.device_id();
+    let mesh_id = MeshState::load(paths.mesh_file())?.mesh_id;
+    let armed = store.arm_new(mesh_id.clone(), id, ttl, PairEndpointClass::Direct)?;
+    let token_b64 = URL_SAFE_NO_PAD.encode(armed.token_raw);
+    let fp = NodeFingerprint::from_device_id(&id).as_str().to_string();
+    let qr = build_pair_qr_v2(&PairQrV2Params {
+        sid: &armed.session.sid,
+        did: &id.to_string(),
+        token: &token_b64,
+        nonce: &armed.session.nonce,
+        fp: &fp,
+        mesh: Some(&mesh_id),
+        host: Some(host_base),
+        ep: Some(PairEndpointClass::Direct),
+        relay: None,
+        tlspin: None,
+    });
+    Ok(ArmPairQr {
+        qr,
+        sid: armed.session.sid,
+        host_base: host_base.to_string(),
+        token_b64,
+    })
+}
+
+/// Result of [`arm_pair_qr`].
+pub struct ArmPairQr {
+    pub qr: String,
+    pub sid: String,
+    pub host_base: String,
+    pub token_b64: String,
+}
+
+/// MMA1 handler used by `mymesh serve` (arm QR without a second HTTP bind).
+pub struct PairArmAdmin {
+    pub paths: Paths,
+    pub secret: [u8; 32],
+    pub host_base: Arc<Mutex<String>>,
+}
+
+#[async_trait]
+impl LocalAdmin for PairArmAdmin {
+    async fn handle(&self, request: serde_json::Value) -> serde_json::Value {
+        match request.get("cmd").and_then(|c| c.as_str()) {
+            Some("arm_pair_qr") => {
+                let ttl = request
+                    .get("ttl_secs")
+                    .and_then(|t| t.as_u64())
+                    .unwrap_or(MMA1_ARM_TTL_SECS);
+                let host_base = self.host_base.lock().await.clone();
+                let identity = Identity::from_secret_bytes(self.secret);
+                match arm_pair_qr(&self.paths, &identity, ttl, &host_base) {
+                    Ok(armed) => serde_json::json!({
+                        "ok": true,
+                        "qr": armed.qr,
+                        "sid": armed.sid,
+                        "host_base": armed.host_base
+                    }),
+                    Err(e) => serde_json::json!({
+                        "ok": false,
+                        "code": "internal",
+                        "error": e.to_string()
+                    }),
+                }
+            }
+            _ => serde_json::json!({
+                "ok": false,
+                "code": "bad_request",
+                "error": "unknown cmd"
+            }),
+        }
+    }
+}
+
 /// Start carrier HTTP facade + emit bootstrap QR.
 ///
 /// * `pair_v1 == false` (default product path): mint a **pair/v2** PairSession
@@ -178,6 +346,7 @@ pub struct CarrierHandle {
 ///   using the arm-scoped bootstrap token (escape hatch during compat window).
 ///
 /// `/pair/v1/*` and `/pair/v2/*` endpoints are both served regardless of QR version.
+/// Lab-only when serve is down — serve owns `:17878` after F4p.
 pub async fn start_carrier(
     paths: Paths,
     identity: Identity,
@@ -192,93 +361,37 @@ pub async fn start_carrier(
     // (join host path requires ArmState; status.armed = arm && session open).
     let _ = ArmState::arm(paths.arm_file(), CARRIER_ARM_TTL_SECS);
 
-    let bootstrap = Arc::new(Mutex::new(None));
-    let rate_limits = Arc::new(RateLimitState::new());
-    let st = CarrierState {
-        paths: paths.clone(),
-        secret: identity.to_secret_bytes(),
-        label: label.clone(),
-        pending_peer: Arc::new(Mutex::new(None)),
-        status: Arc::new(Mutex::new("waiting for phone".into())),
-        bootstrap: bootstrap.clone(),
-        mesh_auth: Arc::new(Mutex::new(MeshAuthStore::default())),
-        rate_limits: rate_limits.clone(),
-    };
-
-    // Always keep arm-scoped v1 bootstrap in sync so /pair/v1/* stays usable
-    // during the compat window (even when the printed QR is v2).
-    let v1_token_b64 = {
-        let mut guard = st.bootstrap.lock().await;
-        ensure_bootstrap_locked(&st.paths, &mut guard)?
-    };
-
-    let app = build_router(st);
-
-    let bind: SocketAddr = format!("0.0.0.0:{port}").parse()?;
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    let actual = listener.local_addr()?;
-    let host = lan_ip.unwrap_or_else(|| local_ipv4().unwrap_or_else(|| "127.0.0.1".into()));
-    let url = format!("http://{host}:{}/", actual.port());
-    let host_base = format!("http://{host}:{}", actual.port());
+    let http = start_pair_http(paths.clone(), &identity, label, port, lan_ip).await?;
     let id = identity.device_id();
     let fp = NodeFingerprint::from_device_id(&id).as_str().to_string();
     let mesh_id = MeshState::load(paths.mesh_file())?.mesh_id;
 
     let (pair_qr, bootstrap_token, pair_protocol_version) = if pair_v1 {
+        let v1_token_b64 = http
+            .v1_bootstrap_token
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("v1 bootstrap missing after arm"))?;
         (
-            build_pair_qr(&host_base, &v1_token_b64, &fp, Some(&mesh_id)),
+            build_pair_qr(&http.host_base, &v1_token_b64, &fp, Some(&mesh_id)),
             v1_token_b64,
             1u32,
         )
     } else {
-        // Default (D5): PairSession + v2 QR with direct LAN host.
-        let store = PairSessionStore::open(paths.pair_sessions_dir())?;
-        let armed = store.arm_new(
-            mesh_id.clone(),
-            id,
-            CARRIER_ARM_TTL_SECS,
-            PairEndpointClass::Direct,
-        )?;
-        let token_b64 = URL_SAFE_NO_PAD.encode(armed.token_raw);
-        let did = id.to_string();
-        let qr = build_pair_qr_v2(&PairQrV2Params {
-            sid: &armed.session.sid,
-            did: &did,
-            token: &token_b64,
-            nonce: &armed.session.nonce,
-            fp: &fp,
-            mesh: Some(&mesh_id),
-            host: Some(host_base.as_str()),
-            ep: Some(PairEndpointClass::Direct),
-            relay: None,
-            tlspin: None,
-        });
-        (qr, token_b64, 2u32)
+        let armed = arm_pair_qr(&paths, &identity, CARRIER_ARM_TTL_SECS, &http.host_base)?;
+        (armed.qr, armed.token_b64, 2u32)
     };
 
     info!(
-        %url,
-        %host_base,
+        url = %http.url,
+        host_base = %http.host_base,
         pair_v = pair_protocol_version,
         "carrier + pair/v1 + pair/v2 + mesh/v1 listening"
     );
 
-    tokio::spawn(async move {
-        // ConnectInfo peer IP for S9 IP-scoped rate limits (not client-spoofable XFF).
-        if let Err(e) = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        {
-            tracing::warn!(%e, "carrier server exit");
-        }
-    });
-
     Ok(CarrierHandle {
-        url,
-        bind: actual,
-        host_base,
+        url: http.url,
+        bind: http.bind,
+        host_base: http.host_base,
         bootstrap_token,
         pair_qr,
         pair_protocol_version,
@@ -667,9 +780,7 @@ where
 
 /// IP rate-limit key: peer addr primary; XFF only if `MYMESH_TRUST_PROXY` (see core).
 fn rate_limit_ip(peer: Option<SocketAddr>, headers: &HeaderMap) -> String {
-    let xff = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok());
+    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
     let rip = headers.get("x-real-ip").and_then(|v| v.to_str().ok());
     client_ip_key(peer, xff, rip)
 }
@@ -2044,7 +2155,9 @@ mod tests {
             "mesh= required when mesh loaded: {}",
             handle.pair_qr
         );
-        assert!(handle.pair_qr.contains(&format!("token={}", handle.bootstrap_token)));
+        assert!(handle
+            .pair_qr
+            .contains(&format!("token={}", handle.bootstrap_token)));
 
         // PairSession was armed and is findable by the QR token.
         let store = PairSessionStore::open(paths.pair_sessions_dir()).unwrap();
@@ -2116,7 +2229,9 @@ mod tests {
         assert!(!handle.pair_qr.contains("nonce="));
         assert!(!handle.pair_qr.contains("sid="));
         assert!(handle.pair_qr.contains("host=http%3A%2F%2F192.168.1.10%3A"));
-        assert!(handle.pair_qr.contains(&format!("token={}", handle.bootstrap_token)));
+        assert!(handle
+            .pair_qr
+            .contains(&format!("token={}", handle.bootstrap_token)));
 
         // Escape must not mint a PairSession for the v1 QR token.
         let store = PairSessionStore::open(paths.pair_sessions_dir()).unwrap();
@@ -2681,7 +2796,8 @@ mod tests {
     }
 
     fn with_peer(mut req: Request<Body>, ip: [u8; 4]) -> Request<Body> {
-        req.extensions_mut().insert(ConnectInfo(SocketAddr::from((ip, 50_000))));
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from((ip, 50_000))));
         req
     }
 
@@ -2894,5 +3010,157 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(resp.headers().get(header::RETRY_AFTER).is_some());
+    }
+
+    async fn raw_http_get(addr: SocketAddr, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// `mymesh serve` binds the same router — curl /pair/v2/status without `mymesh carrier`.
+    #[tokio::test]
+    async fn serve_pair_http_status_without_carrier_cli() {
+        let paths = tmp_paths();
+        let secret = [0x22u8; 32];
+        let identity = Identity::from_secret_bytes(secret);
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+
+        let handle = start_pair_http(
+            paths.clone(),
+            &identity,
+            "host".into(),
+            0,
+            Some("127.0.0.1".into()),
+        )
+        .await
+        .expect("start_pair_http");
+
+        let raw = raw_http_get(handle.bind, "/pair/v2/status").await;
+        assert!(
+            raw.contains("404") || raw.contains("not_found"),
+            "unarmed status should be 404 not_found: {raw}"
+        );
+
+        let armed = arm_pair_qr(&paths, &identity, 600, &handle.host_base).unwrap();
+        assert!(armed.qr.starts_with("carrier://pair?v=2&"));
+        assert!(armed.qr.contains(&format!("sid={}", armed.sid)));
+
+        let raw = raw_http_get(handle.bind, &format!("/pair/v2/status?sid={}", armed.sid)).await;
+        assert!(
+            raw.contains("200") && raw.contains("\"protocol_version\":2"),
+            "armed status via serve-owned HTTP: {raw}"
+        );
+        assert!(raw.contains(&armed.sid));
+    }
+
+    #[tokio::test]
+    async fn pair_arm_admin_mma1_json() {
+        let paths = tmp_paths();
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        let secret = [0x33u8; 32];
+        let admin = PairArmAdmin {
+            paths,
+            secret,
+            host_base: Arc::new(Mutex::new("http://127.0.0.1:17878".into())),
+        };
+        let ok = admin
+            .handle(serde_json::json!({"cmd": "arm_pair_qr", "ttl_secs": 120}))
+            .await;
+        assert_eq!(ok["ok"], true);
+        assert!(ok["qr"]
+            .as_str()
+            .unwrap()
+            .starts_with("carrier://pair?v=2&"));
+        assert!(ok["sid"].as_str().unwrap().len() > 4);
+        assert_eq!(ok["host_base"], "http://127.0.0.1:17878");
+
+        let bad = admin.handle(serde_json::json!({"cmd": "nope"})).await;
+        assert_eq!(bad["ok"], false);
+        assert_eq!(bad["code"], "bad_request");
+    }
+
+    /// Serve-shaped process: pair HTTP + MMA1 on the control socket, then MMD1.
+    #[tokio::test]
+    async fn serve_mma1_arm_then_connect_mesh_and_status() {
+        use mymesh_net::{
+            arm_pair_qr_via_agent, connect_mesh, serve_control_socket, LocalAdmin, LocalFabric,
+            Transport,
+        };
+        use mymesh_protocol::ChannelId;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let paths = tmp_paths();
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        let secret = [0x44u8; 32];
+        let identity = Identity::from_secret_bytes(secret);
+        let http = start_pair_http(
+            paths.clone(),
+            &identity,
+            "host".into(),
+            0,
+            Some("127.0.0.1".into()),
+        )
+        .await
+        .unwrap();
+
+        let fabric = LocalFabric::new();
+        let id_b = Identity::generate();
+        let ep_a = fabric.endpoint(identity.device_id());
+        let ep_b = fabric.endpoint(id_b.device_id());
+        let sock = std::env::temp_dir().join(format!(
+            "mma1-serve-{}-{}.sock",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let admin: Arc<dyn LocalAdmin> = Arc::new(PairArmAdmin {
+            paths: paths.clone(),
+            secret,
+            host_base: Arc::new(Mutex::new(http.host_base.clone())),
+        });
+        let t: Arc<dyn Transport> = Arc::new(ep_a);
+        let sock2 = sock.clone();
+        tokio::spawn(async move {
+            let _ = serve_control_socket(sock2, t, Some(admin)).await;
+        });
+        for _ in 0..50 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let armed = arm_pair_qr_via_agent(&sock, 600).await.expect("MMA1");
+        assert!(armed.ok);
+        let sid = armed.sid.expect("sid");
+        let qr = armed.qr.expect("qr");
+        assert!(qr.starts_with("carrier://pair?v=2&"));
+        assert!(qr.contains(&format!("sid={sid}")));
+
+        let raw = raw_http_get(http.bind, &format!("/pair/v2/status?sid={sid}")).await;
+        assert!(
+            raw.contains("\"protocol_version\":2"),
+            "curl-style status without mymesh carrier: {raw}"
+        );
+
+        let accept = tokio::spawn(async move { ep_b.accept().await });
+        let (conn, direct) = connect_mesh(&identity, id_b.device_id(), &sock)
+            .await
+            .expect("connect_mesh after MMA1");
+        assert!(direct.is_none());
+        conn.send_frame(mymesh_protocol::Frame {
+            channel: ChannelId::control(),
+            payload: bytes::Bytes::from_static(b"ok"),
+        })
+        .await
+        .unwrap();
+        let peer = accept.await.unwrap().unwrap();
+        assert_eq!(&peer.recv_frame().await.unwrap().payload[..], b"ok");
+        let _ = std::fs::remove_file(&sock);
     }
 }

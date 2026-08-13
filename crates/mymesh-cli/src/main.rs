@@ -26,13 +26,13 @@ use mymesh_crypto::{
     MmkRuntime, OwnerBackupSealed, OwnerClaimRequest, RecoveryCode,
 };
 use mymesh_net::{
-    run_mailbox_server, FsMailbox, HttpMailbox, IrohTransport, LocalFabric, LocalRendezvous,
-    Rendezvous, Transport,
+    run_mailbox_server, serve_control_socket, FsMailbox, HttpMailbox, IrohTransport, LocalFabric,
+    LocalRendezvous, Rendezvous, Transport,
 };
 use mymesh_protocol::{decode_msg, encode_msg, ChannelId, FileMessage, Frame, TerminalMessage};
 use mymesh_session::{
     apply_kick_target, apply_membership, build_announce, run_guest_pair, run_host_pair_code,
-    run_join_as_guest, sign_kick, Agent, Session,
+    run_join_as_guest, sign_kick, Agent, PairArmAdmin, Session, PAIR_HTTP_PORT,
 };
 use mymesh_terminal::TerminalClient;
 use std::net::SocketAddr;
@@ -184,7 +184,7 @@ enum Commands {
         #[arg(long, default_value_t = 30)]
         fps: u8,
     },
-    /// Run the mesh agent (sessions + magic plane)
+    /// Run the mesh agent (sessions, magic plane, pair/v2 + mesh/v1 HTTP)
     Serve {
         /// Keep in foreground (default for CLI)
         #[arg(long)]
@@ -326,7 +326,7 @@ enum Commands {
         #[arg(long)]
         local: Option<u16>,
     },
-    /// Connect-by-carrier (phone QR page; phone is not a mesh node)
+    /// Lab-only pair HTTP if serve is down (serve owns :17878 after F4p)
     Carrier {
         /// HTTP listen port (default 17878)
         #[arg(long, default_value_t = 17878)]
@@ -1858,18 +1858,36 @@ async fn cmd_serve(paths: &Paths) -> Result<()> {
     );
     let transport = std::sync::Arc::new(IrohTransport::bind(&identity).await?);
     let agent = Agent::from_paths(&identity, paths, cfg.clone())?;
+    // KD-F16: serve owns pair/v2 + mesh/v1 (do not require `mymesh carrier`).
+    let host_base = match agent.spawn_pair_http(paths, PAIR_HTTP_PORT).await {
+        Ok(h) => {
+            println!("  pair HTTP   0.0.0.0:{PAIR_HTTP_PORT}  /pair/v2 /mesh/v1");
+            h.host_base
+        }
+        Err(e) => {
+            eprintln!("  pair HTTP   bind :{PAIR_HTTP_PORT} failed: {e}");
+            tracing::error!(%e, "pair/mesh HTTP bind failed");
+            format!("http://127.0.0.1:{PAIR_HTTP_PORT}")
+        }
+    };
     // Single iroh endpoint: dial proxy so CLI/TUI never re-bind the same identity.
+    // MMA1 arm_pair_qr shares this socket; MMD1 dial is unchanged after 4-byte magic.
     let sock = std::path::PathBuf::from(&cfg.daemon.control_socket);
+    let admin = std::sync::Arc::new(PairArmAdmin {
+        paths: paths.clone(),
+        secret: identity.to_secret_bytes(),
+        host_base: std::sync::Arc::new(tokio::sync::Mutex::new(host_base)),
+    });
     {
-        let t = transport.clone();
+        let t: std::sync::Arc<dyn Transport> = transport.clone();
         let sock = sock.clone();
         tokio::spawn(async move {
-            if let Err(e) = mymesh_net::serve_dial_proxy(sock, t).await {
+            if let Err(e) = serve_control_socket(sock, t, Some(admin)).await {
                 tracing::error!(%e, "dial proxy exited");
             }
         });
     }
-    println!("  dial proxy  {}", sock.display());
+    println!("  dial proxy  {}  (MMD1 dial, MMA1 admin)", sock.display());
     // Magic plane: DNS, SOCKS5, mesh-IP auto ports, reconnect probes (shared transport)
     mymesh_session::MagicPlane::new(
         paths.clone(),

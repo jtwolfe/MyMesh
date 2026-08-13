@@ -117,6 +117,11 @@ impl Paths {
         self.data_dir.join("enrollments.json")
     }
 
+    /// AdminEnvelope replay cache (`admin-nonces.json`, mode 0600). Serve-owned (F4p / F4).
+    pub fn admin_nonces_file(&self) -> PathBuf {
+        self.data_dir.join("admin-nonces.json")
+    }
+
     /// Continuity packs root: `continuity/<pack_id>/` mode 0700 (S8).
     pub fn continuity_dir(&self) -> PathBuf {
         self.data_dir.join("continuity")
@@ -125,5 +130,23 @@ impl Paths {
     /// Single pack directory under continuity root.
     pub fn continuity_pack_dir(&self, pack_id: &str) -> PathBuf {
         self.continuity_dir().join(pack_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admin_nonces_path_is_serve_owned_file() {
+        let p = Paths {
+            config_dir: PathBuf::from("/tmp/cfg"),
+            data_dir: PathBuf::from("/tmp/data"),
+            cache_dir: PathBuf::from("/tmp/cache"),
+        };
+        assert_eq!(
+            p.admin_nonces_file(),
+            PathBuf::from("/tmp/data/admin-nonces.json")
+        );
     }
 }

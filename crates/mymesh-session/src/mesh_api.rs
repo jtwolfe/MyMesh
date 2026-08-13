@@ -1,7 +1,8 @@
 //! Mesh API v1 — auth challenge (Issue 4) + topology + owner claim (S4/B4) + grants (C2/C4)
 //! + continuity materialize/wipe/status (S8/E4).
 //!
-//! Routes (served on the carrier HTTP process, same Paths as serve):
+//! Routes (served by `mymesh serve` on :17878 after F4p; lab `mymesh carrier`
+//! if serve is down). Same Paths / MeshAuthStore as the agent:
 //!
 //! ```text
 //! GET  /mesh/v1/auth/challenge   # public: nonce + methods_allowed

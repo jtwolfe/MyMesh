@@ -1,7 +1,7 @@
 //! Background agent: join, sessions, mesh gossip, pending kicks, periodic sync.
 use mymesh_core::{
-    allows, ArmState, Capability, Config, DeviceStore, EnrollmentStore, GrantStore, MeshState,
-    Paths, PendingKick, PendingKickStore, Result,
+    allows, AdminNonceStore, ArmState, Capability, Config, DeviceStore, EnrollmentStore,
+    GrantStore, MeshState, Paths, PendingKick, PendingKickStore, Result,
 };
 use mymesh_crypto::Identity;
 use mymesh_files::{apply_host_message, FileTransferEngine, PathSandbox};
@@ -121,6 +121,8 @@ impl Agent {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
         let _ = EnrollmentStore::open_or_create(data_dir.join("enrollments.json"))?;
+        // Serve owns admin-nonces.json (F4p). Replay consume is F4 AdminEnvelope.
+        let _ = AdminNonceStore::open_or_create(data_dir.join("admin-nonces.json"))?;
         Ok(Self {
             secret: identity.to_secret_bytes(),
             label,
@@ -140,6 +142,22 @@ impl Agent {
 
     fn identity(&self) -> Identity {
         Identity::from_secret_bytes(self.secret)
+    }
+
+    /// KD-F16: bind pair/v2 + mesh/v1 in-process. Serve owns `:17878`.
+    pub async fn spawn_pair_http(
+        &self,
+        paths: &Paths,
+        port: u16,
+    ) -> anyhow::Result<crate::carrier::PairHttpHandle> {
+        crate::carrier::start_pair_http(
+            paths.clone(),
+            &self.identity(),
+            self.label.clone(),
+            port,
+            None,
+        )
+        .await
     }
 
     fn store(&self) -> Result<DeviceStore> {

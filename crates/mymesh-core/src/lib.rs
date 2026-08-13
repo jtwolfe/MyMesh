@@ -1,5 +1,6 @@
 //! Core types shared across the MyMesh stack.
 
+mod admin_nonces;
 mod config;
 mod continuity;
 mod device;
@@ -19,6 +20,7 @@ mod rate_limit;
 mod tls_pin;
 pub mod wire;
 
+pub use admin_nonces::{AdminNonceStore, ADMIN_NONCES_VERSION, ADMIN_NONCE_TTL_SECS};
 pub use config::{Config, DaemonConfig, Limits, MagicConfig};
 pub use continuity::{
     load_state, materialize_pack, read_fields, status_pack,

@@ -7,10 +7,10 @@
 //! | `PairDecide` | 10 / min / token | **File-backed** under `metrics_dir/rate-limits.json` so carrier HTTP decide and CLI `pair confirm` share one budget on the same host |
 //! | `OwnerBackupUnwrap` | 5 / 15 min / person_id | **File-backed** (CLI unwrap attempts across processes) |
 //! | `GrantMutate` | 30 / min / session | **File-backed** |
-//! | `AdminEnvelope` | 30 / min / person_id | **File-backed** (F1 type; F4p serve consumer) |
-//! | `EnrollWrite` | 10 / min / person_id | **File-backed** (F1 type; unused this PR) |
-//! | `MailboxBind` | 10 / min / ip | **File-backed** (F1 type; unused this PR) |
-//! | `MailboxPut` | 30 / min / did | **File-backed** (F1 type; unused this PR) |
+//! | `AdminEnvelope` | 30 / min / person_id | **File-backed** (F4p: serve is the consumer) |
+//! | `EnrollWrite` | 10 / min / person_id | **File-backed** (CLI add; HTTP F4) |
+//! | `MailboxBind` | 10 / min / ip | **File-backed** (F4p type; mailbox poller F6) |
+//! | `MailboxPut` | 30 / min / did | **File-backed** (F4p type; mailbox poller F6) |
 //! | `PairStatus` | 60 / min / ip | **In-process** (`RateLimitState` on carrier) — same process as status HTTP |
 //! | `MeshAuthChallenge` | 30 / min / ip | **In-process** (carrier mesh routes) |
 //!
@@ -126,7 +126,7 @@ impl LimitKind {
         }
     }
 
-    /// Kinds that must share budget across carrier + CLI processes.
+    /// Kinds that persist under `metrics_dir/rate-limits.json` (serve-owned after F4p).
     pub fn is_file_backed(self) -> bool {
         matches!(
             self,
@@ -639,6 +639,24 @@ mod tests {
         assert_eq!(LimitKind::MailboxBind.policy().max, 10);
         assert_eq!(LimitKind::MailboxPut.policy().max, 30);
         assert_eq!(LimitKind::EnrollWrite.policy().max, 10);
+    }
+
+    #[test]
+    fn admin_envelope_file_backed_persists() {
+        let dir = tmp_metrics();
+        clear_shared_for_tests(&dir);
+        let key = "person-admin";
+        for _ in 0..ADMIN_ENVELOPE.max {
+            check_shared(&dir, LimitKind::AdminEnvelope, key).unwrap();
+        }
+        assert!(check_shared(&dir, LimitKind::AdminEnvelope, key).is_err());
+        assert!(
+            FileStore::path(&dir).exists(),
+            "serve-owned rate-limits.json must exist"
+        );
+        let err = check_shared(&dir, LimitKind::AdminEnvelope, key).expect_err("reload");
+        assert_eq!(err.kind, LimitKind::AdminEnvelope);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
