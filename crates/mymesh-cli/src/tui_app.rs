@@ -318,7 +318,7 @@ pub async fn run_tui(paths: Paths) -> Result<()> {
         pending_size: None,
         pending_since: None,
     };
-    ensure_pair_qr_a(&mut app);
+    ensure_pair_qr_a(&mut app).await;
 
     let res = run_loop(&mut terminal, &mut app).await;
 
@@ -430,13 +430,60 @@ fn node_cwd_default(node: &BrowserNode, home: &Path) -> String {
     }
 }
 
-fn ensure_pair_qr_a(app: &mut App) {
+fn sid_from_pair_qr(qr: &str) -> Option<String> {
+    let q = qr.split_once('?')?.1;
+    for part in q.split('&') {
+        if let Some(v) = part.strip_prefix("sid=") {
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn host_from_page_url(url: &str) -> String {
+    url.trim_end_matches('/').to_string()
+}
+
+/// Arm QR_A with a LAN `host` when pair HTTP can listen, so the phone can tell
+/// this machine to `link` the other (same path as 24-word join).
+async fn ensure_pair_qr_a(app: &mut App) {
+    if app.carrier_url.is_none() {
+        match crate::magic_cmd::start_carrier_ui(&app.paths, 17878).await {
+            Ok((url, pair_qr)) => {
+                app.carrier_url = Some(url);
+                app.pair_sid = sid_from_pair_qr(&pair_qr);
+                app.pair_qr_a = Some(pair_qr);
+                app.status =
+                    "pair HTTP + QR armed — scan this first, then the other machine".into();
+                return;
+            }
+            Err(e) => {
+                app.status = format!("pair HTTP unavailable ({e}); confirm-only QR");
+            }
+        }
+    } else if let Some(url) = app.carrier_url.clone() {
+        let host = host_from_page_url(&url);
+        match crate::pair_cmd::mint_pair_dual_qr(&app.paths, Some(host), None, None) {
+            Ok((qr, sid, _)) => {
+                app.pair_qr_a = Some(qr);
+                app.pair_sid = Some(sid);
+                app.status = "pair QR reminted (LAN host) — scan this first".into();
+            }
+            Err(e) => app.status = format!("pair QR: {e}"),
+        }
+        return;
+    }
     match crate::pair_cmd::mint_pair_dual_qr(&app.paths, None, None, None) {
         Ok((qr, sid, _)) => {
             app.pair_qr_a = Some(qr);
             app.pair_sid = Some(sid);
-            app.status =
-                "pair QR armed — scan this first on Carrier, then scan the other machine".into();
+            if !app.status.starts_with("pair HTTP unavailable") {
+                app.status =
+                    "pair QR armed — scan this first on Carrier, then scan the other machine"
+                        .into();
+            }
         }
         Err(e) => app.status = format!("pair QR: {e}"),
     }
@@ -833,7 +880,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 "paste hex id or 24 words, then Enter",
             ),
             KeyCode::Char('C') => start_carrier(app).await,
-            KeyCode::Char('P') => ensure_pair_qr_a(app),
+            KeyCode::Char('P') => ensure_pair_qr_a(app).await,
             KeyCode::Char('f') => start_prompt(
                 app,
                 PromptKind::PairConfirm,
@@ -1218,7 +1265,7 @@ async fn click_button(app: &mut App, id: &str) {
             "hex or 24 words",
         ),
         "carrier" => start_carrier(app).await,
-        "pair_qr" => ensure_pair_qr_a(app),
+        "pair_qr" => ensure_pair_qr_a(app).await,
         "pair_confirm" => start_prompt(
             app,
             PromptKind::PairConfirm,
@@ -1439,6 +1486,8 @@ async fn start_carrier(app: &mut App) {
     match crate::magic_cmd::start_carrier_ui(&app.paths, 17878).await {
         Ok((url, pair_qr)) => {
             app.carrier_url = Some(url.clone());
+            app.pair_sid = sid_from_pair_qr(&pair_qr);
+            app.pair_qr_a = Some(pair_qr.clone());
             app.detail = format!(
                 "Connect-by-carrier (pair/v2 default)\n\n\
 Carrier QR (scan with app):\n  {pair_qr}\n\n\
@@ -2766,7 +2815,11 @@ fn draw_home(f: &mut TuiFrame, area: Rect, app: &App) {
         }
         qr_lines.push(Line::from(""));
         qr_lines.push(Line::from(Span::styled(
-            "[f] paste confirm code after phone Accept",
+            "Phone Accept tells the other machine to dial this one (same as 24-word link).",
+            Style::default().fg(C_MUTED),
+        )));
+        qr_lines.push(Line::from(Span::styled(
+            "[f] paste confirm code only if the phone cannot reach this host",
             Style::default().fg(C_MUTED),
         )));
     } else if let Some(id) = id {

@@ -16,9 +16,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
 use mymesh_core::{
-    client_ip_key, hash_pair_token, record_pair_decide, record_pair_status, ArmState, Config,
-    DeviceId, JoinDecision, JoinStore, LimitKind, MeshState, NodeFingerprint, PairEndpointClass,
-    PairPhase, PairSessionFile, PairSessionStore, Paths, PendingJoin, RateLimitState,
+    client_ip_key, hash_pair_token, record_pair_decide, record_pair_status, ArmState, Capability,
+    Config, DeviceId, DeviceStore, JoinDecision, JoinStore, LimitKind, MeshState, NodeFingerprint,
+    PairEndpointClass, PairPhase, PairSessionFile, PairSessionStore, Paths, PendingJoin,
+    RateLimitState,
 };
 use mymesh_crypto::{device_id_to_words, device_join_uri, Identity};
 use rand::rngs::OsRng;
@@ -31,6 +32,7 @@ use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
+use crate::join::run_join_as_guest;
 use crate::mesh_api::{self, MeshApiState, MeshAuthStore};
 
 /// Pair HTTP listen port (matches `CARRIER_TCP` / PAIR-HTTP.md).
@@ -305,6 +307,8 @@ fn build_router(st: CarrierState) -> Router {
         .route("/pair/v2/status", get(pair_v2_status))
         .route("/pair/v2/pending", get(pair_v2_pending))
         .route("/pair/v2/decide", post(pair_v2_decide))
+        // Phone introducer: tell this node to dial a resident (same path as `mymesh link`).
+        .route("/pair/v2/dial", post(pair_v2_dial))
         .with_state(st);
     // mesh/v1 auth challenge + topology (Issue 4 / B3) — separate state type, merge after
     pair_app
@@ -908,6 +912,23 @@ struct SessionDecisionBody {
     reason: Option<String>,
 }
 
+/// `POST /pair/v2/dial` — phone tells this node to join a resident (24-word link path).
+#[derive(Debug, Deserialize)]
+struct DialRequest {
+    /// Resident / host device id (64 hex), same target as `mymesh link <id>`.
+    resident_did: String,
+    #[serde(default)]
+    resident_fp: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DialResponse {
+    ok: bool,
+    /// `dialing` — join started in the background (iroh JoinRequest).
+    state: &'static str,
+    resident_did: String,
+}
+
 #[derive(Serialize)]
 struct DecideV2Response {
     ok: bool,
@@ -1377,6 +1398,112 @@ async fn pair_v2_decide(
         state,
         sid: sess.sid,
         phase: PairPhase::Decided.as_str(),
+    })
+    .into_response()
+}
+
+/// Phone introducer: this node is the **joiner**. Bearer is *this* machine's pair token.
+///
+/// Same iroh path as `mymesh link <resident>` / `pair dual --join`. Join runs in the
+/// background so the HTTP call returns before host approval (up to 600s).
+async fn pair_v2_dial(
+    State(st): State<CarrierState>,
+    headers: HeaderMap,
+    Json(body): Json<DialRequest>,
+) -> Response {
+    let (_store, sess, raw) = match require_v2_session(&st.paths, &headers, None) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if sess.is_expired_now() {
+        return pair_err(StatusCode::GONE, "session_gone", "pair session expired");
+    }
+    let token_key = hash_pair_token(&raw);
+    if let Err(rl) = mymesh_core::rate_limit_check_shared(
+        st.paths.metrics_dir(),
+        LimitKind::PairDecide,
+        &token_key,
+    ) {
+        record_pair_decide(st.paths.metrics_dir(), "rate_limited");
+        return pair_rate_limited(rl.retry_after_secs);
+    }
+
+    let resident: DeviceId = match body.resident_did.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return pair_err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "resident_did must be 64 hex chars",
+            );
+        }
+    };
+    let self_id = st.identity().device_id();
+    if resident == self_id {
+        return pair_err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "cannot dial self — scan the other machine as QR_B",
+        );
+    }
+    if let Some(ref fp) = body.resident_fp {
+        let want = NodeFingerprint::from_device_id(&resident);
+        if !fp.is_empty() && fp != want.as_str() {
+            return pair_err(
+                StatusCode::CONFLICT,
+                "conflict",
+                "resident_fp does not match resident_did",
+            );
+        }
+    }
+
+    let identity = st.identity();
+    let paths = st.paths.clone();
+    let label = st.label.clone();
+    let cfg = Config::load(paths.config_file()).unwrap_or_default();
+    let sock = PathBuf::from(&cfg.daemon.control_socket);
+    info!(
+        resident = %resident.short(),
+        "pair/v2 dial — joining resident (same path as mymesh link)"
+    );
+    tokio::spawn(async move {
+        let mut store = match DeviceStore::open(paths.devices_file()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(%e, "pair/v2 dial: device store");
+                return;
+            }
+        };
+        match mymesh_net::connect_mesh(&identity, resident, &sock).await {
+            Ok((conn, transport)) => {
+                match run_join_as_guest(
+                    conn,
+                    &identity,
+                    &label,
+                    &mut store,
+                    &paths.mesh_file(),
+                    Capability::all(),
+                )
+                .await
+                {
+                    Ok(peer) => info!(
+                        peer = %peer.id.short(),
+                        "pair/v2 dial join completed"
+                    ),
+                    Err(e) => tracing::warn!(%e, "pair/v2 dial join failed"),
+                }
+                if let Some(tr) = transport {
+                    tr.shutdown().await;
+                }
+            }
+            Err(e) => tracing::warn!(%e, "pair/v2 dial connect failed — is mymesh serve running?"),
+        }
+    });
+
+    Json(DialResponse {
+        ok: true,
+        state: "dialing",
+        resident_did: resident.to_string(),
     })
     .into_response()
 }
@@ -2372,6 +2499,75 @@ mod tests {
         let s = store.load(&sid).unwrap().unwrap();
         assert_eq!(s.phase, mymesh_core::PairPhase::Armed);
         assert!(s.joiner_device_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn v2_dial_requires_bearer_and_rejects_self() {
+        let paths = tmp_paths();
+        let secret = [0x75u8; 32];
+        let id = Identity::from_secret_bytes(secret);
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        ArmState::arm(paths.arm_file(), 600).unwrap();
+        let (_sid, token, _nonce, _) =
+            arm_v2_session(&paths, id.device_id(), PairEndpointClass::Direct);
+
+        let st = test_state(paths, secret, "joiner");
+        let app = build_router(st);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/pair/v2/dial")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "resident_did": "ab".repeat(32) }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let self_did = id.device_id().to_string();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/pair/v2/dial")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "resident_did": self_did }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let other = DeviceId::from_bytes([0xe5u8; 32]).to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/pair/v2/dial")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "resident_did": other }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["state"], "dialing");
+        assert_eq!(v["resident_did"], other);
     }
 
     #[tokio::test]
