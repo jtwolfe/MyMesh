@@ -31,7 +31,11 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> io:
     Ok(())
 }
 
+/// Consecutive unknown kinds a new peer will skip before tearing down.
+const MAX_UNKNOWN_KIND_SKIPS: u32 = 16;
+
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Frame> {
+    let mut skipped = 0u32;
     loop {
         let mut hdr = [0u8; HEADER_LEN];
         r.read_exact(&mut hdr).await?;
@@ -51,6 +55,13 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Frame> {
         // F5: new peers skip unknown kinds (consume length, continue). Do not
         // send kind 6 this wave — old peers still tear down (KD-F17).
         let Some(kind) = crate::ChannelKind::from_u8(kind_u8) else {
+            skipped = skipped.saturating_add(1);
+            if skipped > MAX_UNKNOWN_KIND_SKIPS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "too many unknown channel kinds",
+                ));
+            }
             continue;
         };
         return Ok(Frame {
@@ -94,5 +105,19 @@ mod tests {
         let got = read_frame(&mut r).await.unwrap();
         assert_eq!(got.channel.kind, ChannelKind::Control);
         assert_eq!(&got.payload[..], b"hello");
+    }
+
+    #[tokio::test]
+    async fn too_many_unknown_kinds_tears_down() {
+        let (mut w, mut r) = tokio::io::duplex(64 * 1024);
+        for _ in 0..(MAX_UNKNOWN_KIND_SKIPS + 1) {
+            let len = 5u32;
+            let mut unknown = Vec::from(len.to_be_bytes());
+            unknown.push(6);
+            unknown.extend_from_slice(&0u32.to_be_bytes());
+            w.write_all(&unknown).await.unwrap();
+        }
+        let err = read_frame(&mut r).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

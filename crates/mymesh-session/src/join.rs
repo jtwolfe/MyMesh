@@ -725,6 +725,82 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn run_join_as_guest_first_frame_is_join_request() {
+        let root = tmp_root("join-req");
+        let devices = root.join("devices.json");
+        let mesh = root.join("mesh.json");
+        MeshState::new_mesh().save(&mesh).unwrap();
+        let guest = Identity::generate();
+        let host_id = DeviceId::from_bytes([0x11; 32]);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let deny = Frame {
+            channel: ChannelId::control(),
+            payload: encode_msg(&ControlMessage::JoinDeny {
+                reason: "test".into(),
+            })
+            .unwrap(),
+        };
+        let conn = RecordGuestConn {
+            peer: host_id,
+            sent: sent.clone(),
+            reply: tokio::sync::Mutex::new(Some(deny)),
+        };
+        let mut store = DeviceStore::open(&devices).unwrap();
+        let err = run_join_as_guest(
+            Box::new(conn),
+            &guest,
+            "joiner",
+            &mut store,
+            &mesh,
+            Capability::all(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("test"));
+        let msgs = sent.lock().unwrap();
+        assert!(
+            matches!(msgs.first(), Some(ControlMessage::JoinRequest { .. })),
+            "{msgs:?}"
+        );
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, ControlMessage::OpenChannel { .. })),
+            "introduce must not OpenChannel: {msgs:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    struct RecordGuestConn {
+        peer: DeviceId,
+        sent: Arc<Mutex<Vec<ControlMessage>>>,
+        reply: tokio::sync::Mutex<Option<Frame>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PeerConnection for RecordGuestConn {
+        fn peer_id(&self) -> DeviceId {
+            self.peer
+        }
+        async fn send_frame(&self, frame: Frame) -> mymesh_core::Result<()> {
+            if let Ok(msg) = decode_msg::<ControlMessage>(&frame.payload) {
+                self.sent.lock().unwrap().push(msg);
+            }
+            Ok(())
+        }
+        async fn recv_frame(&self) -> mymesh_core::Result<Frame> {
+            self.reply
+                .lock()
+                .await
+                .take()
+                .ok_or_else(|| mymesh_core::Error::Other("no reply".into()))
+        }
+        async fn close(&self) -> mymesh_core::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn resolve_guest_grant_fail_closed() {
         let root = tmp_root("grant-resolve");

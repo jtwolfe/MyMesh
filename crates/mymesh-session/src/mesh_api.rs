@@ -1713,23 +1713,6 @@ async fn admin_rpc(State(st): State<MeshApiState>, headers: HeaderMap, body: Str
             "ts outside allowed skew (±5 min)",
         );
     }
-    let mut nonces = match AdminNonceStore::open_or_create(st.paths.admin_nonces_file()) {
-        Ok(s) => s,
-        Err(e) => {
-            return mesh_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                format!("admin nonces: {e}"),
-            );
-        }
-    };
-    if let Err(e) = nonces.insert(&env.nonce) {
-        return mesh_err(
-            StatusCode::CONFLICT,
-            "conflict",
-            format!("admin nonce replay: {e}"),
-        );
-    }
 
     tracing::info!(
         op = env.op.as_str(),
@@ -1826,26 +1809,31 @@ fn introduce_op(st: &MeshApiState, env: AdminEnvelope) -> Response {
 
     let store = match EnrollmentStore::open(st.paths.enrollments_file()) {
         Ok(s) => s,
-        Err(_) => {
-            tracing::info!(reason = "enrollment_pending", "introduce_denied");
+        Err(e) => {
             return mesh_err(
-                StatusCode::FORBIDDEN,
-                "enrollment_pending",
-                "joiner is not enrolled for this person (not can_drive)",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("enrollments: {e}"),
             );
         }
+    };
+    // Same 403 for missing enroll and bad sig so a LAN caller cannot
+    // enumerate who can_drive this box.
+    let unauthorized = || {
+        tracing::info!(reason = "enrollment_pending", "introduce_denied");
+        mesh_err(
+            StatusCode::FORBIDDEN,
+            "enrollment_pending",
+            "joiner is not enrolled for this person (not can_drive)",
+        )
     };
     let rec = match store.get(&env.person_id).filter(|e| e.can_drive) {
         Some(r) => r,
-        None => {
-            tracing::info!(reason = "enrollment_pending", "introduce_denied");
-            return mesh_err(
-                StatusCode::FORBIDDEN,
-                "enrollment_pending",
-                "joiner is not enrolled for this person (not can_drive)",
-            );
-        }
+        None => return unauthorized(),
     };
+    if rec.facet != env.facet {
+        return unauthorized();
+    }
     let pk = match mymesh_core::wire::parse_id32_hex(&rec.person_public_key_hex) {
         Ok(p) => p,
         Err(_) => {
@@ -1858,24 +1846,32 @@ fn introduce_op(st: &MeshApiState, env: AdminEnvelope) -> Response {
     };
     let pre = match env.preimage(&pk) {
         Ok(p) => p,
-        Err(e) => return mesh_err(StatusCode::BAD_REQUEST, e.code, e.message),
+        Err(_) => return unauthorized(),
     };
     let sig = match parse_sig_hex(&env.sig_hex) {
         Some(s) => s,
-        None => {
-            return mesh_err(
-                StatusCode::BAD_REQUEST,
-                "invalid_proof",
-                "sig_hex required (64-byte Ed25519 hex)",
-            );
-        }
+        None => return unauthorized(),
     };
     let pubk = IdentityPublic { verifying_key: pk };
     if pubk.verify(&pre, &sig).is_err() {
+        return unauthorized();
+    }
+
+    let mut nonces = match AdminNonceStore::open_or_create(st.paths.admin_nonces_file()) {
+        Ok(s) => s,
+        Err(e) => {
+            return mesh_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("admin nonces: {e}"),
+            );
+        }
+    };
+    if let Err(e) = nonces.insert(&env.nonce) {
         return mesh_err(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "introduce signature verification failed",
+            StatusCode::CONFLICT,
+            "conflict",
+            format!("admin nonce replay: {e}"),
         );
     }
 
@@ -3390,6 +3386,55 @@ mod tests {
         let (status, v) = post_admin_rpc(&app, &env).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(v["code"], "enrollment_pending");
+    }
+
+    #[tokio::test]
+    async fn introduce_bad_sig_same_403_as_pending() {
+        let paths = tmp_paths();
+        let secret = [0xB3u8; 32];
+        let joiner = Identity::from_secret_bytes(secret);
+        let resident = Identity::from_secret_bytes([0xA3u8; 32]);
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        let person = Identity::from_secret_bytes([0x42u8; 32]);
+        let pid = "01HZXPERSON0000000000000";
+        let ts = rfc3339(Utc::now());
+        let enroll = signed_enroll_body(&person, pid, &joiner.device_id(), &ts, &[0x14u8; 16]);
+        let mut store = EnrollmentStore::open_or_create(paths.enrollments_file()).unwrap();
+        store.add(&joiner.device_id(), &enroll).unwrap();
+        let st = test_state(paths.clone(), secret, "joiner-b");
+        let app = mesh_v1_routes(st);
+        let mut env = signed_introduce_env(
+            &person,
+            pid,
+            &joiner.device_id(),
+            &joiner.device_id(),
+            &resident.device_id(),
+            &ts,
+            &[0x24u8; 16],
+        );
+        let last = env.sig_hex.pop().unwrap();
+        env.sig_hex.push(if last == '0' { '1' } else { '0' });
+        let (status, v) = post_admin_rpc(&app, &env).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(v["code"], "enrollment_pending");
+
+        std::fs::write(
+            paths.enrollments_file(),
+            r#"{"version":99,"enrollments":[]}"#,
+        )
+        .unwrap();
+        let env2 = signed_introduce_env(
+            &person,
+            pid,
+            &joiner.device_id(),
+            &joiner.device_id(),
+            &resident.device_id(),
+            &ts,
+            &[0x25u8; 16],
+        );
+        let (status, v) = post_admin_rpc(&app, &env2).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(v["code"], "internal");
     }
 
     #[tokio::test]
