@@ -48,7 +48,7 @@ pub use grants::{
 };
 pub use identity::{DeviceId, DeviceLabel, NodeFingerprint};
 pub use join::{ArmState, JoinDecision, JoinStore, PendingJoin};
-pub use memberships::{write_init_primary, MembershipCatalog};
+pub use memberships::{write_init_primary, write_private_0600, MembershipCatalog};
 pub use mesh::{
     mark_mesh_dirty, mesh_dirty_mtime, KickNoticeRecord, MeshMember, MeshState, PendingKick,
     PendingKickStore,

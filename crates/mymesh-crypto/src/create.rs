@@ -9,7 +9,10 @@ use crate::master_key::{
 };
 use crate::Identity;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
-use mymesh_core::{write_init_primary, Capability, DeviceStore, Error, MeshState, Paths, Result};
+use mymesh_core::{
+    write_init_primary, write_private_0600, Capability, DeviceStore, Error, MeshState, Paths,
+    Result,
+};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -84,20 +87,7 @@ impl CreateWindowFile {
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let body = serde_json::to_string_pretty(self)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, body)?;
-        std::fs::rename(&tmp, path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(())
+        write_private_0600(path, serde_json::to_vec_pretty(self)?.as_slice())
     }
 
     pub fn clear(path: impl AsRef<Path>) -> Result<bool> {
@@ -121,11 +111,15 @@ pub enum CreateAuthMethod {
 pub fn check_create_authorized(
     create_window_path: impl AsRef<Path>,
 ) -> Result<(CreateAuthMethod, CreateWindowFile)> {
-    match CreateWindowFile::try_load(create_window_path)? {
+    let path = create_window_path.as_ref();
+    match CreateWindowFile::try_load(path)? {
         Some(win) if win.is_valid_now() => Ok((CreateAuthMethod::CreateWindow, win)),
-        Some(_) => Err(Error::PermissionDenied(
-            "create window expired — run mymesh mesh allow-create".into(),
-        )),
+        Some(_) => {
+            let _ = CreateWindowFile::clear(path);
+            Err(Error::PermissionDenied(
+                "create window expired — run mymesh mesh allow-create".into(),
+            ))
+        }
         None => Err(Error::PermissionDenied(
             "create_window_required: run mymesh mesh allow-create --secs 300 or enter password in TUI"
                 .into(),
@@ -163,16 +157,18 @@ impl Drop for FirstMeshInit {
     }
 }
 
-/// Wrap a new MRK, write `mesh-master.json`, set `mesh.json` display name,
-/// and persist a single primary `mesh-memberships.json` row.
+/// Wrap a new MRK, exclusive-create `mesh-master.json`, write recovery-once,
+/// set `mesh.json` display name, and persist a single primary catalog row.
 ///
-/// Refuses if `mesh-master.json` already exists (`mesh_already_inited`).
+/// Returns `Ok` only when master **and** recovery-once exist. Exclusive create
+/// means a second writer is `mesh_already_inited` and does not touch recovery.
 pub fn apply_first_mesh_init(
     paths: &Paths,
     password: &[u8],
     display_name: &str,
     params: Option<KdfParams>,
     keep_unlocked: bool,
+    generated_password: Option<String>,
 ) -> Result<FirstMeshInit> {
     if MeshMasterFile::exists(paths.mesh_master_file()) {
         return Err(Error::PermissionDenied("mesh_already_inited".into()));
@@ -183,7 +179,16 @@ pub fn apply_first_mesh_init(
     let name = sanitize_display_name(display_name)?;
     paths.ensure()?;
     let init = mesh_init(password, params)?;
-    init.file.save(paths.mesh_master_file())?;
+    init.file.save_new(paths.mesh_master_file())?;
+
+    if let Err(e) = write_recovery_once(
+        paths.mesh_recovery_once_file(),
+        &init.recovery_codes,
+        generated_password.as_deref(),
+    ) {
+        let _ = std::fs::remove_file(paths.mesh_master_file());
+        return Err(e);
+    }
 
     let identity = Identity::load_or_create(paths.identity_file())?;
     let mut mesh = MeshState::load(paths.mesh_file())?;
@@ -211,13 +216,15 @@ pub fn apply_first_mesh_init(
         let _ = MmkRuntime::clear(paths.mmk_runtime_file());
     }
 
-    let created_on = mesh.created_at.to_rfc3339_opts(SecondsFormat::Secs, true);
+    let _ = CreateWindowFile::clear(paths.create_window_file());
+
+    let created_on = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     Ok(FirstMeshInit {
         init,
         mesh_id: mesh.mesh_id,
         display_name: name,
         created_on,
-        generated_password: None,
+        generated_password,
     })
 }
 
@@ -251,16 +258,8 @@ pub fn write_recovery_once(
     for (i, code) in codes.iter().enumerate() {
         body.push_str(&format!("{:>2}.  {}\n", i + 1, code.display_hex()));
     }
-    let tmp = path.with_extension("txt.tmp");
-    std::fs::write(&tmp, body.as_bytes())?;
-    // Best-effort wipe of the in-memory copy we just wrote.
+    write_private_0600(path, body.as_bytes())?;
     body.zeroize();
-    std::fs::rename(&tmp, path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
     Ok(())
 }
 
@@ -309,20 +308,6 @@ pub fn clear_tui_attached(path: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
-pub fn tui_is_attached(path: impl AsRef<Path>) -> bool {
-    let path = path.as_ref();
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    let Ok(modified) = meta.modified() else {
-        return path.exists();
-    };
-    match std::time::SystemTime::now().duration_since(modified) {
-        Ok(age) => age.as_secs() < 300,
-        Err(_) => true,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,10 +354,12 @@ mod tests {
             "Home",
             Some(test_params()),
             false,
+            None,
         )
         .unwrap();
         assert_eq!(first.display_name, "Home");
         assert!(MeshMasterFile::exists(paths.mesh_master_file()));
+        assert!(paths.mesh_recovery_once_file().exists());
         let cat = mymesh_core::MembershipCatalog::try_load(paths.mesh_memberships_file())
             .unwrap()
             .unwrap();
@@ -385,9 +372,85 @@ mod tests {
             "Studio",
             Some(test_params()),
             false,
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("mesh_already_inited"));
+        let _ = std::fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn recovery_write_failure_rolls_back_master() {
+        let paths = tmp_paths();
+        std::fs::create_dir_all(paths.mesh_recovery_once_file()).unwrap();
+        let err = apply_first_mesh_init(
+            &paths,
+            b"test-mmk-password-ok",
+            "Home",
+            Some(test_params()),
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(!MeshMasterFile::exists(paths.mesh_master_file()));
+        assert!(
+            err.to_string().contains("Is a directory")
+                || err.to_string().contains("directory")
+                || err.to_string().contains("0600")
+                || err.to_string().contains("io"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn exclusive_create_second_writer_does_not_overwrite_recovery() {
+        let paths = tmp_paths();
+        let params = test_params();
+        let p1 = paths.clone();
+        let p2 = paths.clone();
+        let h1 = std::thread::spawn(move || {
+            apply_first_mesh_init(
+                &p1,
+                b"test-mmk-password-ok",
+                "Home",
+                Some(params),
+                false,
+                None,
+            )
+        });
+        let h2 = std::thread::spawn(move || {
+            apply_first_mesh_init(
+                &p2,
+                b"other-mmk-password-ok",
+                "Studio",
+                Some(params),
+                false,
+                None,
+            )
+        });
+        let r1 = h1.join().unwrap();
+        let r2 = h2.join().unwrap();
+        let wins = r1.is_ok() as u8 + r2.is_ok() as u8;
+        assert_eq!(wins, 1, "exactly one exclusive create");
+        let loser_msg = match (&r1, &r2) {
+            (Err(e), Ok(_)) | (Ok(_), Err(e)) => e.to_string(),
+            _ => panic!("expected one win and one lose"),
+        };
+        assert!(loser_msg.contains("mesh_already_inited"));
+        let winner = r1.ok().or_else(|| r2.ok()).unwrap();
+        let master = MeshMasterFile::load(paths.mesh_master_file()).unwrap();
+        assert_eq!(master.mrk_fingerprint, winner.init.file.mrk_fingerprint);
+        let rec = std::fs::read_to_string(paths.mesh_recovery_once_file()).unwrap();
+        for h in &master.recovery_code_hashes {
+            let _ = h;
+        }
+        for code in &winner.init.recovery_codes {
+            assert!(
+                rec.contains(&code.display_hex()),
+                "recovery file must match surviving master"
+            );
+        }
         let _ = std::fs::remove_dir_all(paths.data_dir.parent().unwrap());
     }
 

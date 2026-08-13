@@ -29,8 +29,8 @@ pub use continuity::{
 };
 pub use create::{
     apply_first_mesh_init, check_create_authorized, clear_tui_attached, generate_mmk_password,
-    mark_tui_attached, sanitize_display_name, take_recovery_once, tui_is_attached,
-    write_recovery_once, CreateAuthMethod, CreateWindowFile, FirstMeshInit,
+    mark_tui_attached, sanitize_display_name, take_recovery_once, write_recovery_once,
+    CreateAuthMethod, CreateWindowFile, FirstMeshInit,
 };
 pub use identity::{Identity, IdentityPublic};
 pub use master_key::{

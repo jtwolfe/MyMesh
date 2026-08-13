@@ -7,6 +7,7 @@ use crate::wire::{
 };
 use crate::{Error, Result};
 use chrono::{SecondsFormat, Utc};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Persist / load this node's membership catalog.
@@ -66,23 +67,39 @@ pub fn write_init_primary(path: impl AsRef<Path>, mesh_id: &str) -> Result<MeshM
             source: "init".into(),
         }],
     };
-    save_memberships(path, &file)?;
+    write_private_0600(path.as_ref(), serde_json::to_vec_pretty(&file)?.as_slice())?;
     Ok(file)
 }
 
-fn save_memberships(path: impl AsRef<Path>, file: &MeshMembershipsFile) -> Result<()> {
+/// Write `bytes` via a 0600 tmp file, then rename. Fails if dest is not 0600.
+pub fn write_private_0600(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let body = serde_json::to_string_pretty(file)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body)?;
+    let tmp = path.with_extension("tmp.0600");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
     std::fs::rename(&tmp, path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(Error::Config(format!(
+                "{}: expected mode 0600, got {mode:04o}",
+                path.display()
+            )));
+        }
     }
     Ok(())
 }

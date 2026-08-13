@@ -19,6 +19,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::path::Path;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -253,8 +254,8 @@ pub fn verify_mrk_proof_ed25519_with_vk(
 pub fn sign_mrk_proof_hmac(mrk: &Mrk, challenge: &[u8]) -> MrkAdminProof {
     let key = admin_mac_key(mrk);
     let pre = mrk_proof_preimage(challenge);
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(&key)
-        .expect("HMAC-SHA256 accepts 32-byte key");
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(&key).expect("HMAC-SHA256 accepts 32-byte key");
     mac.update(&pre);
     let tag = mac.finalize().into_bytes();
     MrkAdminProof {
@@ -314,7 +315,11 @@ pub struct WrappedMrk {
 }
 
 /// Derive 32-byte wrap key via Argon2id.
-pub fn derive_wrap_key(password: &[u8], salt: &[u8], params: &KdfParams) -> Result<[u8; WRAP_KEY_LEN]> {
+pub fn derive_wrap_key(
+    password: &[u8],
+    salt: &[u8],
+    params: &KdfParams,
+) -> Result<[u8; WRAP_KEY_LEN]> {
     let params = params.validate()?;
     let argon_params = argon2::Params::new(params.m, params.t, params.p, Some(WRAP_KEY_LEN))
         .map_err(|e| Error::MasterKey(format!("argon2 params: {e}")))?;
@@ -590,6 +595,50 @@ impl MeshMasterFile {
         Ok(())
     }
 
+    /// First-init only: `create_new` so a second writer cannot overwrite.
+    ///
+    /// Recover/rotate keep [`Self::save`]. Failure is `mesh_already_inited`.
+    pub fn save_new(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if path.exists() {
+            return Err(Error::PermissionDenied("mesh_already_inited".into()));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let body = serde_json::to_string_pretty(self)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Error::PermissionDenied("mesh_already_inited".into())
+            } else {
+                e.into()
+            }
+        })?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                let _ = std::fs::remove_file(path);
+                return Err(Error::MasterKey(format!(
+                    "mesh-master.json expected mode 0600, got {mode:04o}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn exists(path: impl AsRef<Path>) -> bool {
         path.as_ref().exists()
     }
@@ -641,9 +690,8 @@ pub fn mesh_recover_with_code(
     new_password: &[u8],
     params: Option<KdfParams>,
 ) -> Result<(MeshMasterFile, Mrk)> {
-    let idx = find_recovery_code(code, &file.recovery_code_hashes).ok_or_else(|| {
-        Error::MasterKey("invalid recovery code".into())
-    })?;
+    let idx = find_recovery_code(code, &file.recovery_code_hashes)
+        .ok_or_else(|| Error::MasterKey("invalid recovery code".into()))?;
     let params = params.unwrap_or(file.kdf_params).validate()?;
     let mrk = Mrk::generate();
     let wrapped = wrap_mrk(new_password, &mrk, &params)?;
@@ -666,8 +714,11 @@ pub fn mesh_rotate_password(
     let mrk = mesh_unlock_password(file, current_password)?;
     let params = params.unwrap_or(file.kdf_params).validate()?;
     let wrapped = wrap_mrk(new_password, &mrk, &params)?;
-    let mut new_file =
-        MeshMasterFile::from_wrap(&wrapped, mrk.fingerprint(), file.recovery_code_hashes.clone());
+    let mut new_file = MeshMasterFile::from_wrap(
+        &wrapped,
+        mrk.fingerprint(),
+        file.recovery_code_hashes.clone(),
+    );
     new_file.created_at = file.created_at;
     new_file.rotated_at = Some(Utc::now());
     Ok((new_file, mrk))
@@ -707,9 +758,7 @@ impl MmkRuntime {
         arr.copy_from_slice(&bytes);
         let mrk = Mrk(arr);
         if mrk.fingerprint() != self.mrk_fingerprint {
-            return Err(Error::MasterKey(
-                "runtime fingerprint mismatch".into(),
-            ));
+            return Err(Error::MasterKey("runtime fingerprint mismatch".into()));
         }
         Ok(mrk)
     }
@@ -818,7 +867,11 @@ mod tests {
         assert_eq!(mrk.as_bytes(), init.mrk.as_bytes());
 
         // recovery code hashes match
-        for (code, h) in init.recovery_codes.iter().zip(loaded.recovery_code_hashes.iter()) {
+        for (code, h) in init
+            .recovery_codes
+            .iter()
+            .zip(loaded.recovery_code_hashes.iter())
+        {
             assert_eq!(&code.hash_hex(), h);
         }
 
@@ -874,7 +927,13 @@ mod tests {
 
     #[test]
     fn kdf_params_range_enforced() {
-        assert!(KdfParams { m: 1000, t: 3, p: 1 }.validate().is_err());
+        assert!(KdfParams {
+            m: 1000,
+            t: 3,
+            p: 1
+        }
+        .validate()
+        .is_err());
         assert!(KdfParams {
             m: 65_536,
             t: 1,
@@ -914,7 +973,10 @@ mod tests {
         let labels = [HKDF_ADMIN_SIGN, HKDF_ADMIN_MAC];
         for l in labels {
             let s = std::str::from_utf8(l).unwrap();
-            assert!(!s.contains("person"), "label {s} must not be person hierarchy");
+            assert!(
+                !s.contains("person"),
+                "label {s} must not be person hierarchy"
+            );
             assert!(s.starts_with("mymesh/mrk/"));
         }
     }
@@ -949,7 +1011,9 @@ mod tests {
         let vk = admin_verifying_key_bytes(&mrk);
         assert!(verify_mrk_proof_ed25519_with_vk(&vk, challenge, &proof));
         let bad_vk = [0u8; 32];
-        assert!(!verify_mrk_proof_ed25519_with_vk(&bad_vk, challenge, &proof));
+        assert!(!verify_mrk_proof_ed25519_with_vk(
+            &bad_vk, challenge, &proof
+        ));
     }
 
     #[test]

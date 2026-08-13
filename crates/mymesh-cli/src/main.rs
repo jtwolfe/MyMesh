@@ -2393,6 +2393,8 @@ fn cmd_mesh_init(
     if MeshMasterFile::exists(&path) && force {
         std::fs::remove_file(&path)
             .with_context(|| format!("remove {} for --force", path.display()))?;
+        // Stale one-shot codes would belong to the previous MRK.
+        let _ = std::fs::remove_file(paths.mesh_recovery_once_file());
     }
     let password = read_mmk_password(password_file.as_deref(), "New mesh master password", true)?;
     let display_name = name
@@ -2403,7 +2405,8 @@ fn cmd_mesh_init(
                 .filter(|s| !s.is_empty())
         })
         .unwrap_or_else(|| "Home".into());
-    let first = apply_first_mesh_init(paths, password.as_bytes(), &display_name, None, false)?;
+    let first =
+        apply_first_mesh_init(paths, password.as_bytes(), &display_name, None, false, None)?;
     let init = &first.init;
 
     // Existing Trusted devices: leave capabilities as stored (no Admin auto-grant).
