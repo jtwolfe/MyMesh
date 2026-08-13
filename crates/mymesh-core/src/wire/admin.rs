@@ -14,6 +14,14 @@ pub const ADMIN_ENVELOPE_DOMAIN: &[u8] = b"carrier-admin-v1";
 pub const ADMIN_ENVELOPE_VERSION: u32 = 1;
 /// Max envelope size (JSON bytes).
 pub const ADMIN_ENVELOPE_MAX_BYTES: usize = 64 * 1024;
+/// Max opaque mailbox PUT (sealed blob). Same budget as the envelope.
+pub const ADMIN_MAILBOX_MAX_BYTES: usize = ADMIN_ENVELOPE_MAX_BYTES;
+/// Mailbox bind / message TTL (no disk log of bodies).
+pub const ADMIN_MAILBOX_TTL_SECS: u64 = 15 * 60;
+/// Inbox/outbox long-poll (serve poller).
+pub const ADMIN_MAILBOX_POLL_MS: u64 = 25_000;
+/// Bind `ts` skew (±5 min), same as enroll / AdminEnvelope.
+pub const ADMIN_BIND_SKEW_SECS: i64 = 5 * 60;
 /// HKDF info / AAD prefix for HintBlob.
 pub const ADMIN_HINT_INFO: &[u8] = b"carrier-admin-hint-v1";
 /// HintBlob format version.
@@ -293,6 +301,28 @@ pub struct AdminSealPayload {
     pub ciphertext: String,
 }
 
+/// Parse a mailbox inbox body. Raw `AdminEnvelope` JSON is rejected (seal required).
+pub fn parse_admin_seal_payload(bytes: &[u8]) -> Result<AdminSealPayload, AdminWireError> {
+    if bytes.len() > ADMIN_MAILBOX_MAX_BYTES {
+        return Err(AdminWireError::bad_request("admin mailbox blob too large"));
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| AdminWireError::bad_request("seal required"))?;
+    if v.get("wrap").and_then(|x| x.as_str()).is_none()
+        || v.get("nonce").and_then(|x| x.as_str()).is_none()
+        || v.get("ciphertext").and_then(|x| x.as_str()).is_none()
+    {
+        return Err(AdminWireError::bad_request("seal required"));
+    }
+    serde_json::from_value(v).map_err(|_| AdminWireError::bad_request("seal required"))
+}
+
+/// `mailbox_id = sha256(url)[0..16]` hex. Never store the URL on a device row.
+pub fn mailbox_id_from_url(url: &str) -> String {
+    let digest = Sha256::digest(url.trim().as_bytes());
+    hex::encode(&digest[..16])
+}
+
 /// `carrier-admin-seal-v1 || nonce_16 || sha256(envelope_canonical_bytes)`.
 pub fn admin_seal_preimage(nonce: &[u8; 16], envelope_canonical_bytes: &[u8]) -> Vec<u8> {
     let hash = Sha256::digest(envelope_canonical_bytes);
@@ -436,5 +466,21 @@ mod tests {
             &pre[MAILBOX_BIND_DOMAIN.len()..MAILBOX_BIND_DOMAIN.len() + 32],
             &did
         );
+    }
+
+    #[test]
+    fn parse_seal_rejects_raw_envelope() {
+        let json = br#"{"v":1,"op":"introduce","target_device_id_hex":"aa","ts":"t","nonce":"n","person_id":"p","facet":"personal","payload_json":"{}","sig_hex":"00"}"#;
+        let err = parse_admin_seal_payload(json).expect_err("seal required");
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("seal required"));
+    }
+
+    #[test]
+    fn mailbox_id_is_truncated_sha256_hex() {
+        let id = mailbox_id_from_url("https://mailbox.example");
+        assert_eq!(id.len(), 32);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(id, mailbox_id_from_url("https://other.example"));
     }
 }

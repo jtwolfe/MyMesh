@@ -202,6 +202,7 @@ pub async fn start_pair_http(
 
     let bootstrap = Arc::new(Mutex::new(None));
     let rate_limits = Arc::new(RateLimitState::new());
+    let label_for_poller = label.clone();
     let st = CarrierState {
         paths: paths.clone(),
         secret: identity.to_secret_bytes(),
@@ -233,6 +234,17 @@ pub async fn start_pair_http(
         %host_base,
         "pair/v2 + mesh/v1 listening (serve-owned)"
     );
+
+    if let Ok(cfg) = mymesh_core::Config::load(paths.config_file()) {
+        if let Some(mailbox_url) = cfg.admin_mailbox_url() {
+            crate::spawn_admin_mailbox_poller(
+                paths.clone(),
+                identity.to_secret_bytes(),
+                label_for_poller,
+                mailbox_url,
+            );
+        }
+    }
 
     tokio::spawn(async move {
         // ConnectInfo peer IP for S9 IP-scoped rate limits (not client-spoofable XFF).

@@ -20,6 +20,9 @@ pub use local_dial::{
     serve_dial_proxy, serve_owns_pair_http, ArmPairQrResponse, LocalAdmin, ADMIN_MAGIC, DIAL_MAGIC,
 };
 pub use mailbox_fs::{default_local_mailbox_dir, open_default_fs, FsMailbox};
-pub use mailbox_http::{run_mailbox_server, HttpMailbox};
+pub use mailbox_http::{
+    mailbox_router, run_mailbox_server, run_mailbox_server_with_metrics, AdminMailboxClient,
+    AdminMailboxError, HttpMailbox, ADMIN_MAILBOX_MAX_BYTES_NET, ADMIN_MAILBOX_POLL_MS_NET,
+};
 pub use rendezvous::{LocalRendezvous, Rendezvous};
 pub use traits::{PeerConnection, Transport};

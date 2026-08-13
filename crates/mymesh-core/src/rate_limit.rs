@@ -9,8 +9,8 @@
 //! | `GrantMutate` | 30 / min / session | **File-backed** |
 //! | `AdminEnvelope` | 30 / min / person_id | **File-backed** (F4p: serve is the consumer) |
 //! | `EnrollWrite` | 10 / min / person_id | **File-backed** (CLI add; HTTP F4) |
-//! | `MailboxBind` | 10 / min / ip | **File-backed** (F4p type; mailbox poller F6) |
-//! | `MailboxPut` | 30 / min / did | **File-backed** (F4p type; mailbox poller F6) |
+//! | `MailboxBind` | 10 / min / ip | **File-backed** (`mymesh mailbox` bind) |
+//! | `MailboxPut` | 30 / min / did | **File-backed** (`mymesh mailbox` inbox PUT) |
 //! | `PairStatus` | 60 / min / ip | **In-process** (`RateLimitState` on carrier) — same process as status HTTP |
 //! | `MeshAuthChallenge` | 30 / min / ip | **In-process** (carrier mesh routes) |
 //!
@@ -72,12 +72,12 @@ pub const ENROLL_WRITE: Policy = Policy {
     max: 10,
     window: Duration::from_secs(60),
 };
-/// Mailbox device bind — 10 / min / ip (F1 type; unused this PR).
+/// Mailbox device bind — 10 / min / ip.
 pub const MAILBOX_BIND: Policy = Policy {
     max: 10,
     window: Duration::from_secs(60),
 };
-/// Mailbox inbox put — 30 / min / did (F1 type; unused this PR).
+/// Mailbox inbox put — 30 / min / did.
 pub const MAILBOX_PUT: Policy = Policy {
     max: 30,
     window: Duration::from_secs(60),

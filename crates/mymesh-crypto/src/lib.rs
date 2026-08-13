@@ -7,7 +7,9 @@
 //! - Mesh master key (MMK): Argon2id wrap of mesh root key (MRK)
 //! - Owner claim preimage + sealed person backup (S4)
 //! - Continuity pack v1 seal/open (S8 host unwrap)
+//! - AdminEnvelope mailbox seal (F6)
 
+mod admin_seal;
 mod continuity;
 mod identity;
 mod master_key;
@@ -16,6 +18,7 @@ mod pairing;
 mod word_id;
 mod words;
 
+pub use admin_seal::{open_admin_envelope, seal_admin_envelope, AdminSealError};
 pub use continuity::{
     ed25519_pk_to_x25519, ed25519_seed_to_x25519, open_continuity_pack,
     open_continuity_pack_for_device, parse_continuity_pack_json, seal_continuity_pack,
@@ -34,8 +37,8 @@ pub use master_key::{
     sign_mrk_proof_ed25519, sign_mrk_proof_hmac, unwrap_mrk, verify_mrk_admin_proof,
     verify_mrk_proof_ed25519, verify_mrk_proof_ed25519_with_vk, verify_mrk_proof_hmac, wrap_mrk,
     KdfParams, MeshInitResult, MeshMasterFile, MmkRuntime, Mrk, MrkAdminProof, MrkProofMethod,
-    RecoveryCode, WrappedMrk, DEFAULT_M_KIB, DEFAULT_P, DEFAULT_T, HKDF_ADMIN_MAC,
-    HKDF_ADMIN_SIGN, MRK_PROOF_DOMAIN, RECOVERY_CODE_COUNT,
+    RecoveryCode, WrappedMrk, DEFAULT_M_KIB, DEFAULT_P, DEFAULT_T, HKDF_ADMIN_MAC, HKDF_ADMIN_SIGN,
+    MRK_PROOF_DOMAIN, RECOVERY_CODE_COUNT,
 };
 pub use owner::{
     accept_owner_claim, check_claim_authorized, owner_claim_preimage, resolve_claim_fingerprint,
