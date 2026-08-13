@@ -163,6 +163,9 @@ pub struct PairHttpHandle {
     pub url: String,
     pub bind: SocketAddr,
     /// Base `http://IP:port` for pair API (no trailing slash).
+    ///
+    /// Embedded in QR `host=` as a **private last-mile hint** (KD-F18). Never
+    /// render this URL in product chrome.
     pub host_base: String,
     /// Arm-scoped v1 bootstrap token if join is currently armed.
     pub v1_bootstrap_token: Option<String>,
@@ -173,6 +176,8 @@ pub struct CarrierHandle {
     pub url: String,
     pub bind: SocketAddr,
     /// Base `http://IP:port` for pair API (no trailing slash).
+    ///
+    /// QR `host=` private last-mile hint (KD-F18). Do not display.
     pub host_base: String,
     /// Bootstrap token embedded in `pair_qr` (base64url, no padding).
     ///
@@ -183,6 +188,9 @@ pub struct CarrierHandle {
     ///
     /// Default (D5 / KD23): `carrier://pair?v=2&sid&did&token&nonce&fp&ep=direct&host&mesh?`
     /// Escape (`pair_v1`): `carrier://pair?v=1&host&token&fp&mesh?`
+    ///
+    /// `host=` stays in the payload as a private last-mile hint (KD-F18 / F9).
+    /// Do not strip it; do not print it in the TUI.
     pub pair_qr: String,
     /// Protocol version of `pair_qr` (`1` or `2`).
     pub pair_protocol_version: u32,
@@ -254,7 +262,11 @@ pub async fn start_pair_http(
     })
 }
 
-/// Mint a pair/v2 session + QR_A (`host` is for the QR payload only — do not render).
+/// Mint a pair/v2 session + QR_A.
+///
+/// `host_base` is written into QR `host=` as a private last-mile hint (KD-F18).
+/// Callers must not display it. Do not omit it to "hide IPs" — that deletes
+/// the automatic LAN enroll bootstrap (F9 wontfix).
 pub fn arm_pair_qr(
     paths: &Paths,
     identity: &Identity,
@@ -342,12 +354,14 @@ impl LocalAdmin for PairArmAdmin {
 /// Start carrier HTTP facade + emit bootstrap QR.
 ///
 /// * `pair_v1 == false` (default product path): mint a **pair/v2** PairSession
-///   (`ep=direct`) and print a v2 QR that includes LAN `host`.
+///   (`ep=direct`) and a v2 QR that still includes LAN `host=` as a **private
+///   last-mile hint** (KD-F18). F9 does **not** strip `host=`.
 /// * `pair_v1 == true` (`mymesh carrier --pair-v1`): emit alpha.1 **v1** LAN QR
 ///   using the arm-scoped bootstrap token (escape hatch during compat window).
 ///
 /// `/pair/v1/*` and `/pair/v2/*` endpoints are both served regardless of QR version.
-/// Lab-only when serve is down — serve owns `:17878` after F4p.
+/// Lab-only when serve is down — serve owns `:17878` after F4p. Do not render
+/// `host_base` / the raw QR URI in the TUI.
 pub async fn start_carrier(
     paths: Paths,
     identity: Identity,

@@ -115,7 +115,9 @@ pub async fn cmd_pair_dual(
     println!("  until   {:?}", arm.until);
     println!("  phase   {}", sess.phase.as_str());
     if let Some(h) = &host {
-        println!("  host    {h}");
+        println!(
+            "  host    {h}  (private last-mile hint; serve owns /pair/v2 — not product copy)"
+        );
     } else {
         println!(
             "  mode    confirm-on-machine (no host) — after joiner dials: mymesh pair confirm <code>"

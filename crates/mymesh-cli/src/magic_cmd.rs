@@ -404,17 +404,17 @@ pub async fn cmd_carrier(paths: &Paths, port: u16, pair_v1: bool) -> Result<()> 
     };
     println!("{}", style("connect by carrier").bold());
     println!(
-        "  pair API  {}/{}  (QR v{})",
-        handle.host_base, pair_prefix, handle.pair_protocol_version
+        "  pair API  /{}  (QR v{}; host= is a private last-mile hint)",
+        pair_prefix, handle.pair_protocol_version
     );
-    println!("  page      {}  (deprecated HTML fallback)", handle.url);
+    println!("  page      (deprecated HTML fallback; URL not shown)");
     if pair_v1 {
         println!("  mode      pair/v1 LAN escape (--pair-v1)");
     } else {
         println!("  mode      pair/v2 default (use --pair-v1 for alpha.1 LAN QR)");
     }
     println!();
-    println!("  scan this QR with Carrier (same LAN):");
+    println!("  scan this QR with Carrier (lab CLI prints the payload):");
     println!("  {}", handle.pair_qr);
     if let Ok(code) = QrCode::new(handle.pair_qr.as_bytes()) {
         let qr = code
@@ -615,7 +615,8 @@ pub fn magic_status_text(paths: &Paths) -> Result<String> {
 /// Start or arm pair/v2 QR; returns page URL (internal) and pair QR deep link.
 ///
 /// When serve owns `:17878`, arms via MMA1 (no second HTTP bind). Lab fallback
-/// binds only if serve/port is down. TUI must not display `host_base`.
+/// binds only if serve/port is down. The QR still includes `host=` as a private
+/// last-mile hint (KD-F18 / F9 — do not strip). TUI must not display `host_base`.
 pub async fn start_carrier_ui(paths: &Paths, port: u16) -> Result<(String, String)> {
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file())?;

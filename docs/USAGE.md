@@ -101,17 +101,18 @@ Arm auto-disarms after accept / timeout.
 Internet-first decide without requiring phone HTTP to the host. Full demo checklist: **[DEMO-PAIR.md](DEMO-PAIR.md)**. Contract: [PAIR-V2.md](PAIR-V2.md).
 
 ```bash
-# Machine A (resident) — mymesh serve must be running
+# Machine A (resident) — mymesh serve must be running (owns :17878 /pair/v2 + /mesh/v1)
 mymesh pair dual                    # QR_A v2 (nonce; ep=confirm if no --host)
-# optional LAN HTTP decide (mymesh serve owns :17878 /pair/v2 — dual --host only sets the QR hint):
+# optional: put a private last-mile hint in QR_A (not product copy; TUI / start_carrier already emit host=):
 # mymesh pair dual --host http://<lan-ip>:17878
 
 # Machine B (joiner)
 mymesh pair dual --join --resident <did-or-words-from-A>   # QR_B + iroh dial
 
 # Phone: scan QR_A then QR_B → L2 Accept/Deny
-#   host reachable (carrier up) → POST /pair/v2/decide
-#   else → confirm codes on phone; on A:
+#   default → confirm codes + enroll-via-hint (POST /enrollments using host= privately)
+#   Advanced LAN helper / HTTP decide → POST /pair/v2/decide
+#   then on A:
 mymesh pair confirm <CODE>          # Crockford 4-4; hyphens optional
 mymesh pair status                  # optional
 ```
@@ -120,7 +121,7 @@ mymesh pair status                  # optional
 
 ### Connect-by-carrier (phone as scanner — default pair/v2 QR)
 
-Phone must reach the **carrier pair API** on one machine (same LAN, or open carrier port carefully). Default bootstrap QR is **pair/v2** with LAN `host` + `ep=direct` (D5 / KD23). Prefer dual-scan + confirm above when phone cannot reach host HTTP.
+Default bootstrap QR is **pair/v2** with LAN `host=` + `ep=direct` (D5 / KD23). That `host=` is a **private last-mile hint** (never shown in the TUI). Serve owns `/pair/v2`. Prefer dual-scan + confirm above; HTTP decide is Carrier Advanced LAN helper.
 
 ```bash
 # Machine A — serve owns /pair/v2 + /mesh/v1 on :17878; TUI arms QR via MMA1

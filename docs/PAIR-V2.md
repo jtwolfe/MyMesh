@@ -305,21 +305,23 @@ See [CARRIER-ADMIN-NEXT.md](CARRIER-ADMIN-NEXT.md) for the three frozen reads (`
 2. Machine B (joiner): mymesh pair dual --join --resident <did_A|words>
    → iroh join toward A; QR_B (did_B, fp_B, label) for phone
 3. Phone: Scan A → SessionDraft; Scan B → bind joiner; show both fps → L2 Accept/Deny
-4a. If host reachable: POST /pair/v2/decide with SessionDecision
-4b. Else: show code_accept / code_deny; user: mymesh pair confirm <code> on A
+4a. Default: show code_accept / code_deny; enroll-via-hint if host= cached; user: mymesh pair confirm <code> on A
+4b. Advanced LAN helper: POST /pair/v2/decide with SessionDecision
 5. A writes JoinStore decision for bound joiner only; phase decided → completing
 6. Existing join loop take_decision → JoinAccept; B Trusted on A
 7. B applies host trust; member path sends membership snapshot (guest path: see GUEST.md)
 8. phase completed; audit on phone if used
 ```
 
-### Wave A decide priority (Carrier after dual-scan bound)
+### Wave A / F9 decide priority (Carrier after dual-scan bound)
 
 ```text
-1. If host hint present → try POST /pair/v2/decide (2s timeout)
-2. Else → show confirm codes; user runs mymesh pair confirm <code>
+1. Default: confirm codes + enroll-via-hint (POST /enrollments via private host= hint)
+2. Advanced LAN helper / “use HTTP decide”: try POST /pair/v2/decide (2s timeout)
 3. Relay — not in Wave A
 ```
+
+`host=` on QR_A is a private last-mile hint (never render). F9 does not strip it from `start_carrier`. `mymesh serve` owns `/pair/v2`.
 
 ### Artifacts
 
