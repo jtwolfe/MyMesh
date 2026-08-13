@@ -342,6 +342,9 @@ TUI may try `pkexec` for elevation when available.
 
 ```bash
 mymesh mesh
+mymesh mesh init                    # first MMK on this box (TTY prints recovery codes)
+mymesh mesh allow-create --secs 300 # let Carrier POST /meshes init an uninited box
+mymesh mesh recovery-show-once      # print + delete mesh-recovery-once.txt
 mymesh mesh sync
 mymesh kick <device>                # interactive double confirm
 ```

@@ -10,6 +10,7 @@ mod event_metrics;
 mod grants;
 mod identity;
 mod join;
+mod memberships;
 mod mesh;
 mod mesh_ip;
 mod metrics;
@@ -47,6 +48,7 @@ pub use grants::{
 };
 pub use identity::{DeviceId, DeviceLabel, NodeFingerprint};
 pub use join::{ArmState, JoinDecision, JoinStore, PendingJoin};
+pub use memberships::{write_init_primary, MembershipCatalog};
 pub use mesh::{
     mark_mesh_dirty, mesh_dirty_mtime, KickNoticeRecord, MeshMember, MeshState, PendingKick,
     PendingKickStore,

@@ -13,7 +13,10 @@ use mymesh_core::{
     apply_pair_confirm, record_pair_decide, ArmState, Config, DeviceStore, JoinStore, MeshState,
     NodeFingerprint, PairSessionStore, Paths, PeerMetrics, PendingKickStore, TrustState,
 };
-use mymesh_crypto::{device_id_to_words, device_join_uri, Identity};
+use mymesh_crypto::{
+    clear_tui_attached, device_id_to_words, device_join_uri, mark_tui_attached, take_recovery_once,
+    CreateWindowFile, Identity, MeshMasterFile,
+};
 use mymesh_protocol::FileEntry;
 use qrcode::QrCode;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -203,6 +206,8 @@ enum PromptKind {
     DenyRequest,
     ExposePort,
     PairConfirm,
+    AllowCreatePassword,
+    RecoveryShow,
 }
 
 impl Default for PromptKind {
@@ -217,6 +222,8 @@ struct Prompt {
     title: String,
     hint: String,
     buf: String,
+    /// Multi-line body for RecoveryShow (never logged).
+    detail: String,
 }
 
 struct App {
@@ -248,6 +255,8 @@ struct App {
     pending_size: Option<(u16, u16)>,
     /// When pending_size last changed — used to debounce Hyprland fullscreen storms.
     pending_since: Option<Instant>,
+    /// Esc on recovery modal: keep file, do not re-open this session.
+    recovery_snooze: bool,
 }
 
 pub async fn run_tui(paths: Paths) -> Result<()> {
@@ -317,12 +326,15 @@ pub async fn run_tui(paths: Paths) -> Result<()> {
         term_size: (0, 0),
         pending_size: None,
         pending_since: None,
+        recovery_snooze: false,
     };
+    let _ = mark_tui_attached(app.paths.tui_attached_file());
     ensure_pair_qr_a(&mut app).await;
 
     let res = run_loop(&mut terminal, &mut app).await;
 
     term_pane::disconnect(&mut app.term);
+    let _ = clear_tui_attached(app.paths.tui_attached_file());
 
     disable_raw_mode()?;
     execute!(
@@ -676,6 +688,7 @@ async fn run_loop(
             note_pending_size(app, w, h);
         }
         try_apply_settled_resize(terminal, app)?;
+        maybe_open_recovery_modal(app);
 
         terminal.draw(|f| ui(f, app))?;
         if app.should_quit {
@@ -733,16 +746,24 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
     if app.prompt.kind != PromptKind::None {
         match code {
             KeyCode::Esc => {
+                if app.prompt.kind == PromptKind::RecoveryShow {
+                    app.recovery_snooze = true;
+                    app.status = "recovery file kept — run mymesh mesh recovery-show-once".into();
+                } else {
+                    app.status = "cancelled".into();
+                }
                 app.prompt = Prompt::default();
-                app.status = "cancelled".into();
             }
-            KeyCode::Backspace => {
+            KeyCode::Backspace if app.prompt.kind != PromptKind::RecoveryShow => {
                 app.prompt.buf.pop();
             }
             KeyCode::Enter => {
                 submit_prompt(app).await;
             }
-            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(c)
+                if !mods.contains(KeyModifiers::CONTROL)
+                    && app.prompt.kind != PromptKind::RecoveryShow =>
+            {
                 app.prompt.buf.push(c);
             }
             _ => {}
@@ -887,6 +908,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 "Pair confirm code",
                 "4-4 code from Carrier after Accept (hyphens optional)",
             ),
+            KeyCode::Char('M') => start_allow_create(app),
             KeyCode::Char('h') => {
                 app.detail =
                     crate::magic_cmd::hosts_text(&app.paths).unwrap_or_else(|e| e.to_string());
@@ -1272,6 +1294,7 @@ async fn click_button(app: &mut App, id: &str) {
             "Pair confirm code",
             "4-4 code from Carrier after Accept",
         ),
+        "allow_create" => start_allow_create(app),
         "copy_id" => copy_id(app),
         "words" => show_words(app),
         "ping" => ping_sel(app).await,
@@ -1459,8 +1482,45 @@ fn start_prompt(app: &mut App, kind: PromptKind, title: &str, hint: &str) {
         title: title.into(),
         hint: hint.into(),
         buf: String::new(),
+        detail: String::new(),
     };
     app.status = format!("{title} — type then Enter (Esc cancel)");
+}
+
+fn maybe_open_recovery_modal(app: &mut App) {
+    if app.prompt.kind != PromptKind::None || app.recovery_snooze {
+        return;
+    }
+    let path = app.paths.mesh_recovery_once_file();
+    if !path.exists() {
+        return;
+    }
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    if body.trim().is_empty() {
+        return;
+    }
+    app.prompt = Prompt {
+        kind: PromptKind::RecoveryShow,
+        title: "Mesh recovery codes — save now".into(),
+        hint: "Enter deletes the file · Esc keeps it for `mymesh mesh recovery-show-once`".into(),
+        buf: String::new(),
+        detail: body,
+    };
+}
+
+fn start_allow_create(app: &mut App) {
+    if MeshMasterFile::exists(app.paths.mesh_master_file()) {
+        app.status = "mesh already inited — pick another box (no dual-MMK)".into();
+        return;
+    }
+    start_prompt(
+        app,
+        PromptKind::AllowCreatePassword,
+        "Allow phone create (MMK password)",
+        "new master password — stays on this box",
+    );
 }
 
 fn show_words(app: &mut App) {
@@ -1652,6 +1712,28 @@ async fn submit_prompt(app: &mut App) {
                 Err(e) => app.status = format!("pair confirm: {e}"),
             }
         }
+        PromptKind::AllowCreatePassword => {
+            if buf.is_empty() {
+                app.status = "password must not be empty".into();
+                return;
+            }
+            let win = CreateWindowFile::mint(300, Some(buf));
+            match win.save(app.paths.create_window_file()) {
+                Ok(()) => {
+                    app.status =
+                        "create window open 300s — Carrier POST /meshes may init this box".into();
+                }
+                Err(e) => app.status = format!("allow-create: {e}"),
+            }
+        }
+        PromptKind::RecoveryShow => match take_recovery_once(app.paths.mesh_recovery_once_file()) {
+            Ok(Some(_)) => {
+                app.recovery_snooze = false;
+                app.status = "recovery file deleted after show".into();
+            }
+            Ok(None) => app.status = "recovery file already gone".into(),
+            Err(e) => app.status = format!("recovery: {e}"),
+        },
         PromptKind::ExposePort => {
             let peers = load_peers(&app.paths);
             if peers.is_empty() {
@@ -2558,6 +2640,7 @@ fn draw_action_bar(f: &mut TuiFrame, area: Rect, app: &mut App) {
             ("carrier", "[C] Carrier"),
             ("pair_qr", "[P] Pair QR"),
             ("pair_confirm", "[f] Confirm"),
+            ("allow_create", "[M] Allow create"),
             ("copy_id", "[c] ID"),
             ("words", "[w] Words"),
             ("quit", "[q] Quit"),
@@ -2643,19 +2726,31 @@ fn draw_prompt_overlay(f: &mut TuiFrame, app: &App) {
     if app.prompt.kind == PromptKind::None {
         return;
     }
-    let area = centered_rect(70, 7, f.area());
+    let recovery = app.prompt.kind == PromptKind::RecoveryShow;
+    let area = if recovery {
+        centered_rect(80, 22, f.area())
+    } else {
+        centered_rect(70, 7, f.area())
+    };
     f.render_widget(Clear, area);
-    let text = format!(
-        "{}\n{}\n\n> {}\n\nEnter confirm · Esc cancel",
-        app.prompt.title, app.prompt.hint, app.prompt.buf
-    );
+    let text = if recovery {
+        format!(
+            "{}\n{}\n\n{}\n\nEnter deletes file · Esc keeps it",
+            app.prompt.title, app.prompt.hint, app.prompt.detail
+        )
+    } else {
+        format!(
+            "{}\n{}\n\n> {}\n\nEnter confirm · Esc cancel",
+            app.prompt.title, app.prompt.hint, app.prompt.buf
+        )
+    };
     f.render_widget(
         Paragraph::new(text)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" input ")
-                    .border_style(Style::default().fg(C_ACCENT))
+                    .title(if recovery { " recovery " } else { " input " })
+                    .border_style(Style::default().fg(if recovery { C_WARN } else { C_ACCENT }))
                     .style(Style::default().bg(Color::Rgb(24, 24, 36))),
             )
             .wrap(Wrap { trim: false }),

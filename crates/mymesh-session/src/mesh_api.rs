@@ -22,6 +22,7 @@
 //! GET  /mesh/v1/enrollments             # host-local | person_enrolled (own) | mrk_proof
 //! POST /mesh/v1/enrollments             # carrier-enroll-v1 person sig | host-local
 //! DELETE /mesh/v1/enrollments/{id}      # own person_enrolled | host-local | mrk_proof
+//! POST /mesh/v1/meshes                 # person_enrolled + create window + no mesh-master
 //! ```
 //!
 //! Auth methods (S0 freeze / CARRIER-NEXT Issue 4):
@@ -68,9 +69,10 @@ use mymesh_core::{
     MeshState, NodeFingerprint, PairPhase, PairSessionStore, Paths, RateLimitState, TrustState,
 };
 use mymesh_crypto::{
-    accept_owner_claim, check_claim_authorized, open_continuity_pack_for_device,
-    resolve_claim_fingerprint, verify_wipe_token, ClaimAuthMethod, ContinuityPack,
-    ContinuityStatus, Identity, IdentityPublic, MeshMasterFile, MeshOwnerFile, MmkRuntime, Mrk,
+    accept_owner_claim, apply_first_mesh_init, check_claim_authorized, check_create_authorized,
+    generate_mmk_password, open_continuity_pack_for_device, resolve_claim_fingerprint,
+    verify_wipe_token, write_recovery_once, ClaimAuthMethod, ContinuityPack, ContinuityStatus,
+    CreateWindowFile, Identity, IdentityPublic, MeshMasterFile, MeshOwnerFile, MmkRuntime, Mrk,
     OwnerBackupSealed, OwnerClaimRequest, CONTINUITY_MAX_CIPHERTEXT_BYTES, CONTINUITY_PACK_VERSION,
     HKDF_ADMIN_SIGN,
 };
@@ -246,6 +248,8 @@ struct TopologyMember {
 struct MeshErrorBody {
     error: String,
     code: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'static str>,
 }
 
 // ── Router attachment ───────────────────────────────────────────────────────
@@ -291,6 +295,7 @@ pub fn mesh_v1_routes(st: MeshApiState) -> Router {
             "/mesh/v1/enrollments/{person_id}",
             delete(enrollments_revoke),
         )
+        .route("/mesh/v1/meshes", post(meshes_create))
         .with_state(st)
 }
 
@@ -358,11 +363,21 @@ fn rfc3339(dt: DateTime<Utc>) -> String {
 }
 
 fn mesh_err(status: StatusCode, code: &'static str, error: impl Into<String>) -> Response {
+    mesh_err_detail(status, code, error, None)
+}
+
+fn mesh_err_detail(
+    status: StatusCode,
+    code: &'static str,
+    error: impl Into<String>,
+    detail: Option<&'static str>,
+) -> Response {
     (
         status,
         Json(MeshErrorBody {
             error: error.into(),
             code,
+            detail,
         }),
     )
         .into_response()
@@ -1674,6 +1689,166 @@ async fn enrollments_revoke(
             format!("revoke: {e}"),
         ),
     }
+}
+
+// ── POST /meshes (first init only) ───────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct CreateMeshBody {
+    display_name: String,
+    #[serde(default)]
+    claim_after: bool,
+}
+
+#[derive(Serialize)]
+struct CreateMeshResponse {
+    ok: bool,
+    mesh_id: String,
+    display_name: String,
+    created_on: String,
+    claimed: bool,
+    mrk_fingerprint: String,
+    served_by_device_id_hex: String,
+    /// Recovery lives on the node (TUI modal or mesh-recovery-once.txt). Never codes.
+    recovery: &'static str,
+}
+
+/// `POST /mesh/v1/meshes` — first `mesh init` iff no mesh-master.
+///
+/// Auth: `person_enrolled` or host-local. Requires a live create window
+/// (`mymesh mesh allow-create` / TUI). Phone never receives MMK.
+async fn meshes_create(
+    State(st): State<MeshApiState>,
+    OptionalPeer(peer): OptionalPeer,
+    headers: HeaderMap,
+    Json(body): Json<CreateMeshBody>,
+) -> Response {
+    if let Err(r) = check_x_mesh_id(&st.paths, &headers) {
+        return r;
+    }
+    let host_local = is_host_local(peer);
+    if !host_local {
+        let session = match require_mesh_session(&st, &headers).await {
+            Ok(s) => s,
+            Err(r) => return r,
+        };
+        if session.auth_mode != AuthMethod::PersonEnrolled {
+            return mesh_err(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "POST /meshes requires person_enrolled or host-local",
+            );
+        }
+    }
+
+    if MeshMasterFile::exists(st.paths.mesh_master_file()) {
+        return mesh_err_detail(
+            StatusCode::CONFLICT,
+            "mesh_already_inited",
+            format!(
+                "{} already has a mesh master. Pick a box that has not been inited, or use CLI on that machine.",
+                st.label
+            ),
+            Some("mesh_already_inited"),
+        );
+    }
+
+    let (_auth, win) = match check_create_authorized(st.paths.create_window_file()) {
+        Ok(x) => x,
+        Err(e) => {
+            let msg = e.to_string();
+            let code = if msg.contains("expired") {
+                "create_window_expired"
+            } else {
+                "create_window_required"
+            };
+            return mesh_err(
+                StatusCode::FORBIDDEN,
+                code,
+                format!(
+                    "{msg}; unlock is not enough — run mymesh mesh allow-create --secs 300 or enter a password in the TUI"
+                ),
+            );
+        }
+    };
+
+    let mut generated = None;
+    let password = if let Some(ref pw) = win.password {
+        pw.clone()
+    } else {
+        let g = generate_mmk_password();
+        generated = Some(g.clone());
+        g
+    };
+    let kdf = win.kdf_params;
+
+    let mut first = match apply_first_mesh_init(
+        &st.paths,
+        password.as_bytes(),
+        &body.display_name,
+        kdf,
+        body.claim_after,
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("mesh_already_inited") {
+                return mesh_err_detail(
+                    StatusCode::CONFLICT,
+                    "mesh_already_inited",
+                    format!(
+                        "{} already has a mesh master. Pick a box that has not been inited, or use CLI on that machine.",
+                        st.label
+                    ),
+                    Some("mesh_already_inited"),
+                );
+            }
+            if msg.contains("display_name") {
+                return mesh_err(StatusCode::BAD_REQUEST, "bad_request", msg);
+            }
+            return mesh_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("mesh init: {msg}"),
+            );
+        }
+    };
+
+    first.generated_password = generated;
+    // Recovery never leaves the node (not HTTP, not logs).
+    if let Err(e) = write_recovery_once(
+        st.paths.mesh_recovery_once_file(),
+        &first.init.recovery_codes,
+        first.generated_password.as_deref(),
+    ) {
+        return mesh_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("recovery-once: {e}"),
+        );
+    }
+    let _ = CreateWindowFile::clear(st.paths.create_window_file());
+
+    tracing::info!(
+        mesh_id = %first.mesh_id,
+        display_name = %first.display_name,
+        source = "http",
+        claim_after = body.claim_after,
+        "mesh_init"
+    );
+
+    let host = host_identity(&st.secret);
+    Json(CreateMeshResponse {
+        ok: true,
+        mesh_id: first.mesh_id.clone(),
+        display_name: first.display_name.clone(),
+        created_on: first.created_on.clone(),
+        claimed: false,
+        mrk_fingerprint: first.init.file.mrk_fingerprint.clone(),
+        served_by_device_id_hex: host.device_id().to_string(),
+        recovery: "on_node",
+    })
+    .into_response()
 }
 
 async fn require_mesh_session(
@@ -3023,6 +3198,197 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    async fn person_enrolled_token(
+        app: &axum::Router,
+        person: &Identity,
+        person_id: &str,
+        host: &Identity,
+    ) -> String {
+        let (_, ch) = get_challenge(app, "/mesh/v1/auth/challenge").await;
+        let cid = ch["challenge_id"].as_str().unwrap().to_string();
+        let nonce = decode_b64_32(ch["nonce"].as_str().unwrap()).unwrap();
+        let pre = person_enrolled_auth_preimage(&cid, &nonce, host.device_id().as_bytes());
+        let sig = person.sign(&pre);
+        let sess_body = serde_json::json!({
+            "challenge_id": cid,
+            "method": "person_enrolled",
+            "person_id": person_id,
+            "sig_hex": hex::encode(sig),
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/auth/session")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(sess_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        json_body(resp).await["session_token"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn mint_create_window(paths: &Paths, password: &str) {
+        let mut win = CreateWindowFile::mint(300, Some(password.into()));
+        win.kdf_params = Some(mymesh_crypto::KdfParams {
+            m: 64_000,
+            t: 2,
+            p: 1,
+        });
+        win.save(paths.create_window_file()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_meshes_first_init_then_409() {
+        let paths = tmp_paths();
+        let secret = [0xE7u8; 32];
+        let host = Identity::from_secret_bytes(secret);
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        let person = Identity::from_secret_bytes([0x42u8; 32]);
+        let ts = rfc3339(Utc::now());
+        let enroll = signed_enroll_body(
+            &person,
+            "01HZXPERSON0000000000000",
+            &host.device_id(),
+            &ts,
+            &[0x77u8; 16],
+        );
+        let mut store = EnrollmentStore::open_or_create(paths.enrollments_file()).unwrap();
+        store.add(&host.device_id(), &enroll).unwrap();
+        mint_create_window(&paths, "test-mmk-password-ok");
+
+        let st = test_state(paths.clone(), secret, "Kitchen-PC");
+        let app = mesh_v1_routes(st);
+        let token = person_enrolled_token(&app, &person, "01HZXPERSON0000000000000", &host).await;
+
+        let body = serde_json::json!({
+            "display_name": "Home",
+            "claim_after": false
+        });
+        let resp = app
+            .clone()
+            .oneshot(with_remote(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/meshes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["display_name"], "Home");
+        assert_eq!(v["claimed"], false);
+        assert_eq!(v["recovery"], "on_node");
+        assert!(v["mesh_id"].as_str().unwrap().len() > 8);
+        // Phone never receives codes or the password.
+        let dumped = v.to_string();
+        assert!(!dumped.contains("recovery_codes"));
+        assert!(!dumped.contains("test-mmk-password-ok"));
+
+        assert!(MeshMasterFile::exists(paths.mesh_master_file()));
+        let mesh = MeshState::load(paths.mesh_file()).unwrap();
+        assert_eq!(mesh.display_name.as_deref(), Some("Home"));
+        let cat = mymesh_core::MembershipCatalog::try_load(paths.mesh_memberships_file())
+            .unwrap()
+            .unwrap();
+        assert_eq!(cat.file().primary_mesh_id, mesh.mesh_id);
+        assert_eq!(cat.file().memberships[0].source, "init");
+        assert!(paths.mesh_recovery_once_file().exists());
+        let rec = std::fs::read_to_string(paths.mesh_recovery_once_file()).unwrap();
+        assert!(rec.contains("Recovery codes"));
+        assert!(!rec.contains("test-mmk-password-ok")); // operator-supplied
+
+        // Second create — 409 even with a fresh window + session.
+        mint_create_window(&paths, "other-password-xxxx");
+        let token2 = person_enrolled_token(&app, &person, "01HZXPERSON0000000000000", &host).await;
+        let resp = app
+            .clone()
+            .oneshot(with_remote(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/meshes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token2}"))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let err = json_body(resp).await;
+        assert_eq!(err["code"], "mesh_already_inited");
+        assert!(err["error"]
+            .as_str()
+            .unwrap()
+            .contains("Kitchen-PC already has a mesh master"));
+    }
+
+    #[tokio::test]
+    async fn post_meshes_requires_window_and_enroll() {
+        let paths = tmp_paths();
+        let secret = [0xE8u8; 32];
+        let host = Identity::from_secret_bytes(secret);
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        let person = Identity::from_secret_bytes([0x42u8; 32]);
+        let enroll = signed_enroll_body(
+            &person,
+            "01HZXPERSON0000000000000",
+            &host.device_id(),
+            &rfc3339(Utc::now()),
+            &[0x78u8; 16],
+        );
+        let mut store = EnrollmentStore::open_or_create(paths.enrollments_file()).unwrap();
+        store.add(&host.device_id(), &enroll).unwrap();
+
+        let st = test_state(paths.clone(), secret, "host-a");
+        let app = mesh_v1_routes(st);
+        let token = person_enrolled_token(&app, &person, "01HZXPERSON0000000000000", &host).await;
+        let body = serde_json::json!({ "display_name": "Home" });
+
+        // No create window → 403.
+        let resp = app
+            .clone()
+            .oneshot(with_remote(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/meshes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json_body(resp).await["code"], "create_window_required");
+
+        // Remote without Bearer → 401.
+        mint_create_window(&paths, "test-mmk-password-ok");
+        let resp = app
+            .oneshot(with_remote(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/meshes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

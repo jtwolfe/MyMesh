@@ -817,7 +817,7 @@ mymesh enroll revoke <person_id>
 mymesh enroll add --person-id … --facet personal|work \
   --ts … --nonce … --person-pubkey … --sig-file …   # airgap; flags = preimage
 mymesh mesh init                                 # existing; F7 Carrier create calls this
-mymesh mesh allow-create --secs 300
+mymesh mesh allow-create --secs 300              # F7 — MMK window for POST /meshes
 mymesh mesh recovery-show-once                   # prints + deletes mesh-recovery-once.txt
 mymesh memberships list
 mymesh memberships add --mesh <id> --role guest  # --role member errors until F8b
