@@ -18,6 +18,8 @@ impl ChannelKind {
             3 => Some(Self::Files),
             4 => Some(Self::Desktop),
             5 => Some(Self::Tcp),
+            // 6 reserved (Wave F / KD-F17): future admin frame kind. Do not
+            // send. No ChannelKind variant this wave — mixed-mesh safety.
             _ => None,
         }
     }
@@ -64,5 +66,16 @@ impl ChannelId {
             kind: ChannelKind::Tcp,
             stream,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_kind_6_reserved_unmapped() {
+        assert_eq!(ChannelKind::from_u8(6), None);
+        assert_eq!(ChannelKind::from_u8(5), Some(ChannelKind::Tcp));
     }
 }

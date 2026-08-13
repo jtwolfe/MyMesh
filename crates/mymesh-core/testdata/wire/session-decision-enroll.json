@@ -1,0 +1,12 @@
+{
+  "sid": "01HZXPAIRSESSION0000000000",
+  "decision": "accept",
+  "joiner_device_id_hex": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+  "resident_device_id_hex": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+  "ts": "2026-08-12T12:00:00Z",
+  "nonce": "IiIiIiIiIiIiIiIiIiIiIg",
+  "person_id": "01HZXPERSON0000000000000",
+  "sig_hex": "ae579e54837cf9c884529503dfe6c04f8f4f2c22ea68362bdb0920ed541abf78f7d2992a84cf3cac836bb0fdf0f1be35da63c9310848b51a9d7f76133a2d5203",
+  "facet": "personal",
+  "person_public_key_hex": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12"
+}

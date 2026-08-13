@@ -138,7 +138,10 @@ pub struct SessionDecision {
     pub ts: String, // RFC3339
     pub nonce: String, // from session; binds decide
     pub person_id: Option<String>,
-    pub sig_hex: Option<String>, // optional person sig Wave A (audit only)
+    pub sig_hex: Option<String>, // Wave A: optional audit sig over SessionDecision bytes
+    // Wave F1 additive (`serde(default)`). Omit / null = pair-only.
+    pub facet: Option<"personal" | "work">,
+    pub person_public_key_hex: Option<String>, // 64 hex
 }
 ```
 
@@ -286,6 +289,11 @@ Authorization: Bearer <token>
 7. Idempotent: if phase already `decided|completing|completed` with same decision+joiner → ok; if different decision → conflict.
 8. Optional person `sig_hex` over canonical SessionDecision bytes — audit only in Wave A.
 9. If armed + single pending: bind first (same as confirm); if zero pending: **409 `not_bound`**.
+10. **Enroll (F4, not confirm):** if `person_id`, `facet`, `person_public_key_hex`, and `sig_hex` are **all** present, verify `sig_hex` over **`carrier-enroll-v1`** (not SessionDecision canonical bytes) and write the resident enrollments row. Any of those four absent → pair-only. Present but bad sig / unknown facet → skip enroll; pair decide may still succeed. Confirm-on-machine does **not** enroll.
+
+`host=` on QR_A remains a **private last-mile hint** (never render). After F4p, `mymesh serve` owns `/pair/v2` + `/mesh/v1`; standalone `mymesh carrier` is lab-only.
+
+See [CARRIER-ADMIN-NEXT.md](CARRIER-ADMIN-NEXT.md) for the three frozen reads (`GET /mesh/v1/enrollments`, `GET /mesh/v1/memberships`, `GET /mesh/v1/topology` unchanged) and `person_enrolled` (device-scoped auth preimage).
 
 ---
 

@@ -16,6 +16,7 @@ mod pair_session;
 mod paths;
 mod rate_limit;
 mod tls_pin;
+pub mod wire;
 
 pub use config::{Config, DaemonConfig, Limits, MagicConfig};
 pub use continuity::{
@@ -61,8 +62,9 @@ pub use rate_limit::{
     check as rate_limit_check, check_shared as rate_limit_check_shared,
     clear_shared_for_tests as rate_limit_clear_shared_for_tests, client_ip_key,
     metrics_dir_from_pair_sessions, reset_for_tests as rate_limit_reset_for_tests,
-    trust_proxy_enabled, LimitKind, Policy, RateLimitState, RateLimited, GRANT_MUTATE,
-    HOST_LOCAL_SESSION, MESH_AUTH_CHALLENGE, OWNER_BACKUP_UNWRAP, PAIR_DECIDE, PAIR_STATUS,
+    trust_proxy_enabled, LimitKind, Policy, RateLimitState, RateLimited, ADMIN_ENVELOPE,
+    ENROLL_WRITE, GRANT_MUTATE, HOST_LOCAL_SESSION, MAILBOX_BIND, MAILBOX_PUT, MESH_AUTH_CHALLENGE,
+    OWNER_BACKUP_UNWRAP, PAIR_DECIDE, PAIR_STATUS,
 };
 pub use tls_pin::{
     check_direct_host_tls_pin, host_is_http_cleartext, host_is_https, parse_tls_pin,
