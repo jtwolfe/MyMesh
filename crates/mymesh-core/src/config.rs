@@ -12,6 +12,9 @@ pub struct Config {
     /// HTTP mailbox base URL for SPAKE2 rendezvous (e.g. http://127.0.0.1:9876).
     #[serde(default)]
     pub rendezvous_url: Option<String>,
+    /// Self-host admin mailbox (`mymesh mailbox` `/v1/admin/*`). Not a public product.
+    #[serde(default)]
+    pub admin_mailbox_url: Option<String>,
     /// Shared directory mailbox (cross-process, same host / NFS).
     #[serde(default)]
     pub mailbox_dir: Option<PathBuf>,
@@ -30,6 +33,7 @@ impl Default for Config {
             daemon: DaemonConfig::default(),
             limits: Limits::default(),
             rendezvous_url: std::env::var("MYMESH_MAILBOX").ok(),
+            admin_mailbox_url: std::env::var("MYMESH_ADMIN_MAILBOX").ok(),
             mailbox_dir: std::env::var_os("MYMESH_MAILBOX_DIR").map(PathBuf::from),
             sandbox_root: None,
             magic: MagicConfig::default(),
@@ -92,6 +96,28 @@ impl Default for MagicConfig {
 }
 
 impl Config {
+    /// Admin mailbox base URL (self-host only). Prefers dedicated config/env, then SPAKE URL.
+    pub fn admin_mailbox_url(&self) -> Option<String> {
+        let pick = |s: &str| {
+            let t = s.trim().trim_end_matches('/');
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        };
+        self.admin_mailbox_url
+            .as_deref()
+            .and_then(pick)
+            .or_else(|| {
+                std::env::var("MYMESH_ADMIN_MAILBOX")
+                    .ok()
+                    .as_deref()
+                    .and_then(pick)
+            })
+            .or_else(|| self.rendezvous_url.as_deref().and_then(pick))
+    }
+
     pub fn effective_sandbox_root(&self) -> PathBuf {
         if let Some(p) = &self.sandbox_root {
             return p.clone();

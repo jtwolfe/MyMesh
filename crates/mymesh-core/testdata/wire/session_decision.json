@@ -1,0 +1,8 @@
+{
+  "decision": "accept",
+  "joiner_device_id_hex": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+  "nonce": "IiIiIiIiIiIiIiIiIiIiIg",
+  "resident_device_id_hex": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+  "sid": "01HZXPAIRSESSION0000000000",
+  "ts": "2026-08-12T12:00:00Z"
+}

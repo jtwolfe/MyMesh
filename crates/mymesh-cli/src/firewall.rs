@@ -39,7 +39,7 @@ when you want LAN clients (e.g. a phone for connect-by-carrier) to reach this
 machine.
 
 {}
-  TCP {}   connect-by-carrier web page  (mymesh carrier)
+  TCP {}   pair/v2 + mesh/v1 HTTP  (mymesh serve; lab carrier if serve is down)
            bind: 0.0.0.0 — blocked by default UFW on many desktops
 
 {} (normally no firewall rule)
@@ -194,7 +194,7 @@ pub fn ufw_allow() -> Result<()> {
         "{} ufw allow {CARRIER_TCP}/tcp comment '{RULE_COMMENT}'",
         style("plan").yellow().bold()
     );
-    println!("  purpose: mymesh carrier (LAN phone page)");
+    println!("  purpose: mymesh serve pair HTTP (LAN phone last-mile)");
     let st = Command::new("ufw")
         .args([
             "allow",

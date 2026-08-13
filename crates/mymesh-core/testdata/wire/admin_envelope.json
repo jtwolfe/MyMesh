@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "op": "enroll_ack",
+  "target_device_id_hex": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+  "mesh_id": "550e8400-e29b-41d4-a716-446655440000",
+  "ts": "2026-08-13T12:00:00Z",
+  "nonce": "MzMzMzMzMzMzMzMzMzMzMw",
+  "person_id": "01HZXPERSON0000000000000",
+  "facet": "personal",
+  "payload_json": "{\"person_id\":\"01HZXPERSON0000000000000\",\"facet\":\"personal\",\"target_device_id_hex\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"ts\":\"2026-08-13T12:00:00Z\",\"nonce\":\"MzMzMzMzMzMzMzMzMzMzMw\",\"person_public_key_hex\":\"2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12\",\"enroll_sig_hex\":\"beff01e897fe7e9b50b5988d6739da604bbd625c75226a652d0080348eeacfb843572e9c302c21c063b25c7ba1ccf02200cbd2ac0e97a8bbf661a701f443d50a\",\"label\":\"kitchen-phone\"}",
+  "sig_hex": "cbcacab60da579cf0717023be01eb28c0649dbae289fbd79b2994a222ec356f5d4fc9fed8686ba2a0c53922fb9f7b7e7181bbb400a33d2c5f8a65a223ded2f09"
+}

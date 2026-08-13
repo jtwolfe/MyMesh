@@ -7,6 +7,10 @@
 //! | `PairDecide` | 10 / min / token | **File-backed** under `metrics_dir/rate-limits.json` so carrier HTTP decide and CLI `pair confirm` share one budget on the same host |
 //! | `OwnerBackupUnwrap` | 5 / 15 min / person_id | **File-backed** (CLI unwrap attempts across processes) |
 //! | `GrantMutate` | 30 / min / session | **File-backed** |
+//! | `AdminEnvelope` | 30 / min / person_id | **File-backed** (F4p: serve is the consumer) |
+//! | `EnrollWrite` | 10 / min / person_id | **File-backed** (CLI add; HTTP F4) |
+//! | `MailboxBind` | 10 / min / ip | **File-backed** (`mymesh mailbox` bind) |
+//! | `MailboxPut` | 30 / min / did | **File-backed** (`mymesh mailbox` inbox PUT) |
 //! | `PairStatus` | 60 / min / ip | **In-process** (`RateLimitState` on carrier) — same process as status HTTP |
 //! | `MeshAuthChallenge` | 30 / min / ip | **In-process** (carrier mesh routes) |
 //!
@@ -58,6 +62,26 @@ pub const GRANT_MUTATE: Policy = Policy {
     max: 30,
     window: Duration::from_secs(60),
 };
+/// AdminEnvelope RPC — 30 / min / person_id (F1; F4p file-backed on serve).
+pub const ADMIN_ENVELOPE: Policy = Policy {
+    max: 30,
+    window: Duration::from_secs(60),
+};
+/// Enroll write — 10 / min / person_id (CLI add; HTTP F4).
+pub const ENROLL_WRITE: Policy = Policy {
+    max: 10,
+    window: Duration::from_secs(60),
+};
+/// Mailbox device bind — 10 / min / ip.
+pub const MAILBOX_BIND: Policy = Policy {
+    max: 10,
+    window: Duration::from_secs(60),
+};
+/// Mailbox inbox put — 30 / min / did.
+pub const MAILBOX_PUT: Policy = Policy {
+    max: 30,
+    window: Duration::from_secs(60),
+};
 
 /// Which limiter bucket to consult.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -67,6 +91,10 @@ pub enum LimitKind {
     MeshAuthChallenge,
     OwnerBackupUnwrap,
     GrantMutate,
+    AdminEnvelope,
+    EnrollWrite,
+    MailboxBind,
+    MailboxPut,
 }
 
 impl LimitKind {
@@ -77,6 +105,10 @@ impl LimitKind {
             Self::MeshAuthChallenge => MESH_AUTH_CHALLENGE,
             Self::OwnerBackupUnwrap => OWNER_BACKUP_UNWRAP,
             Self::GrantMutate => GRANT_MUTATE,
+            Self::AdminEnvelope => ADMIN_ENVELOPE,
+            Self::EnrollWrite => ENROLL_WRITE,
+            Self::MailboxBind => MAILBOX_BIND,
+            Self::MailboxPut => MAILBOX_PUT,
         }
     }
 
@@ -87,14 +119,24 @@ impl LimitKind {
             Self::MeshAuthChallenge => "mesh_auth_challenge",
             Self::OwnerBackupUnwrap => "owner_backup_unwrap",
             Self::GrantMutate => "grant_mutate",
+            Self::AdminEnvelope => "admin_envelope",
+            Self::EnrollWrite => "enroll_write",
+            Self::MailboxBind => "mailbox_bind",
+            Self::MailboxPut => "mailbox_put",
         }
     }
 
-    /// Kinds that must share budget across carrier + CLI processes.
+    /// Kinds that persist under `metrics_dir/rate-limits.json` (serve-owned after F4p).
     pub fn is_file_backed(self) -> bool {
         matches!(
             self,
-            Self::PairDecide | Self::OwnerBackupUnwrap | Self::GrantMutate
+            Self::PairDecide
+                | Self::OwnerBackupUnwrap
+                | Self::GrantMutate
+                | Self::AdminEnvelope
+                | Self::EnrollWrite
+                | Self::MailboxBind
+                | Self::MailboxPut
         )
     }
 }
@@ -243,6 +285,14 @@ struct FileStore {
     owner_backup_unwrap: HashMap<String, UnixWindow>,
     #[serde(default)]
     grant_mutate: HashMap<String, UnixWindow>,
+    #[serde(default)]
+    admin_envelope: HashMap<String, UnixWindow>,
+    #[serde(default)]
+    enroll_write: HashMap<String, UnixWindow>,
+    #[serde(default)]
+    mailbox_bind: HashMap<String, UnixWindow>,
+    #[serde(default)]
+    mailbox_put: HashMap<String, UnixWindow>,
 }
 
 impl FileStore {
@@ -268,11 +318,11 @@ impl FileStore {
     fn save(&self, metrics_dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(metrics_dir)?;
         let path = Self::path(metrics_dir);
-        let tmp = metrics_dir.join(format!(
-            "rate-limits.{}.tmp",
-            std::process::id()
-        ));
-        std::fs::write(&tmp, serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".into()))?;
+        let tmp = metrics_dir.join(format!("rate-limits.{}.tmp", std::process::id()));
+        std::fs::write(
+            &tmp,
+            serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".into()),
+        )?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -287,6 +337,10 @@ impl FileStore {
             LimitKind::PairDecide => Some(&mut self.pair_decide),
             LimitKind::OwnerBackupUnwrap => Some(&mut self.owner_backup_unwrap),
             LimitKind::GrantMutate => Some(&mut self.grant_mutate),
+            LimitKind::AdminEnvelope => Some(&mut self.admin_envelope),
+            LimitKind::EnrollWrite => Some(&mut self.enroll_write),
+            LimitKind::MailboxBind => Some(&mut self.mailbox_bind),
+            LimitKind::MailboxPut => Some(&mut self.mailbox_put),
             _ => None,
         }
     }
@@ -409,7 +463,10 @@ pub fn check(kind: LimitKind, key: &str) -> Result<(), RateLimited> {
 
 /// Clear process-local fallback windows (tests only). Does **not** wipe disk files.
 pub fn reset_for_tests() {
-    fallback_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    fallback_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 fn clear_fallback_for_tests() {
@@ -468,7 +525,11 @@ pub fn trust_proxy_enabled() -> bool {
 /// 1. If `MYMESH_TRUST_PROXY` is set: first `X-Forwarded-For` hop, else `X-Real-IP`.
 /// 2. Else (default, direct LAN carrier): TCP `peer` IP only — **ignore** client XFF.
 /// 3. No peer (tests without `ConnectInfo`): `"unknown"`.
-pub fn client_ip_key(peer: Option<SocketAddr>, headers_xff: Option<&str>, headers_real_ip: Option<&str>) -> String {
+pub fn client_ip_key(
+    peer: Option<SocketAddr>,
+    headers_xff: Option<&str>,
+    headers_real_ip: Option<&str>,
+) -> String {
     if trust_proxy_enabled() {
         if let Some(xff) = headers_xff {
             if let Some(first) = xff.split(',').next() {
@@ -561,6 +622,40 @@ mod tests {
             check_shared(&dir, LimitKind::PairDecide, key).unwrap();
         }
         assert!(check_shared(&dir, LimitKind::PairDecide, key).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f1_kinds_are_file_backed() {
+        for kind in [
+            LimitKind::AdminEnvelope,
+            LimitKind::EnrollWrite,
+            LimitKind::MailboxBind,
+            LimitKind::MailboxPut,
+        ] {
+            assert!(kind.is_file_backed(), "{kind:?}");
+        }
+        assert_eq!(LimitKind::AdminEnvelope.policy().max, 30);
+        assert_eq!(LimitKind::MailboxBind.policy().max, 10);
+        assert_eq!(LimitKind::MailboxPut.policy().max, 30);
+        assert_eq!(LimitKind::EnrollWrite.policy().max, 10);
+    }
+
+    #[test]
+    fn admin_envelope_file_backed_persists() {
+        let dir = tmp_metrics();
+        clear_shared_for_tests(&dir);
+        let key = "person-admin";
+        for _ in 0..ADMIN_ENVELOPE.max {
+            check_shared(&dir, LimitKind::AdminEnvelope, key).unwrap();
+        }
+        assert!(check_shared(&dir, LimitKind::AdminEnvelope, key).is_err());
+        assert!(
+            FileStore::path(&dir).exists(),
+            "serve-owned rate-limits.json must exist"
+        );
+        let err = check_shared(&dir, LimitKind::AdminEnvelope, key).expect_err("reload");
+        assert_eq!(err.kind, LimitKind::AdminEnvelope);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

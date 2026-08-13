@@ -138,7 +138,10 @@ pub struct SessionDecision {
     pub ts: String, // RFC3339
     pub nonce: String, // from session; binds decide
     pub person_id: Option<String>,
-    pub sig_hex: Option<String>, // optional person sig Wave A (audit only)
+    pub sig_hex: Option<String>, // Wave A: optional audit sig over SessionDecision bytes
+    // Wave F1 additive (`serde(default)`). Omit / null = pair-only.
+    pub facet: Option<"personal" | "work">,
+    pub person_public_key_hex: Option<String>, // 64 hex
 }
 ```
 
@@ -286,6 +289,11 @@ Authorization: Bearer <token>
 7. Idempotent: if phase already `decided|completing|completed` with same decision+joiner → ok; if different decision → conflict.
 8. Optional person `sig_hex` over canonical SessionDecision bytes — audit only in Wave A.
 9. If armed + single pending: bind first (same as confirm); if zero pending: **409 `not_bound`**.
+10. **Enroll (F4, not confirm):** if `person_id`, `facet`, `person_public_key_hex`, and `sig_hex` are **all** present, verify `sig_hex` over **`carrier-enroll-v1`** (not SessionDecision canonical bytes) and write the resident enrollments row. Any of those four absent → pair-only. Present but bad sig / unknown facet → skip enroll; pair decide may still succeed. Confirm-on-machine does **not** enroll.
+
+`host=` on QR_A remains a **private last-mile hint** (never render). After F4p, `mymesh serve` owns `/pair/v2` + `/mesh/v1`; standalone `mymesh carrier` is lab-only.
+
+See [CARRIER-ADMIN-NEXT.md](CARRIER-ADMIN-NEXT.md) for the three frozen reads (`GET /mesh/v1/enrollments`, `GET /mesh/v1/memberships`, `GET /mesh/v1/topology` unchanged) and `person_enrolled` (device-scoped auth preimage).
 
 ---
 
@@ -297,21 +305,23 @@ Authorization: Bearer <token>
 2. Machine B (joiner): mymesh pair dual --join --resident <did_A|words>
    → iroh join toward A; QR_B (did_B, fp_B, label) for phone
 3. Phone: Scan A → SessionDraft; Scan B → bind joiner; show both fps → L2 Accept/Deny
-4a. If host reachable: POST /pair/v2/decide with SessionDecision
-4b. Else: show code_accept / code_deny; user: mymesh pair confirm <code> on A
+4a. Default: show code_accept / code_deny; enroll-via-hint if host= cached; user: mymesh pair confirm <code> on A
+4b. Advanced LAN helper: POST /pair/v2/decide with SessionDecision
 5. A writes JoinStore decision for bound joiner only; phase decided → completing
 6. Existing join loop take_decision → JoinAccept; B Trusted on A
 7. B applies host trust; member path sends membership snapshot (guest path: see GUEST.md)
 8. phase completed; audit on phone if used
 ```
 
-### Wave A decide priority (Carrier after dual-scan bound)
+### Wave A / F9 decide priority (Carrier after dual-scan bound)
 
 ```text
-1. If host hint present → try POST /pair/v2/decide (2s timeout)
-2. Else → show confirm codes; user runs mymesh pair confirm <code>
+1. Default: confirm codes + enroll-via-hint (POST /enrollments via private host= hint)
+2. Advanced LAN helper / “use HTTP decide”: try POST /pair/v2/decide (2s timeout)
 3. Relay — not in Wave A
 ```
+
+`host=` on QR_A is a private last-mile hint (never render). F9 does not strip it from `start_carrier`. `mymesh serve` owns `/pair/v2`.
 
 ### Artifacts
 

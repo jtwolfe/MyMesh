@@ -1,7 +1,7 @@
 //! Background agent: join, sessions, mesh gossip, pending kicks, periodic sync.
 use mymesh_core::{
-    allows, ArmState, Capability, Config, DeviceStore, GrantStore, MeshState, Paths, PendingKick,
-    PendingKickStore, Result,
+    allows, AdminNonceStore, ArmState, Capability, Config, DeviceStore, EnrollmentStore,
+    GrantStore, MembershipStore, MeshState, Paths, PendingKick, PendingKickStore, Result,
 };
 use mymesh_crypto::Identity;
 use mymesh_files::{apply_host_message, FileTransferEngine, PathSandbox};
@@ -17,7 +17,7 @@ use tracing::{info, warn};
 
 use crate::join::handle_join_as_host_with_grants;
 use crate::mesh_sync::{
-    apply_grant_revoke, apply_kick_notice_local, apply_kick_target, apply_membership,
+    apply_grant_revoke, apply_kick_notice_local, apply_kick_target, apply_membership_gossip,
     build_announce, build_snapshot, sign_leave_ack, verify_grant_announce, verify_grant_revoke,
     verify_kick, verify_leave_ack, verify_membership,
 };
@@ -115,6 +115,23 @@ impl Agent {
         config: Config,
     ) -> Result<Self> {
         let sandbox = PathSandbox::new(config.effective_sandbox_root())?;
+        // Load empty enrollments.json if missing. Pair/decide write is F4.
+        let data_dir = grants_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let _ = EnrollmentStore::open_or_create(data_dir.join("enrollments.json"))?;
+        // Serve owns admin-nonces.json (F4p). Replay consume is F4 AdminEnvelope.
+        let _ = AdminNonceStore::open_or_create(data_dir.join("admin-nonces.json"))?;
+        // F8: one primary catalog row from mesh.json when the file is missing.
+        if mesh_path.exists() {
+            if let Ok(mesh) = MeshState::load(&mesh_path) {
+                let _ = MembershipStore::open_or_migrate(
+                    data_dir.join("mesh-memberships.json"),
+                    &mesh.mesh_id,
+                );
+            }
+        }
         Ok(Self {
             secret: identity.to_secret_bytes(),
             label,
@@ -134,6 +151,22 @@ impl Agent {
 
     fn identity(&self) -> Identity {
         Identity::from_secret_bytes(self.secret)
+    }
+
+    /// KD-F16: bind pair/v2 + mesh/v1 in-process. Serve owns `:17878`.
+    pub async fn spawn_pair_http(
+        &self,
+        paths: &Paths,
+        port: u16,
+    ) -> anyhow::Result<crate::carrier::PairHttpHandle> {
+        crate::carrier::start_pair_http(
+            paths.clone(),
+            &self.identity(),
+            self.label.clone(),
+            port,
+            None,
+        )
+        .await
     }
 
     fn store(&self) -> Result<DeviceStore> {
@@ -551,7 +584,7 @@ impl Agent {
                     return Ok(());
                 }
                 let mut store = self.store()?;
-                let n = apply_membership(
+                let n = apply_membership_gossip(
                     &mut store,
                     &self.mesh_path,
                     &from_id,
@@ -957,7 +990,7 @@ impl Agent {
                     {
                         if verify_membership(&from_id, &mesh_id, ts, &members, &signature).is_ok() {
                             let mut store = self.store()?;
-                            apply_membership(
+                            apply_membership_gossip(
                                 &mut store,
                                 &self.mesh_path,
                                 &from_id,

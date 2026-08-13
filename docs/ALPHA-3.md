@@ -70,7 +70,8 @@ Phone is a **scanner only** (no mesh node, no Android app).
 
 ```bash
 # A (phone on a network that can reach A's :17878)
-mymesh carrier
+mymesh serve      # owns /pair/v2; TUI arms QR via MMA1
+# mymesh carrier  # lab-only if serve is down
 
 # B
 mymesh id --uri   # scan/paste into phone page

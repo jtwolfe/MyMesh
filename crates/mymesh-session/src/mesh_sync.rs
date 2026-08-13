@@ -1,8 +1,9 @@
 //! Mesh membership gossip + kick / grant-revoke application.
 use chrono::{TimeZone, Utc};
 use mymesh_core::{
-    Capability, DeviceId, DeviceLabel, DeviceRecord, DeviceStore, Grant, GrantStore,
-    KickNoticeRecord, MeshRole, MeshState, NodeFingerprint, Result, TrustState,
+    allow_mesh_smash, catalog_blocks_adopt, Capability, DeviceId, DeviceLabel, DeviceRecord,
+    DeviceStore, Error, Grant, GrantStore, KickNoticeRecord, MembershipStore, MeshRole, MeshState,
+    NodeFingerprint, Result, TrustState,
 };
 use mymesh_crypto::Identity;
 use mymesh_protocol::{ControlMessage, MeshMemberWire};
@@ -174,7 +175,22 @@ pub fn apply_membership(
 ) -> Result<usize> {
     // Caller must ensure from_id is trusted (or join path).
     let mut mesh = MeshState::load(mesh_path)?;
+    let foreign = mesh_id != mesh.mesh_id.as_str();
+    // Extra catalog rows (guest overlap) must not smash primary via adopt_mesh_id.
+    if foreign && catalog_blocks_adopt(mesh_path, mesh_id) && !allow_mesh_smash() {
+        return Err(Error::Conflict("mesh_overlap".into()));
+    }
     mesh.adopt_mesh_id(mesh_id);
+    if let Some(parent) = mesh_path.parent() {
+        let cat_path = parent.join("mesh-memberships.json");
+        if cat_path.exists() {
+            if let Ok(mut cat) = MembershipStore::open(&cat_path) {
+                if cat.primary_mesh_id() != mesh.mesh_id {
+                    let _ = cat.rebind_primary(&mesh.mesh_id);
+                }
+            }
+        }
+    }
     mesh.last_sync = Some(Utc::now());
     mesh.save(mesh_path)?;
 
@@ -242,6 +258,24 @@ pub fn apply_membership(
         }
     }
     Ok(added)
+}
+
+/// Gossip path: skip foreign smash when the catalog has extras (do not tear the session down).
+pub fn apply_membership_gossip(
+    store: &mut DeviceStore,
+    mesh_path: &Path,
+    from_id: &DeviceId,
+    mesh_id: &str,
+    members: &[MeshMemberWire],
+    self_id: DeviceId,
+) -> Result<usize> {
+    match apply_membership(store, mesh_path, from_id, mesh_id, members, self_id) {
+        Err(Error::Conflict(msg)) if msg.contains("mesh_overlap") => {
+            info!(mesh_id, "refusing adopt_mesh_id (guest overlap catalog)");
+            Ok(0)
+        }
+        other => other,
+    }
 }
 
 /// Apply kick of target from mesh (local remove).
@@ -715,5 +749,106 @@ mod tests {
         };
         let round: ControlMessage = decode_msg(&encode_msg(&msg).unwrap()).unwrap();
         assert!(matches!(round, ControlMessage::GrantAnnounce { .. }));
+    }
+
+    #[test]
+    fn apply_membership_refuses_adopt_when_catalog_has_extras() {
+        let dir = temp_dir("overlap-smash");
+        let mesh_path = dir.join("mesh.json");
+        let mut mesh = MeshState::new_mesh();
+        // High lex id so a foreign lower UUID would smash.
+        mesh.mesh_id = "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz".into();
+        mesh.save(&mesh_path).unwrap();
+        let mut cat =
+            MembershipStore::open_or_migrate(dir.join("mesh-memberships.json"), &mesh.mesh_id)
+                .unwrap();
+        cat.add_guest("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", Some("G1".into()))
+            .unwrap();
+
+        let mut store = DeviceStore::open(dir.join("devices.json")).unwrap();
+        let from = DeviceId::from_bytes([0x11; 32]);
+        let dest_member = DeviceId::from_bytes([0x22; 32]);
+        let foreign = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let members = vec![MeshMemberWire {
+            id: dest_member,
+            label: "studio".into(),
+            fingerprint: "fp-studio".into(),
+            capabilities: Capability::default_grant(),
+            linked_at_unix: Utc::now().timestamp(),
+        }];
+
+        let err = apply_membership(
+            &mut store,
+            &mesh_path,
+            &from,
+            foreign,
+            &members,
+            DeviceId::from_bytes([0xaa; 32]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::Conflict(ref m) if m == "mesh_overlap"),
+            "{err}"
+        );
+        let reloaded = MeshState::load(&mesh_path).unwrap();
+        assert_eq!(reloaded.mesh_id, "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz");
+        assert!(
+            store.get(&dest_member).is_none(),
+            "dest members must not land in DeviceStore (C12)"
+        );
+
+        let n = apply_membership_gossip(
+            &mut store,
+            &mesh_path,
+            &from,
+            foreign,
+            &members,
+            DeviceId::from_bytes([0xaa; 32]),
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn apply_membership_same_primary_ok_with_extras() {
+        let dir = temp_dir("overlap-same");
+        let mesh_path = dir.join("mesh.json");
+        let mut mesh = MeshState::new_mesh();
+        mesh.mesh_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into();
+        mesh.save(&mesh_path).unwrap();
+        let mut cat =
+            MembershipStore::open_or_migrate(dir.join("mesh-memberships.json"), &mesh.mesh_id)
+                .unwrap();
+        cat.add_guest("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", Some("G1".into()))
+            .unwrap();
+
+        let mut store = DeviceStore::open(dir.join("devices.json")).unwrap();
+        let from = DeviceId::from_bytes([0x31; 32]);
+        store
+            .upsert(trusted(0x31, "from", MeshRole::Member))
+            .unwrap();
+        let peer = DeviceId::from_bytes([0x32; 32]);
+        let members = vec![MeshMemberWire {
+            id: peer,
+            label: "home-b".into(),
+            fingerprint: "fp-b".into(),
+            capabilities: Capability::default_grant(),
+            linked_at_unix: Utc::now().timestamp(),
+        }];
+        let n = apply_membership(
+            &mut store,
+            &mesh_path,
+            &from,
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            &members,
+            DeviceId::from_bytes([0x30; 32]),
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+        assert!(store.get(&peer).is_some());
+        let reloaded = MeshState::load(&mesh_path).unwrap();
+        assert_eq!(reloaded.mesh_id, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

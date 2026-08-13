@@ -142,7 +142,9 @@ The kickee then sends **KickLeaveAck** to all known peers so the mesh converges.
 Phone acts as a **scanner / approver only** (not a mesh node). See [USAGE.md](USAGE.md) and [ALPHA-3.md](ALPHA-3.md).
 
 ```bash
-mymesh carrier              # machine A — default pair/v2 QR (LAN host, ep=direct)
+mymesh serve                # machine A — owns /pair/v2 + /mesh/v1 on :17878
+# TUI arms QR_A via MMA1 (or: mymesh pair dual --host http://<lan>:17878)
+# mymesh carrier            # lab-only if serve is down; refuses when serve owns :17878
 # mymesh carrier --pair-v1  # escape: alpha.1 pair/v1 LAN QR
 mymesh id --uri             # machine B → phone page / link
 ```
@@ -151,7 +153,7 @@ mymesh id --uri             # machine B → phone page / link
 
 | Field | Behavior |
 |-------|----------|
-| QR | `carrier://pair?v=1&host=<LAN>&token&fp&mesh` via `mymesh carrier --pair-v1` |
+| QR | `carrier://pair?v=1&host=<LAN>&token&fp&mesh` via lab `mymesh carrier --pair-v1` |
 | `host` | **Required** |
 | Endpoints | `/pair/v1/status`, `pending`, `decide` (still served) |
 | Decide | Phone HTTP to host; L2 step-up on Carrier |
@@ -178,7 +180,7 @@ carrier://pair?v=2&sid=<ulid>&did=<64hex>&token=<b64url>&nonce=<b64url-16B>&fp=<
 
 CLI (implemented): `mymesh pair dual`, `pair dual --join`, `pair confirm <code>`, `pair status`, `pair retry`. E2E demo steps and lab honesty: **[DEMO-PAIR.md](DEMO-PAIR.md)**.
 
-**Migration policy:** v1 accepted through compat window; `pair dual` emits v2 after A3; **`mymesh carrier` defaults to v2** after D5 with `--pair-v1` escape. Details in [PAIR-V2.md](PAIR-V2.md) and [CARRIER-NEXT.md](CARRIER-NEXT.md) Appendix A.
+**Migration policy:** v1 accepted through compat window; `pair dual` emits v2 after A3; serve-owned `/pair/v2` after F4p; lab `mymesh carrier` defaults to v2 after D5 with `--pair-v1` escape. Details in [PAIR-V2.md](PAIR-V2.md) and [CARRIER-NEXT.md](CARRIER-NEXT.md) Appendix A.
 
 ---
 

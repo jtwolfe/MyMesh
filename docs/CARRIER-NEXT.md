@@ -1,11 +1,13 @@
 # MyMesh + Carrier Next Phase (S0–S9) — Design Document
 
+> **Landed prior art (S0–S9 / Waves A–E).** Wave F (enrollment, domains, gateway) lives in [CARRIER-ADMIN-NEXT.md](CARRIER-ADMIN-NEXT.md).
+
 | Field | Value |
 |-------|--------|
 | **Title** | MyMesh + Carrier: Internet-first pair, dual authority, owner/guest, continuity |
 | **Author** | design skill |
 | **Date** | 2026-08-12 |
-| **Status** | Draft (rev 4 — open questions closed) |
+| **Status** | Landed prior art (S0–S9). Original: Draft (rev 4 — open questions closed). Wave F: [CARRIER-ADMIN-NEXT.md](CARRIER-ADMIN-NEXT.md) |
 | **Repos** | `~/Workspace/carrier`, `~/Workspace/MyMesh` |
 | **Scope** | Full next phase after alpha.1 (slices S0–S9, waves A–E) |
 | **Out of scope (implementation)** | GlassSpear site/agent work — parked as future consumer of Carrier identity/presence and Continuity packs |

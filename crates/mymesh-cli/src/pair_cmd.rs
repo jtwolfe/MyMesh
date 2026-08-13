@@ -12,7 +12,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use console::style;
 use mymesh_core::{
-apply_pair_confirm, parse_tls_pin, record_pair_decide, require_https_when_pinned, ArmState,
+    apply_pair_confirm, parse_tls_pin, record_pair_decide, require_https_when_pinned, ArmState,
     Config, JoinDecision, JoinStore, MeshState, NodeFingerprint, PairEndpointClass, PairPhase,
     PairSessionStore, Paths,
 };
@@ -79,7 +79,11 @@ pub(crate) fn mint_pair_dual_qr(
         armed.session.tls_pin = Some(pin.clone());
         store.save(&armed.session)?;
     }
-    Ok((qr, armed.session.sid.clone(), identity.device_id().to_string()))
+    Ok((
+        qr,
+        armed.session.sid.clone(),
+        identity.device_id().to_string(),
+    ))
 }
 
 /// Resident: arm join window, mint PairSession, print QR_A v2 (required nonce).
@@ -94,7 +98,9 @@ pub async fn cmd_pair_dual(
     let (qr, sid, did) = mint_pair_dual_qr(paths, host.clone(), ttl, tlspin.clone())?;
     let identity = Identity::load_or_create(paths.identity_file())?;
     let store = PairSessionStore::open(paths.pair_sessions_dir())?;
-    let sess = store.load(&sid)?.ok_or_else(|| anyhow::anyhow!("session gone"))?;
+    let sess = store
+        .load(&sid)?
+        .ok_or_else(|| anyhow::anyhow!("session gone"))?;
     let arm = ArmState::load(paths.arm_file()).unwrap_or_default();
     let fp = NodeFingerprint::from_device_id(&identity.device_id())
         .as_str()
@@ -109,7 +115,9 @@ pub async fn cmd_pair_dual(
     println!("  until   {:?}", arm.until);
     println!("  phase   {}", sess.phase.as_str());
     if let Some(h) = &host {
-        println!("  host    {h}");
+        println!(
+            "  host    {h}  (private last-mile hint; serve owns /pair/v2 — not product copy)"
+        );
     } else {
         println!(
             "  mode    confirm-on-machine (no host) — after joiner dials: mymesh pair confirm <code>"

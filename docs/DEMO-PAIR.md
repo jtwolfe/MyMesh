@@ -8,7 +8,7 @@
 | Path | Role | When to use |
 |------|------|-------------|
 | **A — dual-scan + confirm** | **Primary product demo** | Two machines + phone; phone **need not** reach host HTTP |
-| **B — dual-scan + direct host** | LAN optimization | Optional `--host` in QR_A; phone can `POST /pair/v2/decide` |
+| **B — dual-scan + direct host** | Advanced LAN helper | Optional `--host` in QR_A as a **private last-mile hint**; HTTP decide only if Carrier Advanced “LAN helper / HTTP decide” is on |
 | **C — carrier single-host LAN** | Migration / LAN helper | Default **v2** after D5; `--pair-v1` for alpha.1 |
 | **Lab — mock-pair-host** | **Lab only** | Lives in **Carrier** repo; emulator / unit fixtures — **not** product |
 
@@ -22,7 +22,7 @@
 |-------|-------------------------|--------|-------------------------|
 | **MyMesh only** (no phone) | No scan UX | CLI `link` + `requests accept`, or operator `pair confirm` if codes known OOB | Yes (CLI path) |
 | **Two machines + Carrier phone, no phone→host HTTP** | Yes | Confirm codes → `mymesh pair confirm <code>` on resident | Yes — **Wave A product exit** |
-| **Two machines + phone on LAN with reachable host** | Yes | Prefer `POST /pair/v2/decide`; fallback to confirm | Yes (Path B) |
+| **Two machines + phone on LAN with reachable host** | Yes | Default: confirm codes + enroll-via-hint. `POST /pair/v2/decide` only with Advanced LAN helper | Yes (Path A; Path B if helper on) |
 | **Phone + mock-pair-host only** | No | v1 mock Accept | **No** real mesh trust — lab UI only |
 | **CI / no Android** | Harness stands in for phone codes | `apply_pair_confirm` in-process | Yes — [two_agent_harness](../crates/mymesh-session/src/two_agent_harness.rs) (PR A7) |
 
@@ -48,7 +48,7 @@ mymesh pair retry [sid]                                # expire + re-arm dual (c
 | `pair status` | Active session phase, ep, joiner bind, pending joins. |
 | `pair retry` | Expire previous session; arm a fresh dual (confirm path). |
 
-Host process: **`mymesh serve`** (or user unit) must be running so join completes. **Path A** decide (`mymesh pair confirm`) is agent-integrated and does **not** need `mymesh carrier`. **Path B** direct HTTP decide requires **`mymesh carrier`** on the same `Paths` (default port **17878**) — `pair dual --host` only puts the host hint in QR_A; it does not start HTTP.
+Host process: **`mymesh serve`** owns iroh **and** `/pair/v2` + `/mesh/v1` on **:17878**. **Path A** decide (`mymesh pair confirm`) is the product Accept path. `host=` in QR_A (TUI / `start_carrier` / optional `pair dual --host`) is a **private last-mile hint** — never product copy; do not strip it. **Path B** HTTP decide is Carrier Advanced LAN helper against **serve-owned** `/pair/v2`. Standalone `mymesh carrier` is **lab-only** (refuses bind when serve is up).
 
 ---
 
@@ -61,20 +61,23 @@ Host process: **`mymesh serve`** (or user unit) must be running so join complete
    → dials A over iroh; prints QR_B: mymesh://pair-peer?v=1&did&fp&label
 3. Phone (Carrier debug APK):
    Scan QR_A → draft; Scan QR_B → bind; review both fingerprints → L2 Accept/Deny
-4a. Host reachable (ep=direct / host hint works):
+4a. Default Accept: confirm codes (Crockford 4-4) + enroll-via-hint
+     (POST /mesh/v1/enrollments using the private host= hint when reachable).
+     Operator: mymesh pair confirm <code>  on A
+4b. Advanced LAN helper / “use HTTP decide”:
      POST /pair/v2/decide  SessionDecision  (Bearer token; ≈2s timeout)
-4b. Else (Wave A zero-HTTP — normative when phone cannot reach host):
-     Phone shows accept/deny codes (Crockford 4-4);
-     operator: mymesh pair confirm <code>  on A
+     Dial on joiner only if LAN helper is on and QR_B had host+token.
 5. A writes JoinStore decision for bound joiner only → join loop JoinAccept
 6. Both DeviceStores Trusted (member path); phone audit with both fps
 ```
 
 **Decide priority on Carrier after dual-scan bind** ([PAIR-V2.md](PAIR-V2.md)):
 
-1. If `host` present → try `POST /pair/v2/decide` (~2s).  
-2. Else (or HTTP fail) → show confirm codes; `mymesh pair confirm <code>`.  
+1. **Default:** confirm codes + enroll-via-hint (`POST /enrollments` via cached `host=` hint).  
+2. **Advanced LAN helper / HTTP decide:** try `POST /pair/v2/decide` (~2s); fallback to confirm.  
 3. Relay — not Wave A.
+
+`host=` is never rendered. Serve owns HTTP; the hint is not product copy.
 
 ---
 
@@ -149,16 +152,16 @@ Confirm-on-machine without Carrier is only practical if codes are computed by a 
 
 ---
 
-## Path B — dual-scan + direct host (LAN optimization)
+## Path B — dual-scan + direct host (Advanced LAN helper)
 
-Same as Path A through dual-scan bind, but QR_A includes a reachable `host=` (`ep=direct`).  
-`/pair/v2/decide` is served by **`mymesh carrier`** (same agent `Paths` as `serve` / `pair dual`). `mymesh serve` and `pair dual --host` do **not** start HTTP; without carrier, the phone falls back to confirm codes (Path A).
+Same as Path A through dual-scan bind. QR_A may include `host=` (`ep=direct`) as a **private last-mile hint** — TUI / `start_carrier` still emit it (do not strip).  
+`/pair/v2/decide` is served by **`mymesh serve`** on `:17878`. `pair dual --host` only puts the hint in QR_A. Carrier **does not** POST decide unless Advanced “LAN helper / HTTP decide” is on. If serve is down, lab `mymesh carrier` may bind; if serve is up, `mymesh carrier` refuses (`serve owns pair HTTP`). Without the helper (or if HTTP fails), the phone uses confirm codes + enroll-via-hint (Path A).
 
 ```bash
 # --- Machine A (resident) ---
-mymesh serve &
+mymesh serve &                     # iroh + pair/v2 + mesh/v1 on :17878
 mymesh firewall ufw allow          # TCP 17878 for phone LAN HTTP (explicit only)
-mymesh carrier                     # pair HTTP on :17878; same Paths as serve
+# mymesh carrier                   # lab-only if serve is down; refuses when serve owns :17878
 mymesh pair dual --host http://<lan-ip>:17878
 # QR_A: ep=direct + host hint. Leave session armed.
 
@@ -166,28 +169,31 @@ mymesh pair dual --host http://<lan-ip>:17878
 mymesh pair dual --join --resident <did_or_words_from_A>
 
 # --- Phone ---
-# Dual-scan as Path A; after L2 Accept, Carrier tries POST /pair/v2/decide (~2s).
-# On success: no confirm codes required.
-# On failure / timeout: falls back to confirm codes (Path A).
+# Dual-scan as Path A. Default Accept: confirm codes + enroll-via-hint.
+# Enable Advanced “LAN helper / HTTP decide” to POST /pair/v2/decide (~2s).
+# On helper success: no confirm codes required.
+# On failure / timeout / helper off: confirm codes (Path A).
 ```
 
 ### Exit checks
 
-- [ ] Phone on same LAN as host can Accept via `/pair/v2/decide` without typing codes  
-- [ ] Unreachable host does **not** fail open: UI falls back to confirm codes  
-- [ ] SessionDecision binds `sid`, `nonce`, resident + joiner dids ([PAIR-V2.md](PAIR-V2.md))
+- [ ] With Advanced LAN helper on, phone on same LAN can Accept via `/pair/v2/decide` without typing codes  
+- [ ] Helper off: Accept shows confirm codes even if `host=` is in the QR  
+- [ ] Unreachable host does **not** fail open: UI stays on confirm codes  
+- [ ] SessionDecision binds `sid`, `nonce`, resident + joiner dids ([PAIR-V2.md](PAIR-V2.md))  
+- [ ] TUI does **not** show the LAN URL; QR payload still has `host=`
 
 ---
 
-## Path C — carrier single-host LAN (default v2; `--pair-v1` escape)
+## Path C — carrier single-host LAN (lab; `--pair-v1` escape)
 
-Single-host LAN helper via `mymesh carrier`. Default QR is **pair/v2** after D5; `--pair-v1` restores alpha.1. **Not** the Wave A dual-scan product exit.
+Lab helper when **serve is down**. After F4p, product path is `mymesh serve` + TUI MMA1 arm. Default QR is **pair/v2**; `--pair-v1` restores alpha.1. **Not** the Wave A dual-scan product exit. `mymesh carrier` **refuses** if serve already owns `:17878`.
 
 ```bash
 # --- Host A ---
-mymesh serve &
+mymesh serve &                     # owns /pair/v2 on :17878; TUI arms QR via MMA1
 mymesh firewall ufw allow          # or firewalld / ufw 17878/tcp
-mymesh carrier                     # arms; prints pair API base + carrier://pair?v=2&… QR (default)
+# mymesh carrier                   # lab-only if serve is down
 # mymesh carrier --pair-v1         # escape: alpha.1 carrier://pair?v=1&… LAN QR
 
 # --- Joiner B ---
@@ -200,7 +206,7 @@ mymesh link '<host-hex-or-words-or-uri>'
 
 | Note | Detail |
 |------|--------|
-| Default QR from `mymesh carrier` | **v2** (`ep=direct` + LAN `host`; PairSession armed). Escape: `--pair-v1` |
+| Default QR from TUI / MMA1 (or lab `mymesh carrier`) | **v2** (`ep=direct` + LAN `host`; PairSession armed). Escape: `--pair-v1` |
 | `mymesh pair dual` | Emits **v2** (post A3) |
 | Port | **17878** |
 
@@ -264,7 +270,7 @@ Confirm algorithm (normative): [PAIR-V2.md](PAIR-V2.md) — pepper = bootstrap t
 
 - `mymesh requests accept` / `deny` remain available on the host.  
 - `mymesh pair retry [sid]` expires a stale session and arms a fresh dual.  
-- Stop `mymesh carrier` if used (`Ctrl-C` / stop unit).  
+- Stop `mymesh serve` (pair HTTP lives with the agent). Lab `mymesh carrier` only if serve was down.  
 - Lab only: stop mock-pair-host in the Carrier tree.
 
 ---

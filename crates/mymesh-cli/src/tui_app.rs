@@ -13,7 +13,10 @@ use mymesh_core::{
     apply_pair_confirm, record_pair_decide, ArmState, Config, DeviceStore, JoinStore, MeshState,
     NodeFingerprint, PairSessionStore, Paths, PeerMetrics, PendingKickStore, TrustState,
 };
-use mymesh_crypto::{device_id_to_words, device_join_uri, Identity};
+use mymesh_crypto::{
+    clear_tui_attached, device_id_to_words, device_join_uri, mark_tui_attached, take_recovery_once,
+    CreateWindowFile, Identity, MeshMasterFile,
+};
 use mymesh_protocol::FileEntry;
 use qrcode::QrCode;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -203,6 +206,8 @@ enum PromptKind {
     DenyRequest,
     ExposePort,
     PairConfirm,
+    AllowCreatePassword,
+    RecoveryShow,
 }
 
 impl Default for PromptKind {
@@ -217,6 +222,8 @@ struct Prompt {
     title: String,
     hint: String,
     buf: String,
+    /// Multi-line body for RecoveryShow (never logged).
+    detail: String,
 }
 
 struct App {
@@ -233,8 +240,10 @@ struct App {
     poll: PeerPoll,
     kick: KickWizard,
     prompt: Prompt,
-    /// Active carrier page URL (if started from TUI)
+    /// Internal pair-HTTP host_base (remint / join poll). Never render (KD-F18).
     carrier_url: Option<String>,
+    /// Advanced: show raw QR URI / LAN host (operator LAN-helper chrome).
+    show_lan_helper: bool,
     /// Scrollable detail text for Status tab extras
     detail: String,
     /// Pending join list selection index on Home
@@ -248,6 +257,8 @@ struct App {
     pending_size: Option<(u16, u16)>,
     /// When pending_size last changed — used to debounce Hyprland fullscreen storms.
     pending_since: Option<Instant>,
+    /// Esc on recovery modal: keep file, do not re-open this session.
+    recovery_snooze: bool,
 }
 
 pub async fn run_tui(paths: Paths) -> Result<()> {
@@ -310,6 +321,7 @@ pub async fn run_tui(paths: Paths) -> Result<()> {
         kick: KickWizard::default(),
         prompt: Prompt::default(),
         carrier_url: None,
+        show_lan_helper: false,
         detail: String::new(),
         req_sel: 0,
         pair_qr_a: None,
@@ -317,12 +329,15 @@ pub async fn run_tui(paths: Paths) -> Result<()> {
         term_size: (0, 0),
         pending_size: None,
         pending_since: None,
+        recovery_snooze: false,
     };
+    let _ = mark_tui_attached(app.paths.tui_attached_file());
     ensure_pair_qr_a(&mut app).await;
 
     let res = run_loop(&mut terminal, &mut app).await;
 
     term_pane::disconnect(&mut app.term);
+    let _ = clear_tui_attached(app.paths.tui_attached_file());
 
     disable_raw_mode()?;
     execute!(
@@ -442,12 +457,28 @@ fn sid_from_pair_qr(qr: &str) -> Option<String> {
     None
 }
 
+/// Drop `host=` from a pair QR for **display**. The scan payload is unchanged (KD-F18).
+fn redact_pair_qr_host(qr: &str) -> String {
+    let Some((base, query)) = qr.split_once('?') else {
+        return qr.to_string();
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|p| !p.starts_with("host="))
+        .collect();
+    if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    }
+}
+
 fn host_from_page_url(url: &str) -> String {
     url.trim_end_matches('/').to_string()
 }
 
-/// Arm QR_A with a LAN `host` when pair HTTP can listen, so the phone can tell
-/// this machine to `link` the other (same path as 24-word join).
+/// Arm QR_A via MMA1 / lab carrier. QR still carries `host=` as a private
+/// last-mile hint (KD-F18); do not render `carrier_url`.
 async fn ensure_pair_qr_a(app: &mut App) {
     if app.carrier_url.is_none() {
         match crate::magic_cmd::start_carrier_ui(&app.paths, 17878).await {
@@ -676,6 +707,7 @@ async fn run_loop(
             note_pending_size(app, w, h);
         }
         try_apply_settled_resize(terminal, app)?;
+        maybe_open_recovery_modal(app);
 
         terminal.draw(|f| ui(f, app))?;
         if app.should_quit {
@@ -733,16 +765,24 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
     if app.prompt.kind != PromptKind::None {
         match code {
             KeyCode::Esc => {
+                if app.prompt.kind == PromptKind::RecoveryShow {
+                    app.recovery_snooze = true;
+                    app.status = "recovery file kept — run mymesh mesh recovery-show-once".into();
+                } else {
+                    app.status = "cancelled".into();
+                }
                 app.prompt = Prompt::default();
-                app.status = "cancelled".into();
             }
-            KeyCode::Backspace => {
+            KeyCode::Backspace if app.prompt.kind != PromptKind::RecoveryShow => {
                 app.prompt.buf.pop();
             }
             KeyCode::Enter => {
                 submit_prompt(app).await;
             }
-            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(c)
+                if !mods.contains(KeyModifiers::CONTROL)
+                    && app.prompt.kind != PromptKind::RecoveryShow =>
+            {
                 app.prompt.buf.push(c);
             }
             _ => {}
@@ -887,6 +927,15 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 "Pair confirm code",
                 "4-4 code from Carrier after Accept (hyphens optional)",
             ),
+            KeyCode::Char('H') => {
+                app.show_lan_helper = !app.show_lan_helper;
+                app.status = if app.show_lan_helper {
+                    "LAN helper QR text on (Advanced) — host= visible".into()
+                } else {
+                    "LAN helper QR text off — host= stays a private hint".into()
+                };
+            }
+            KeyCode::Char('M') => start_allow_create(app),
             KeyCode::Char('h') => {
                 app.detail =
                     crate::magic_cmd::hosts_text(&app.paths).unwrap_or_else(|e| e.to_string());
@@ -1272,6 +1321,15 @@ async fn click_button(app: &mut App, id: &str) {
             "Pair confirm code",
             "4-4 code from Carrier after Accept",
         ),
+        "lan_helper" => {
+            app.show_lan_helper = !app.show_lan_helper;
+            app.status = if app.show_lan_helper {
+                "LAN helper QR text on (Advanced)".into()
+            } else {
+                "LAN helper QR text off".into()
+            };
+        },
+        "allow_create" => start_allow_create(app),
         "copy_id" => copy_id(app),
         "words" => show_words(app),
         "ping" => ping_sel(app).await,
@@ -1459,8 +1517,45 @@ fn start_prompt(app: &mut App, kind: PromptKind, title: &str, hint: &str) {
         title: title.into(),
         hint: hint.into(),
         buf: String::new(),
+        detail: String::new(),
     };
     app.status = format!("{title} — type then Enter (Esc cancel)");
+}
+
+fn maybe_open_recovery_modal(app: &mut App) {
+    if app.prompt.kind != PromptKind::None || app.recovery_snooze {
+        return;
+    }
+    let path = app.paths.mesh_recovery_once_file();
+    if !path.exists() {
+        return;
+    }
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    if body.trim().is_empty() {
+        return;
+    }
+    app.prompt = Prompt {
+        kind: PromptKind::RecoveryShow,
+        title: "Mesh recovery codes — save now".into(),
+        hint: "Enter deletes the file · Esc keeps it for `mymesh mesh recovery-show-once`".into(),
+        buf: String::new(),
+        detail: body,
+    };
+}
+
+fn start_allow_create(app: &mut App) {
+    if MeshMasterFile::exists(app.paths.mesh_master_file()) {
+        app.status = "mesh already inited — pick another box (no dual-MMK)".into();
+        return;
+    }
+    start_prompt(
+        app,
+        PromptKind::AllowCreatePassword,
+        "Allow phone create (MMK password)",
+        "new master password — stays on this box",
+    );
 }
 
 fn show_words(app: &mut App) {
@@ -1488,16 +1583,28 @@ async fn start_carrier(app: &mut App) {
             app.carrier_url = Some(url.clone());
             app.pair_sid = sid_from_pair_qr(&pair_qr);
             app.pair_qr_a = Some(pair_qr.clone());
-            app.detail = format!(
-                "Connect-by-carrier (pair/v2 default)\n\n\
-Carrier QR (scan with app):\n  {pair_qr}\n\n\
-HTML fallback:\n  {url}\n\n\
+            app.detail = if app.show_lan_helper {
+                format!(
+                    "Connect-by-carrier (pair/v2 default)\n\n\
+Carrier QR (scan with app; host= is a private last-mile hint):\n  {pair_qr}\n\n\
 Other machine: mymesh link <host-id>  then approve on phone.\n\
-CLI escape: mymesh carrier --pair-v1  (alpha.1 LAN QR)\n\
+CLI escape: mymesh carrier --pair-v1  (lab only if serve is down)\n\
 Firewall: if phone times out, Status → [F] Open or:\n  {}\n",
-                crate::firewall::sudo_firewall_cmd("ufw allow")
-            );
-            app.status = format!("carrier: {url}");
+                    crate::firewall::sudo_firewall_cmd("ufw allow")
+                )
+            } else {
+                format!(
+                    "Connect-by-carrier (pair/v2 default)\n\n\
+Pair QR armed on Home — scan the QR with Carrier.\n\
+host= stays in the QR payload as a private last-mile hint (not shown).\n\
+[H] toggles Advanced LAN-helper text.\n\n\
+Other machine: mymesh link <host-id>  then approve on phone.\n\
+CLI escape: mymesh carrier --pair-v1  (lab only if serve is down)\n\
+Firewall: if phone times out, Status → [F] Open or:\n  {}\n",
+                    crate::firewall::sudo_firewall_cmd("ufw allow")
+                )
+            };
+            app.status = "pair QR armed".into();
         }
         Err(e) => app.status = format!("carrier: {e}"),
     }
@@ -1653,6 +1760,28 @@ async fn submit_prompt(app: &mut App) {
                 Err(e) => app.status = format!("pair confirm: {e}"),
             }
         }
+        PromptKind::AllowCreatePassword => {
+            if buf.is_empty() {
+                app.status = "password must not be empty".into();
+                return;
+            }
+            let win = CreateWindowFile::mint(300, Some(buf));
+            match win.save(app.paths.create_window_file()) {
+                Ok(()) => {
+                    app.status =
+                        "create window open 300s — Carrier POST /meshes may init this box".into();
+                }
+                Err(e) => app.status = format!("allow-create: {e}"),
+            }
+        }
+        PromptKind::RecoveryShow => match take_recovery_once(app.paths.mesh_recovery_once_file()) {
+            Ok(Some(_)) => {
+                app.recovery_snooze = false;
+                app.status = "recovery file deleted after show".into();
+            }
+            Ok(None) => app.status = "recovery file already gone".into(),
+            Err(e) => app.status = format!("recovery: {e}"),
+        },
         PromptKind::ExposePort => {
             let peers = load_peers(&app.paths);
             if peers.is_empty() {
@@ -2559,6 +2688,8 @@ fn draw_action_bar(f: &mut TuiFrame, area: Rect, app: &mut App) {
             ("carrier", "[C] Carrier"),
             ("pair_qr", "[P] Pair QR"),
             ("pair_confirm", "[f] Confirm"),
+            ("lan_helper", "[H] LAN QR"),
+            ("allow_create", "[M] Allow create"),
             ("copy_id", "[c] ID"),
             ("words", "[w] Words"),
             ("quit", "[q] Quit"),
@@ -2644,19 +2775,31 @@ fn draw_prompt_overlay(f: &mut TuiFrame, app: &App) {
     if app.prompt.kind == PromptKind::None {
         return;
     }
-    let area = centered_rect(70, 7, f.area());
+    let recovery = app.prompt.kind == PromptKind::RecoveryShow;
+    let area = if recovery {
+        centered_rect(80, 22, f.area())
+    } else {
+        centered_rect(70, 7, f.area())
+    };
     f.render_widget(Clear, area);
-    let text = format!(
-        "{}\n{}\n\n> {}\n\nEnter confirm · Esc cancel",
-        app.prompt.title, app.prompt.hint, app.prompt.buf
-    );
+    let text = if recovery {
+        format!(
+            "{}\n{}\n\n{}\n\nEnter deletes file · Esc keeps it",
+            app.prompt.title, app.prompt.hint, app.prompt.detail
+        )
+    } else {
+        format!(
+            "{}\n{}\n\n> {}\n\nEnter confirm · Esc cancel",
+            app.prompt.title, app.prompt.hint, app.prompt.buf
+        )
+    };
     f.render_widget(
         Paragraph::new(text)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" input ")
-                    .border_style(Style::default().fg(C_ACCENT))
+                    .title(if recovery { " recovery " } else { " input " })
+                    .border_style(Style::default().fg(if recovery { C_WARN } else { C_ACCENT }))
                     .style(Style::default().bg(Color::Rgb(24, 24, 36))),
             )
             .wrap(Wrap { trim: false }),
@@ -2755,12 +2898,12 @@ fn draw_home(f: &mut TuiFrame, area: Rect, app: &App) {
             }
         }
     }
-    if let Some(url) = &app.carrier_url {
+    // host_base / carrier_url is QR payload only (KD-F18) — do not render LAN :17878.
+    if app.carrier_url.is_some() {
         left_lines.push(Line::from(Span::styled(
-            "Carrier active",
+            "Pair QR armed",
             Style::default().fg(C_OK).add_modifier(Modifier::BOLD),
         )));
-        left_lines.push(Line::from(Span::raw(format!("  {url}"))));
         left_lines.push(Line::from(""));
     }
     left_lines.push(Line::from(""));
@@ -2802,8 +2945,15 @@ fn draw_home(f: &mut TuiFrame, area: Rect, app: &App) {
         Style::default().fg(C_MUTED),
     ))];
     if let Some(qr) = &app.pair_qr_a {
+        // Graphic encodes the full payload (including host=). Text omits host=
+        // unless Advanced LAN-helper chrome is on (KD-F18 / F9).
+        let shown = if app.show_lan_helper {
+            qr.clone()
+        } else {
+            redact_pair_qr_host(qr)
+        };
         qr_lines.push(Line::from(Span::styled(
-            qr.clone(),
+            shown,
             Style::default().fg(C_ACCENT),
         )));
         qr_lines.push(Line::from(""));
@@ -2815,11 +2965,11 @@ fn draw_home(f: &mut TuiFrame, area: Rect, app: &App) {
         }
         qr_lines.push(Line::from(""));
         qr_lines.push(Line::from(Span::styled(
-            "Phone Accept tells the other machine to dial this one (same as 24-word link).",
+            "Scan with Carrier. Accept shows confirm codes; host= is a private last-mile hint.",
             Style::default().fg(C_MUTED),
         )));
         qr_lines.push(Line::from(Span::styled(
-            "[f] paste confirm code only if the phone cannot reach this host",
+            "[f] paste confirm code from the phone (default pair path)",
             Style::default().fg(C_MUTED),
         )));
     } else if let Some(id) = id {
@@ -3397,7 +3547,7 @@ async fn mesh_sync_all(paths: &Paths) -> anyhow::Result<usize> {
     use mymesh_core::{Config, DeviceStore, MeshState};
     use mymesh_crypto::Identity;
     use mymesh_protocol::{decode_msg, encode_msg, ChannelId, ControlMessage, Frame};
-    use mymesh_session::{apply_membership, build_announce};
+    use mymesh_session::{apply_membership_gossip, build_announce};
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file())?;
     let store = DeviceStore::open(paths.devices_file())?;
@@ -3446,7 +3596,7 @@ async fn mesh_sync_all(paths: &Paths) -> anyhow::Result<usize> {
                     .is_ok()
                 {
                     let mut store = DeviceStore::open(paths.devices_file())?;
-                    added += apply_membership(
+                    added += apply_membership_gossip(
                         &mut store,
                         &paths.mesh_file(),
                         &from_id,
@@ -3461,4 +3611,23 @@ async fn mesh_sync_all(paths: &Paths) -> anyhow::Result<usize> {
         crate::mesh_conn::shutdown_opt(transport).await;
     }
     Ok(added)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_pair_qr_host;
+
+    #[test]
+    fn redact_pair_qr_host_strips_only_host() {
+        let qr = "carrier://pair?v=2&sid=s1&did=aa&token=tt&nonce=nn&fp=ff&ep=direct&host=http%3A%2F%2F192.168.1.10%3A17878&mesh=m1";
+        let shown = redact_pair_qr_host(qr);
+        assert!(!shown.contains("host="));
+        assert!(!shown.contains("192.168"));
+        assert!(!shown.contains("17878"));
+        assert!(shown.contains("sid=s1"));
+        assert!(shown.contains("ep=direct"));
+        assert!(shown.contains("mesh=m1"));
+        // Payload itself is not mutated.
+        assert!(qr.contains("host=http%3A%2F%2F192.168.1.10%3A17878"));
+    }
 }

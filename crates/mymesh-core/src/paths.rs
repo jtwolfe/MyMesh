@@ -112,6 +112,39 @@ impl Paths {
         self.data_dir.join("grants.json")
     }
 
+    /// Verified person drive bindings (`enrollments.json`, mode 0600). Wave F2.
+    pub fn enrollments_file(&self) -> PathBuf {
+        self.data_dir.join("enrollments.json")
+    }
+
+    /// AdminEnvelope replay cache (`admin-nonces.json`, mode 0600). Serve-owned (F4p / F4).
+    pub fn admin_nonces_file(&self) -> PathBuf {
+        self.data_dir.join("admin-nonces.json")
+    }
+
+    /// This-node membership catalog (`mesh-memberships.json`, mode 0600). F7 writes the
+    /// primary row at first init; F8 owns guest rows.
+    /// This-node membership catalog (`mesh-memberships.json`, mode 0600). Wave F8.
+    pub fn mesh_memberships_file(&self) -> PathBuf {
+        self.data_dir.join("mesh-memberships.json")
+    }
+
+    /// MMK-authorized first-create window (`create-window.json`, mode 0600).
+    pub fn create_window_file(&self) -> PathBuf {
+        self.data_dir.join("create-window.json")
+    }
+
+    /// One-shot MMK recovery codes (and generated password, if any). Mode 0600.
+    /// Printed by `mymesh mesh recovery-show-once` or a TUI modal, then deleted.
+    pub fn mesh_recovery_once_file(&self) -> PathBuf {
+        self.data_dir.join("mesh-recovery-once.txt")
+    }
+
+    /// Heartbeat written while the TUI is attached (best-effort IPC).
+    pub fn tui_attached_file(&self) -> PathBuf {
+        self.data_dir.join("tui.attached")
+    }
+
     /// Continuity packs root: `continuity/<pack_id>/` mode 0700 (S8).
     pub fn continuity_dir(&self) -> PathBuf {
         self.data_dir.join("continuity")
@@ -120,5 +153,35 @@ impl Paths {
     /// Single pack directory under continuity root.
     pub fn continuity_pack_dir(&self, pack_id: &str) -> PathBuf {
         self.continuity_dir().join(pack_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admin_nonces_path_is_serve_owned_file() {
+        let p = Paths {
+            config_dir: PathBuf::from("/tmp/cfg"),
+            data_dir: PathBuf::from("/tmp/data"),
+            cache_dir: PathBuf::from("/tmp/cache"),
+        };
+        assert_eq!(
+            p.admin_nonces_file(),
+            PathBuf::from("/tmp/data/admin-nonces.json")
+        );
+        assert_eq!(
+            p.mesh_memberships_file(),
+            PathBuf::from("/tmp/data/mesh-memberships.json")
+        );
+        assert_eq!(
+            p.create_window_file(),
+            PathBuf::from("/tmp/data/create-window.json")
+        );
+        assert_eq!(
+            p.mesh_recovery_once_file(),
+            PathBuf::from("/tmp/data/mesh-recovery-once.txt")
+        );
     }
 }

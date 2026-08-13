@@ -11,26 +11,29 @@ mod tui_app;
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use console::style;
+use mymesh_core::wire::{CatalogRole, EnrollWriteBody};
 use mymesh_core::{
-    not_after_days, parse_capabilities, status_pack as continuity_status_pack,
-    wipe_pack as continuity_wipe_pack, ArmState, Capability, Config, DeviceStore, GrantStore,
-    IssuedBy, JoinDecision, JoinStore, MeshState, Paths,
+    not_after_days, parse_capabilities, parse_enroll_facet, read_enroll_sig_hex,
+    status_pack as continuity_status_pack, wipe_pack as continuity_wipe_pack, ArmState, Capability,
+    Config, DeviceStore, EnrollmentStore, GrantRole, GrantStore, IssuedBy, JoinDecision, JoinStore,
+    MembershipStore, MeshState, Paths,
 };
 use mymesh_crypto::{
-    accept_owner_claim, admin_verifying_key_bytes, check_claim_authorized, device_id_to_words,
-    device_join_uri, mesh_init, mesh_recover_with_code, mesh_rotate_password, mesh_unlock_password,
-    parse_device_id, resolve_claim_fingerprint, seal_owner_backup, sign_mrk_proof_ed25519,
-    unseal_owner_backup, ClaimAuthMethod, ClaimWindowFile, Identity, MeshMasterFile, MeshOwnerFile,
-    MmkRuntime, OwnerBackupSealed, OwnerClaimRequest, RecoveryCode,
+    accept_owner_claim, admin_verifying_key_bytes, apply_first_mesh_init, check_claim_authorized,
+    device_id_to_words, device_join_uri, mesh_recover_with_code, mesh_rotate_password,
+    mesh_unlock_password, parse_device_id, resolve_claim_fingerprint, seal_owner_backup,
+    sign_mrk_proof_ed25519, take_recovery_once, unseal_owner_backup, ClaimAuthMethod,
+    ClaimWindowFile, CreateWindowFile, Identity, MeshMasterFile, MeshOwnerFile, MmkRuntime,
+    OwnerBackupSealed, OwnerClaimRequest, RecoveryCode,
 };
 use mymesh_net::{
-    run_mailbox_server, FsMailbox, HttpMailbox, IrohTransport, LocalFabric, LocalRendezvous,
+    serve_control_socket, FsMailbox, HttpMailbox, IrohTransport, LocalFabric, LocalRendezvous,
     Rendezvous, Transport,
 };
 use mymesh_protocol::{decode_msg, encode_msg, ChannelId, FileMessage, Frame, TerminalMessage};
 use mymesh_session::{
-    apply_kick_target, apply_membership, build_announce, run_guest_pair, run_host_pair_code,
-    run_join_as_guest, sign_kick, Agent, Session,
+    apply_kick_target, apply_membership_gossip, build_announce, run_guest_pair,
+    run_host_pair_code, run_join_as_guest, sign_kick, Agent, PairArmAdmin, Session, PAIR_HTTP_PORT,
 };
 use mymesh_terminal::TerminalClient;
 use std::net::SocketAddr;
@@ -129,6 +132,16 @@ enum Commands {
         #[command(subcommand)]
         action: GrantCmd,
     },
+    /// Person drive bindings on this node (Wave F; host-local)
+    Enroll {
+        #[command(subcommand)]
+        action: EnrollCmd,
+    },
+    /// This-node membership catalog + guest overlap (Wave F8; host-local)
+    Memberships {
+        #[command(subcommand)]
+        action: MembershipsCmd,
+    },
     /// Continuity pack status / wipe (S8; host-local)
     Continuity {
         #[command(subcommand)]
@@ -177,13 +190,13 @@ enum Commands {
         #[arg(long, default_value_t = 30)]
         fps: u8,
     },
-    /// Run the mesh agent (sessions + magic plane)
+    /// Run the mesh agent (sessions, magic plane, pair/v2 + mesh/v1 HTTP)
     Serve {
         /// Keep in foreground (default for CLI)
         #[arg(long)]
         foreground: bool,
     },
-    /// Run a standalone HTTP SPAKE2 mailbox
+    /// Run a standalone HTTP SPAKE2 + self-host admin mailbox (not a public product)
     Mailbox {
         #[arg(long, default_value = "0.0.0.0:9876")]
         bind: String,
@@ -319,7 +332,7 @@ enum Commands {
         #[arg(long)]
         local: Option<u16>,
     },
-    /// Connect-by-carrier (phone QR page; phone is not a mesh node)
+    /// Lab-only pair HTTP if serve is down (serve owns :17878 after F4p)
     Carrier {
         /// HTTP listen port (default 17878)
         #[arg(long, default_value_t = 17878)]
@@ -410,6 +423,71 @@ enum GrantCmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum EnrollCmd {
+    /// List verified person drive bindings
+    List,
+    /// Revoke drive for a person (filesystem root)
+    Revoke {
+        #[arg(value_name = "PERSON_ID")]
+        person_id: String,
+    },
+    /// Airgap add: verify carrier-enroll-v1, then write enrollments.json
+    Add {
+        #[arg(long = "person-id")]
+        person_id: String,
+        /// `personal` or `work`
+        #[arg(long)]
+        facet: String,
+        /// RFC3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`) or unix seconds
+        #[arg(long)]
+        ts: String,
+        /// 16-byte nonce as base64url
+        #[arg(long)]
+        nonce: String,
+        /// Person Ed25519 public key (64 hex chars)
+        #[arg(long = "person-pubkey")]
+        person_pubkey: String,
+        /// Signature: 128 hex chars or raw 64 bytes
+        #[arg(long = "sig-file", value_name = "PATH")]
+        sig_file: PathBuf,
+        /// Optional phone / person label
+        #[arg(long)]
+        label: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MembershipsCmd {
+    /// List this node's primary + guest catalog rows
+    List,
+    /// Add guest overlap (host-local). `--role member` is F8b.
+    Add {
+        #[arg(long = "mesh", value_name = "MESH_ID")]
+        mesh: String,
+        /// `guest` this wave; `member` extra → not_implemented
+        #[arg(long, default_value = "guest")]
+        role: String,
+        /// Attach an existing grant id (Grant.mesh_id must match)
+        #[arg(long = "grant", value_name = "GRANT_ID")]
+        grant: Option<String>,
+        /// Object host for a new dest grant (default: this node)
+        #[arg(long = "on", value_name = "DEVICE")]
+        on: Option<String>,
+        /// Caps for a new dest grant (default: terminal,files)
+        #[arg(long = "caps", default_value = "terminal,files")]
+        caps: String,
+        /// Optional expiry in days for a new dest grant
+        #[arg(long = "days")]
+        days: Option<u64>,
+    },
+    /// Leave a guest catalog row (does not revoke the dest grant)
+    Leave {
+        #[arg(long = "mesh", value_name = "MESH_ID")]
+        mesh: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum ContinuityCmd {
     /// Show pack status: present | wiped | absent
     Status {
@@ -439,7 +517,22 @@ enum MeshCmd {
         /// Overwrite existing mesh-master.json (destructive)
         #[arg(long)]
         force: bool,
+        /// Household display name (default: hostname / existing mesh.json)
+        #[arg(long)]
+        name: Option<String>,
     },
+    /// Open a first-create window so Carrier POST /meshes may init this box
+    #[command(name = "allow-create")]
+    AllowCreate {
+        /// Window lifetime in seconds (default 300, max 86400)
+        #[arg(long, default_value_t = 300)]
+        secs: u64,
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+    },
+    /// Print and delete one-shot recovery codes (`mesh-recovery-once.txt`)
+    #[command(name = "recovery-show-once")]
+    RecoveryShowOnce,
     /// Unlock MMK into host-local runtime cache (re-prompt after lock; not OS keyring)
     Unlock {
         #[arg(long, value_name = "PATH")]
@@ -797,6 +890,48 @@ async fn main() -> Result<()> {
             GrantCmd::List { json, all } => cmd_grant_list(&paths, json, all)?,
             GrantCmd::Revoke { grant_id } => cmd_grant_revoke(&paths, &grant_id)?,
         },
+        Commands::Memberships { action } => match action {
+            MembershipsCmd::List => cmd_memberships_list(&paths)?,
+            MembershipsCmd::Add {
+                mesh,
+                role,
+                grant,
+                on,
+                caps,
+                days,
+            } => cmd_memberships_add(
+                &paths,
+                &mesh,
+                &role,
+                grant.as_deref(),
+                on.as_deref(),
+                &caps,
+                days,
+            )?,
+            MembershipsCmd::Leave { mesh } => cmd_memberships_leave(&paths, &mesh)?,
+        },
+        Commands::Enroll { action } => match action {
+            EnrollCmd::List => cmd_enroll_list(&paths)?,
+            EnrollCmd::Revoke { person_id } => cmd_enroll_revoke(&paths, &person_id)?,
+            EnrollCmd::Add {
+                person_id,
+                facet,
+                ts,
+                nonce,
+                person_pubkey,
+                sig_file,
+                label,
+            } => cmd_enroll_add(
+                &paths,
+                &person_id,
+                &facet,
+                &ts,
+                &nonce,
+                &person_pubkey,
+                &sig_file,
+                label,
+            )?,
+        },
         Commands::Continuity { action } => match action {
             ContinuityCmd::Status { pack_id, json } => {
                 cmd_continuity_status(&paths, &pack_id, json)?
@@ -834,7 +969,7 @@ async fn main() -> Result<()> {
         Commands::Serve { .. } => cmd_serve(&paths).await?,
         Commands::Mailbox { bind } => {
             let addr: SocketAddr = bind.parse().context("invalid --bind")?;
-            run_mailbox_server(addr).await?;
+            mymesh_net::run_mailbox_server_with_metrics(addr, Some(paths.metrics_dir())).await?;
         }
         Commands::Install {
             system,
@@ -858,7 +993,13 @@ async fn main() -> Result<()> {
             MeshCmd::Init {
                 password_file,
                 force,
-            } => cmd_mesh_init(&paths, password_file, force)?,
+                name,
+            } => cmd_mesh_init(&paths, password_file, force, name)?,
+            MeshCmd::AllowCreate {
+                secs,
+                password_file,
+            } => cmd_mesh_allow_create(&paths, secs, password_file)?,
+            MeshCmd::RecoveryShowOnce => cmd_mesh_recovery_show_once(&paths)?,
             MeshCmd::Unlock { password_file } => cmd_mesh_unlock(&paths, password_file)?,
             MeshCmd::Lock => cmd_mesh_lock(&paths)?,
             MeshCmd::Status => cmd_mesh_status(&paths).await?,
@@ -1421,7 +1562,10 @@ fn cmd_grant_create(
         mymesh_core::LimitKind::GrantMutate,
         mymesh_core::HOST_LOCAL_SESSION,
     ) {
-        bail!("rate_limited: grant mutate; retry after {}s", rl.retry_after_secs);
+        bail!(
+            "rate_limited: grant mutate; retry after {}s",
+            rl.retry_after_secs
+        );
     }
 
     let identity = Identity::load_or_create(paths.identity_file())?;
@@ -1526,7 +1670,8 @@ fn cmd_grant_list(paths: &Paths, json: bool, all: bool) -> Result<()> {
 }
 
 fn cmd_continuity_status(paths: &Paths, pack_id: &str, json: bool) -> Result<()> {
-    let status = continuity_status_pack(paths, pack_id.trim()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let status =
+        continuity_status_pack(paths, pack_id.trim()).map_err(|e| anyhow::anyhow!("{e}"))?;
     if json {
         println!(
             "{}",
@@ -1560,6 +1705,311 @@ fn cmd_continuity_wipe(paths: &Paths, pack_id: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_enroll_list(paths: &Paths) -> Result<()> {
+    let store =
+        EnrollmentStore::open(paths.enrollments_file()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let list = store.list();
+    if list.is_empty() {
+        println!("No enrollments.");
+        println!(
+            "  mymesh enroll add --person-id … --facet personal --ts … --nonce … --person-pubkey … --sig-file …"
+        );
+        return Ok(());
+    }
+    for e in list {
+        let drive = if e.can_drive { "drive" } else { "revoked" };
+        let label = e.label.as_deref().unwrap_or("");
+        println!(
+            "{}  {}  {}  {}  {}  {}",
+            e.enrollment_id,
+            e.person_id,
+            e.facet.as_str(),
+            drive,
+            e.enrolled_at,
+            label
+        );
+    }
+    Ok(())
+}
+
+fn cmd_enroll_revoke(paths: &Paths, person_id: &str) -> Result<()> {
+    let _auth = mymesh_core::AdminAuthority::host_local();
+    debug_assert!(_auth.may_mutate_local_store());
+    let pid = person_id.trim();
+    if pid.is_empty() {
+        bail!("person_id is required");
+    }
+    let mut store =
+        EnrollmentStore::open(paths.enrollments_file()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let rec = store.revoke(pid).map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!(
+        "{} revoked enrollment {} ({})",
+        style("ok").green().bold(),
+        rec.person_id,
+        rec.enrollment_id
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_enroll_add(
+    paths: &Paths,
+    person_id: &str,
+    facet: &str,
+    ts: &str,
+    nonce: &str,
+    person_pubkey: &str,
+    sig_file: &Path,
+    label: Option<String>,
+) -> Result<()> {
+    let _auth = mymesh_core::AdminAuthority::host_local();
+    debug_assert!(_auth.may_mutate_local_store());
+
+    let person_id = person_id.trim();
+    if person_id.is_empty() {
+        bail!("--person-id is required");
+    }
+    if let Err(rl) = mymesh_core::rate_limit_check_shared(
+        paths.metrics_dir(),
+        mymesh_core::LimitKind::EnrollWrite,
+        person_id,
+    ) {
+        bail!(
+            "rate_limited: enroll write; retry after {}s",
+            rl.retry_after_secs
+        );
+    }
+
+    let identity = Identity::load(paths.identity_file())
+        .with_context(|| "no identity — run mymesh init first")?;
+    let target = identity.device_id();
+    let facet = parse_enroll_facet(facet).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ts = parse_enroll_ts(ts)?;
+    let sig_hex = read_enroll_sig_hex(sig_file).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let body = EnrollWriteBody {
+        person_id: person_id.to_string(),
+        facet,
+        target_device_id_hex: target.to_string(),
+        ts,
+        nonce: nonce.trim().to_string(),
+        person_public_key_hex: person_pubkey.trim().to_string(),
+        sig_hex,
+        label: label.filter(|s| !s.trim().is_empty()),
+    };
+
+    let mut store =
+        EnrollmentStore::open(paths.enrollments_file()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let rec = store
+        .add(&target, &body)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!(
+        "{} enrolled {}  {}  {}",
+        style("ok").green().bold(),
+        rec.person_id,
+        rec.facet.as_str(),
+        rec.enrollment_id
+    );
+    println!("  can_drive  {}", rec.can_drive);
+    println!("  file       {}", paths.enrollments_file().display());
+    println!("  revoke     mymesh enroll revoke {}", rec.person_id);
+    Ok(())
+}
+
+fn cmd_memberships_list(paths: &Paths) -> Result<()> {
+    let mesh = MeshState::load(paths.mesh_file())?;
+    let store = MembershipStore::open_or_migrate(paths.mesh_memberships_file(), &mesh.mesh_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let list = store.list();
+    if list.is_empty() {
+        println!("No memberships.");
+        return Ok(());
+    }
+    println!("primary {}", store.primary_mesh_id());
+    for m in list {
+        let star = if m.primary { "*" } else { " " };
+        let via = m.via_grant_id.as_deref().unwrap_or("-");
+        println!(
+            "{star} {}  {}  primary={}  source={}  via={}  {}",
+            m.mesh_id,
+            m.role.as_str(),
+            m.primary,
+            m.source,
+            via,
+            m.joined_at
+        );
+    }
+    Ok(())
+}
+
+fn cmd_memberships_add(
+    paths: &Paths,
+    mesh_id: &str,
+    role: &str,
+    grant_id: Option<&str>,
+    on: Option<&str>,
+    caps: &str,
+    days: Option<u64>,
+) -> Result<()> {
+    let _auth = mymesh_core::AdminAuthority::host_local();
+    debug_assert!(_auth.may_mutate_local_store());
+
+    let dest = mesh_id.trim();
+    if dest.is_empty() {
+        bail!("--mesh is required");
+    }
+    let role = match role.trim().to_ascii_lowercase().as_str() {
+        "guest" => CatalogRole::Guest,
+        "member" => {
+            bail!("not_implemented: extra role=member is F8b (DeviceRecord.memberships)")
+        }
+        other => bail!("unknown role '{other}' (want guest)"),
+    };
+    let _ = role;
+
+    let identity = Identity::load_or_create(paths.identity_file())?;
+    let local_id = identity.device_id();
+    let mesh = MeshState::load(paths.mesh_file())?;
+    if dest == mesh.mesh_id {
+        bail!("cannot add extra membership on the primary mesh");
+    }
+
+    let mut cat = MembershipStore::open_or_migrate(paths.mesh_memberships_file(), &mesh.mesh_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    cat.ensure_can_add_guest(dest)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut grants = GrantStore::open(paths.grants_file())?;
+    let mut created_grant_id: Option<String> = None;
+    let via_grant_id = if let Some(raw) = grant_id.map(str::trim).filter(|s| !s.is_empty()) {
+        if raw.len() > 32
+            || !raw
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            bail!("--grant is not a valid grant id");
+        }
+        match grants.get(raw) {
+            None => {
+                // Dest-issued pointer: GrantAnnounce does not replicate foreign mesh_id.
+                raw.to_string()
+            }
+            Some(g) => {
+                if !g.is_active(chrono::Utc::now()) {
+                    bail!("grant {raw} is revoked or expired");
+                }
+                if g.mesh_id != dest {
+                    bail!(
+                        "grant {raw} mesh_id {} does not match --mesh {dest}",
+                        g.mesh_id
+                    );
+                }
+                if g.role != GrantRole::Guest {
+                    bail!("grant {raw} is not a guest grant");
+                }
+                if g.subject_device_id != local_id {
+                    bail!("grant {raw} subject is not this node");
+                }
+                if g.object.as_device_id().is_none() {
+                    bail!("grant {raw} object is not GrantObject::Device");
+                }
+                raw.to_string()
+            }
+        }
+    } else {
+        if let Err(rl) = mymesh_core::rate_limit_check_shared(
+            paths.metrics_dir(),
+            mymesh_core::LimitKind::GrantMutate,
+            mymesh_core::HOST_LOCAL_SESSION,
+        ) {
+            bail!(
+                "rate_limited: grant mutate; retry after {}s",
+                rl.retry_after_secs
+            );
+        }
+        let store = DeviceStore::open(paths.devices_file())?;
+        let object = match on {
+            Some(q) => resolve_device_or_hex(&store, q)?,
+            None => local_id,
+        };
+        let capabilities = parse_capabilities(caps).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if capabilities.contains(&Capability::Admin) {
+            bail!("Admin is not allowed on guest grants (product policy)");
+        }
+        let grant = grants
+            .create_guest(
+                dest,
+                local_id,
+                object,
+                capabilities,
+                not_after_days(days),
+                IssuedBy::device(&local_id),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        mymesh_core::record_grant_mutate(paths.metrics_dir());
+        println!(
+            "{} grant {}  guest {} → object {}  mesh {}",
+            style("ok").green().bold(),
+            grant.grant_id,
+            local_id.short(),
+            object.short(),
+            dest
+        );
+        created_grant_id = Some(grant.grant_id.clone());
+        grant.grant_id
+    };
+
+    let row = match cat.add_guest(dest, Some(via_grant_id.clone())) {
+        Ok(row) => row,
+        Err(e) => {
+            if let Some(gid) = created_grant_id {
+                let _ = grants.revoke(&gid);
+            }
+            return Err(anyhow::anyhow!("{e}"));
+        }
+    };
+    println!(
+        "{} guest overlap {}  via {}",
+        style("ok").green().bold(),
+        row.mesh_id,
+        via_grant_id
+    );
+    println!("  file  {}", paths.mesh_memberships_file().display());
+    println!("  leave mymesh memberships leave --mesh {}", row.mesh_id);
+    Ok(())
+}
+
+fn cmd_memberships_leave(paths: &Paths, mesh_id: &str) -> Result<()> {
+    let _auth = mymesh_core::AdminAuthority::host_local();
+    debug_assert!(_auth.may_mutate_local_store());
+    let dest = mesh_id.trim();
+    if dest.is_empty() {
+        bail!("--mesh is required");
+    }
+    let mesh = MeshState::load(paths.mesh_file())?;
+    let mut store = MembershipStore::open_or_migrate(paths.mesh_memberships_file(), &mesh.mesh_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let row = store.leave(dest).map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!(
+        "{} left guest membership {}",
+        style("ok").green().bold(),
+        row.mesh_id
+    );
+    Ok(())
+}
+
+fn parse_enroll_ts(ts: &str) -> Result<String> {
+    let t = ts.trim();
+    if mymesh_core::wire::parse_rfc3339_unix(t).is_ok() {
+        return Ok(t.to_string());
+    }
+    if let Ok(unix) = t.parse::<i64>() {
+        let dt = chrono::DateTime::from_timestamp(unix, 0)
+            .ok_or_else(|| anyhow::anyhow!("invalid --ts unix timestamp"))?;
+        return Ok(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+    }
+    bail!("--ts must be YYYY-MM-DDTHH:MM:SSZ or unix seconds");
+}
+
 fn cmd_grant_revoke(paths: &Paths, grant_id: &str) -> Result<()> {
     let _auth = mymesh_core::AdminAuthority::host_local();
     if let Err(rl) = mymesh_core::rate_limit_check_shared(
@@ -1567,7 +2017,10 @@ fn cmd_grant_revoke(paths: &Paths, grant_id: &str) -> Result<()> {
         mymesh_core::LimitKind::GrantMutate,
         mymesh_core::HOST_LOCAL_SESSION,
     ) {
-        bail!("rate_limited: grant mutate; retry after {}s", rl.retry_after_secs);
+        bail!(
+            "rate_limited: grant mutate; retry after {}s",
+            rl.retry_after_secs
+        );
     }
     let mut grants = GrantStore::open(paths.grants_file())?;
     let g = grants
@@ -1665,18 +2118,40 @@ async fn cmd_serve(paths: &Paths) -> Result<()> {
     );
     let transport = std::sync::Arc::new(IrohTransport::bind(&identity).await?);
     let agent = Agent::from_paths(&identity, paths, cfg.clone())?;
+    // KD-F16: serve owns pair/v2 + mesh/v1. Fail closed so MMA1 never mints a
+    // QR against a port we do not hold (lab `mymesh carrier` leftover, etc.).
+    let http = agent
+        .spawn_pair_http(paths, PAIR_HTTP_PORT)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "pair HTTP bind :{PAIR_HTTP_PORT} failed: {e}\n\
+             stop lab `mymesh carrier` if it owns the port"
+            )
+        })?;
+    println!("  pair HTTP   0.0.0.0:{PAIR_HTTP_PORT}  /pair/v2 /mesh/v1");
+    if cfg.admin_mailbox_url().is_some() {
+        println!("  admin mailbox poller  (self-host, not a product)");
+    }
+    let host_base = http.host_base;
     // Single iroh endpoint: dial proxy so CLI/TUI never re-bind the same identity.
+    // MMA1 arm_pair_qr shares this socket; MMD1 dial is unchanged after 4-byte magic.
     let sock = std::path::PathBuf::from(&cfg.daemon.control_socket);
+    let admin = std::sync::Arc::new(PairArmAdmin {
+        paths: paths.clone(),
+        secret: identity.to_secret_bytes(),
+        host_base: std::sync::Arc::new(tokio::sync::Mutex::new(host_base)),
+    });
     {
-        let t = transport.clone();
+        let t: std::sync::Arc<dyn Transport> = transport.clone();
         let sock = sock.clone();
         tokio::spawn(async move {
-            if let Err(e) = mymesh_net::serve_dial_proxy(sock, t).await {
+            if let Err(e) = serve_control_socket(sock, t, Some(admin)).await {
                 tracing::error!(%e, "dial proxy exited");
             }
         });
     }
-    println!("  dial proxy  {}", sock.display());
+    println!("  dial proxy  {}  (MMD1 dial, MMA1 admin)", sock.display());
     // Magic plane: DNS, SOCKS5, mesh-IP auto ports, reconnect probes (shared transport)
     mymesh_session::MagicPlane::new(
         paths.clone(),
@@ -2142,7 +2617,12 @@ fn print_mmk_status(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn cmd_mesh_init(paths: &Paths, password_file: Option<PathBuf>, force: bool) -> Result<()> {
+fn cmd_mesh_init(
+    paths: &Paths,
+    password_file: Option<PathBuf>,
+    force: bool,
+    name: Option<String>,
+) -> Result<()> {
     paths.ensure()?;
     let path = paths.mesh_master_file();
     if MeshMasterFile::exists(&path) && !force {
@@ -2151,17 +2631,24 @@ fn cmd_mesh_init(paths: &Paths, password_file: Option<PathBuf>, force: bool) -> 
             path.display()
         );
     }
+    if MeshMasterFile::exists(&path) && force {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("remove {} for --force", path.display()))?;
+        // Stale one-shot codes would belong to the previous MRK.
+        let _ = std::fs::remove_file(paths.mesh_recovery_once_file());
+    }
     let password = read_mmk_password(password_file.as_deref(), "New mesh master password", true)?;
-    let init = mesh_init(password.as_bytes(), None)?;
-    init.file.save(&path)?;
-
-    // Migration (KD15): record creator + fingerprint. Existing Trusted peers keep
-    // stored capabilities (no Admin auto-grant). Host-local CLI always node-admin.
-    let identity = Identity::load_or_create(paths.identity_file())?;
-    let mut mesh = MeshState::load(paths.mesh_file())?;
-    mesh.mrk_fingerprint = Some(init.file.mrk_fingerprint.clone());
-    mesh.creator_device_id = Some(identity.device_id());
-    mesh.save(paths.mesh_file())?;
+    let display_name = name
+        .or_else(|| {
+            Config::load(paths.config_file())
+                .ok()
+                .map(|c| c.device_label)
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "Home".into());
+    let first =
+        apply_first_mesh_init(paths, password.as_bytes(), &display_name, None, false, None)?;
+    let init = &first.init;
 
     // Existing Trusted devices: leave capabilities as stored (no Admin auto-grant).
     let store = DeviceStore::open(paths.devices_file())?;
@@ -2174,12 +2661,12 @@ fn cmd_mesh_init(paths: &Paths, password_file: Option<PathBuf>, force: bool) -> 
         })
         .count();
 
-    // Default re-prompt: do not leave runtime unlocked unless user runs unlock.
-    let _ = MmkRuntime::clear(paths.mmk_runtime_file());
+    let identity = Identity::load_or_create(paths.identity_file())?;
 
     println!("{}", style("Mesh master key initialized").green().bold());
     println!("  file          {}", path.display());
     println!("  fingerprint   {}", init.file.mrk_fingerprint);
+    println!("  display_name  {}", first.display_name);
     println!(
         "  creator       {} (host-local admin on this node)",
         identity.device_id().short()
@@ -2210,6 +2697,48 @@ fn cmd_mesh_init(paths: &Paths, password_file: Option<PathBuf>, force: bool) -> 
     println!("Next: mymesh mesh unlock   # then mymesh mesh prove  (admin proof)");
     println!("      mymesh devices grant-admin <id>   # remote Admin for a Trusted peer");
     Ok(())
+}
+
+fn cmd_mesh_allow_create(paths: &Paths, secs: u64, password_file: Option<PathBuf>) -> Result<()> {
+    paths.ensure()?;
+    if MeshMasterFile::exists(paths.mesh_master_file()) {
+        bail!(
+            "mesh already inited at {} — pick a box that has not been inited (no dual-MMK)",
+            paths.mesh_master_file().display()
+        );
+    }
+    let password = read_mmk_password(password_file.as_deref(), "New mesh master password", true)?;
+    let win = CreateWindowFile::mint(secs, Some(password));
+    win.save(paths.create_window_file())?;
+    println!("{}", style("create window open").green().bold());
+    println!("  until  {}", win.until.to_rfc3339());
+    println!("  secs   {}", win.secs);
+    println!(
+        "  file   {} (mode 0600; Carrier POST /meshes may init this box)",
+        paths.create_window_file().display()
+    );
+    println!("  note   phone never receives MMK — password stays on this node");
+    Ok(())
+}
+
+fn cmd_mesh_recovery_show_once(paths: &Paths) -> Result<()> {
+    match take_recovery_once(paths.mesh_recovery_once_file())? {
+        None => {
+            println!("no mesh-recovery-once.txt — already shown, or init used a TTY");
+            Ok(())
+        }
+        Some(body) => {
+            println!(
+                "{}",
+                style("RECOVERY — save now; this file is deleted")
+                    .red()
+                    .bold()
+            );
+            print!("{body}");
+            println!("deleted {}", paths.mesh_recovery_once_file().display());
+            Ok(())
+        }
+    }
 }
 
 /// Sign challenge with unlocked MRK (Ed25519 admin proof). Demonstrates B2 without Carrier.
@@ -2560,12 +3089,8 @@ fn cmd_owner_backup_store(
         owner.save(paths.mesh_owner_file())?;
     }
     // Smoke-check roundtrip under S9 unwrap rate limit (5 / 15 min / person_id).
-    let (out, _) = rate_limited_unseal_owner_backup(
-        paths,
-        person_id,
-        password.as_bytes(),
-        &sealed,
-    )?;
+    let (out, _) =
+        rate_limited_unseal_owner_backup(paths, person_id, password.as_bytes(), &sealed)?;
     if out != seed {
         bail!("internal: backup roundtrip mismatch");
     }
@@ -2766,7 +3291,7 @@ async fn sync_with_peer(
                             &from_id, &mesh_id, ts, &members, &signature,
                         )?;
                         let mut store = DeviceStore::open(paths.devices_file())?;
-                        added += apply_membership(
+                        added += apply_membership_gossip(
                             &mut store,
                             &paths.mesh_file(),
                             &from_id,

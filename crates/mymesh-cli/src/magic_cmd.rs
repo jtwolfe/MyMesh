@@ -378,6 +378,11 @@ pub async fn cmd_expose(
 pub async fn cmd_carrier(paths: &Paths, port: u16, pair_v1: bool) -> Result<()> {
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file())?;
+    let sock = std::path::PathBuf::from(&cfg.daemon.control_socket);
+    if mymesh_net::serve_owns_pair_http(port, &sock) {
+        bail!("serve owns pair HTTP");
+    }
+    eprintln!("warning: mymesh serve is not running; lab-only bind of pair HTTP (emulator/airgap)");
     // clear pending
     let pend = carrier_pending_path(paths);
     let _ = std::fs::remove_file(&pend);
@@ -399,17 +404,17 @@ pub async fn cmd_carrier(paths: &Paths, port: u16, pair_v1: bool) -> Result<()> 
     };
     println!("{}", style("connect by carrier").bold());
     println!(
-        "  pair API  {}/{}  (QR v{})",
-        handle.host_base, pair_prefix, handle.pair_protocol_version
+        "  pair API  /{}  (QR v{}; host= is a private last-mile hint)",
+        pair_prefix, handle.pair_protocol_version
     );
-    println!("  page      {}  (deprecated HTML fallback)", handle.url);
+    println!("  page      (deprecated HTML fallback; URL not shown)");
     if pair_v1 {
         println!("  mode      pair/v1 LAN escape (--pair-v1)");
     } else {
         println!("  mode      pair/v2 default (use --pair-v1 for alpha.1 LAN QR)");
     }
     println!();
-    println!("  scan this QR with Carrier (same LAN):");
+    println!("  scan this QR with Carrier (lab CLI prints the payload):");
     println!("  {}", handle.pair_qr);
     if let Ok(code) = QrCode::new(handle.pair_qr.as_bytes()) {
         let qr = code
@@ -607,14 +612,39 @@ pub fn magic_status_text(paths: &Paths) -> Result<String> {
     ))
 }
 
-/// Start carrier HTTP + default pair/v2 QR; returns HTML page URL and pair QR deep link.
+/// Start or arm pair/v2 QR; returns page URL (internal) and pair QR deep link.
 ///
-/// TUI uses product default (v2). CLI escape: `mymesh carrier --pair-v1`.
+/// When serve owns `:17878`, arms via MMA1 (no second HTTP bind). Lab fallback
+/// binds only if serve/port is down. The QR still includes `host=` as a private
+/// last-mile hint (KD-F18 / F9 — do not strip). TUI must not display `host_base`.
 pub async fn start_carrier_ui(paths: &Paths, port: u16) -> Result<(String, String)> {
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file())?;
+    let sock = std::path::PathBuf::from(&cfg.daemon.control_socket);
     let pend = carrier_pending_path(paths);
     let _ = std::fs::remove_file(&pend);
+
+    if mymesh_net::agent_control_live(&sock) {
+        match mymesh_net::arm_pair_qr_via_agent(&sock, 900).await {
+            Ok(armed) => {
+                let qr = armed.qr.unwrap_or_default();
+                let host = armed
+                    .host_base
+                    .unwrap_or_else(|| format!("http://127.0.0.1:{port}"));
+                let url = format!("{}/", host.trim_end_matches('/'));
+                return Ok((url, qr));
+            }
+            Err(e) => {
+                // Serve owns the socket — never steal :17878.
+                bail!("serve owns pair HTTP; arm_pair_qr failed: {e}");
+            }
+        }
+    }
+    if mymesh_net::pair_http_port_live(port) {
+        bail!("serve owns pair HTTP");
+    }
+
+    eprintln!("warning: mymesh serve is not running; lab-only bind of pair HTTP (emulator/airgap)");
     // Arm *before* start so bootstrap token / session TTL matches arm.until
     let _ = mymesh_core::ArmState::arm(paths.arm_file(), 900);
     let handle = start_carrier(
