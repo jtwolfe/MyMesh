@@ -146,11 +146,27 @@ async fn handle_inbox_blob(
         .unwrap_or_else(|_| b"{\"code\":\"bad_request\",\"error\":\"envelope\"}".to_vec())
     })?;
     let resp = execute_admin_envelope(st, env, "mailbox");
+    let status = resp.status().as_u16();
     let bytes = to_bytes(resp.into_body(), 64 * 1024)
         .await
         .map(|b| b.to_vec())
         .unwrap_or_else(|_| b"{\"code\":\"internal\",\"error\":\"mailbox exec body\"}".to_vec());
-    Ok(bytes)
+    Ok(outbox_with_status(status, bytes))
+}
+
+/// Keep error `code` / `http_status` so the phone does not treat 403 as a missing ack.
+fn outbox_with_status(status: u16, bytes: Vec<u8>) -> Vec<u8> {
+    let mut v = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .unwrap_or_else(|_| serde_json::json!({ "error": "mailbox exec" }));
+    if status >= 400 {
+        if let Some(obj) = v.as_object_mut() {
+            obj.entry("code")
+                .or_insert_with(|| serde_json::json!("error"));
+            obj.insert("http_status".into(), serde_json::json!(status));
+            obj.insert("ok".into(), serde_json::json!(false));
+        }
+    }
+    serde_json::to_vec(&v).unwrap_or(bytes)
 }
 
 #[cfg(test)]
@@ -280,5 +296,57 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["state"], "dialing");
         assert_eq!(v["joiner_did"], joiner.device_id().to_string());
+    }
+
+    #[tokio::test]
+    async fn outbox_preserves_enrollment_pending_code() {
+        let secret = [0xB8u8; 32];
+        let joiner = Identity::from_secret_bytes(secret);
+        let resident = Identity::from_secret_bytes([0xA8u8; 32]);
+        let person = Identity::from_secret_bytes([0x42u8; 32]);
+        let paths = tmp_paths();
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        let ts = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let ts_unix = mymesh_core::wire::parse_rfc3339_unix(&ts).unwrap();
+        let payload = IntroducePayload {
+            resident_did: resident.device_id().to_string(),
+            joiner_did: joiner.device_id().to_string(),
+            resident_fp: None,
+        };
+        let payload_json = serde_json::to_string(&payload).unwrap();
+        let env_nonce = [0x29u8; 16];
+        let pre = admin_envelope_preimage(
+            AdminOp::Introduce,
+            joiner.device_id().as_bytes(),
+            "",
+            ts_unix,
+            &env_nonce,
+            &person.verifying_key_bytes(),
+            payload_json.as_bytes(),
+        )
+        .unwrap();
+        let env = AdminEnvelope {
+            v: 1,
+            op: AdminOp::Introduce,
+            target_device_id_hex: joiner.device_id().to_string(),
+            mesh_id: None,
+            ts,
+            nonce: mymesh_core::wire::encode_base64url(&env_nonce),
+            person_id: "01HZXPERSON0000000000000".into(),
+            facet: PersonFacet::Personal,
+            payload_json,
+            sig_hex: hex::encode(person.sign(&pre)),
+        };
+        let json = serde_json::to_vec(&env).unwrap();
+        let sealed = seal_admin_envelope(&joiner.verifying_key_bytes(), &json).unwrap();
+        let blob = serde_json::to_vec(&sealed).unwrap();
+        let st = test_state(paths, secret);
+        let out = match handle_inbox_blob(&st, &secret, &blob).await {
+            Ok(b) | Err(b) => b,
+        };
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["code"], "enrollment_pending");
+        assert_eq!(v["http_status"], 403);
+        assert_eq!(v["ok"], false);
     }
 }

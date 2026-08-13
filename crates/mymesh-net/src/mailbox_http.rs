@@ -20,6 +20,7 @@ use mymesh_core::{client_ip_key, Error, LimitKind, RateLimited, Result};
 use mymesh_crypto::IdentityPublic;
 use mymesh_protocol::PairingMessage;
 use parking_lot::Mutex;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -193,15 +194,24 @@ impl ByteLane {
     fn push(&mut self, msg: Vec<u8>, ttl: Duration) {
         self.prune(ttl);
         self.last = Instant::now();
-        if let Some(w) = self.waiters.pop_front() {
-            let _ = w.send(msg);
-        } else {
-            // Cap so a stuck poller cannot grow memory.
-            while self.queue.len() >= 8 {
-                self.queue.pop_front();
+        // Timed-out GETs drop `rx` but leave `tx` queued. Skip closed
+        // waiters so the next PUT is not delivered into the void.
+        let mut msg = Some(msg);
+        while let Some(w) = self.waiters.pop_front() {
+            if w.is_closed() {
+                continue;
             }
-            self.queue.push_back((msg, Instant::now()));
+            let payload = msg.take().expect("payload still pending");
+            match w.send(payload) {
+                Ok(()) => return,
+                Err(payload) => msg = Some(payload),
+            }
         }
+        let msg = msg.expect("payload still pending");
+        while self.queue.len() >= 8 {
+            self.queue.pop_front();
+        }
+        self.queue.push_back((msg, Instant::now()));
     }
 
     fn pop(&mut self, ttl: Duration) -> Option<Vec<u8>> {
@@ -227,6 +237,8 @@ impl Default for AdminBox {
 
 struct BoundDid {
     at: Instant,
+    /// Node-only capability for GET inbox / POST outbox (not enrollment).
+    token: String,
 }
 
 #[derive(Clone)]
@@ -504,11 +516,69 @@ async fn admin_bind(
     if pk.verify(&pre, &sig).is_err() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    state
+    let token = new_bind_token();
+    state.bound.lock().insert(
+        path_did,
+        BoundDid {
+            at: Instant::now(),
+            token: token.clone(),
+        },
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "token": token })),
+    )
+        .into_response()
+}
+
+fn new_bind_token() -> String {
+    let mut raw = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut raw);
+    hex::encode(raw)
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let val = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    val.strip_prefix("Bearer ")
+        .or_else(|| val.strip_prefix("bearer "))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn token_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+/// GET inbox / POST outbox: bind token. Phone POST inbox / GET outbox stay open.
+fn require_node_token(
+    state: &MailboxState,
+    did: &str,
+    headers: &HeaderMap,
+) -> std::result::Result<(), StatusCode> {
+    if !is_bound(state, did) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let want = state
         .bound
         .lock()
-        .insert(path_did, BoundDid { at: Instant::now() });
-    StatusCode::NO_CONTENT.into_response()
+        .get(did)
+        .map(|b| b.token.clone())
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let got = bearer_token(headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    if !token_eq(&want, &got) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(())
 }
 
 enum AdminLaneKind {
@@ -521,18 +591,25 @@ async fn admin_put_inbox(
     Path(device_id): Path<String>,
     body: Bytes,
 ) -> Response {
-    admin_put(state, device_id, body, AdminLaneKind::Inbox)
+    admin_put(state, device_id, body, AdminLaneKind::Inbox, None)
 }
 
 async fn admin_put_outbox(
     State(state): State<MailboxState>,
+    headers: HeaderMap,
     Path(device_id): Path<String>,
     body: Bytes,
 ) -> Response {
-    admin_put(state, device_id, body, AdminLaneKind::Outbox)
+    admin_put(state, device_id, body, AdminLaneKind::Outbox, Some(headers))
 }
 
-fn admin_put(state: MailboxState, device_id: String, body: Bytes, lane: AdminLaneKind) -> Response {
+fn admin_put(
+    state: MailboxState,
+    device_id: String,
+    body: Bytes,
+    lane: AdminLaneKind,
+    headers: Option<HeaderMap>,
+) -> Response {
     let did = match normalize_did_path(&device_id) {
         Ok(d) => d,
         Err(s) => return s.into_response(),
@@ -543,6 +620,13 @@ fn admin_put(state: MailboxState, device_id: String, body: Bytes, lane: AdminLan
     if matches!(lane, AdminLaneKind::Inbox) {
         if let Err(rl) = limit_check(&state, LimitKind::MailboxPut, &did) {
             return rate_limited(rl);
+        }
+    }
+    if matches!(lane, AdminLaneKind::Outbox) {
+        if let Some(h) = headers.as_ref() {
+            if let Err(s) = require_node_token(&state, &did, h) {
+                return s.into_response();
+            }
         }
     }
     if !is_bound(&state, &did) {
@@ -560,10 +644,11 @@ fn admin_put(state: MailboxState, device_id: String, body: Bytes, lane: AdminLan
 
 async fn admin_get_inbox(
     State(state): State<MailboxState>,
+    headers: HeaderMap,
     Path(device_id): Path<String>,
     Query(q): Query<WaitQuery>,
 ) -> Response {
-    admin_get(state, device_id, q, AdminLaneKind::Inbox).await
+    admin_get(state, device_id, q, AdminLaneKind::Inbox, Some(headers)).await
 }
 
 async fn admin_get_outbox(
@@ -571,7 +656,7 @@ async fn admin_get_outbox(
     Path(device_id): Path<String>,
     Query(q): Query<WaitQuery>,
 ) -> Response {
-    admin_get(state, device_id, q, AdminLaneKind::Outbox).await
+    admin_get(state, device_id, q, AdminLaneKind::Outbox, None).await
 }
 
 async fn admin_get(
@@ -579,11 +664,19 @@ async fn admin_get(
     device_id: String,
     q: WaitQuery,
     lane: AdminLaneKind,
+    headers: Option<HeaderMap>,
 ) -> Response {
     let did = match normalize_did_path(&device_id) {
         Ok(d) => d,
         Err(s) => return s.into_response(),
     };
+    if matches!(lane, AdminLaneKind::Inbox) {
+        if let Some(h) = headers.as_ref() {
+            if let Err(s) = require_node_token(&state, &did, h) {
+                return s.into_response();
+            }
+        }
+    }
     if !is_bound(&state, &did) {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -633,6 +726,7 @@ fn opaque_ok(msg: Vec<u8>) -> Response {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdminMailboxError {
     Unbound,
+    Unauthorized,
     TooLarge,
     RateLimited { retry_after_secs: u64 },
     Http(String),
@@ -643,6 +737,7 @@ impl std::fmt::Display for AdminMailboxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unbound => write!(f, "mailbox did unbound"),
+            Self::Unauthorized => write!(f, "mailbox bind token required"),
             Self::TooLarge => write!(f, "mailbox blob too large"),
             Self::RateLimited { retry_after_secs } => {
                 write!(f, "mailbox rate limited (retry {retry_after_secs}s)")
@@ -660,6 +755,8 @@ impl std::error::Error for AdminMailboxError {}
 pub struct AdminMailboxClient {
     base: String,
     client: reqwest::Client,
+    /// Bind token for GET inbox / POST outbox (node poller).
+    token: Arc<Mutex<Option<String>>>,
 }
 
 impl AdminMailboxClient {
@@ -671,6 +768,7 @@ impl AdminMailboxClient {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("reqwest client"),
+            token: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -687,7 +785,28 @@ impl AdminMailboxClient {
             .send()
             .await
             .map_err(|e| AdminMailboxError::Http(truncate_http(&e.to_string())))?;
-        map_empty_status(res.status().as_u16())
+        let status = res.status().as_u16();
+        if status == 404 {
+            return Err(AdminMailboxError::Unbound);
+        }
+        if !(200..300).contains(&status) {
+            return Err(map_status_err(status));
+        }
+        let v: serde_json::Value = res
+            .json()
+            .await
+            .map_err(|e| AdminMailboxError::Http(truncate_http(&e.to_string())))?;
+        let token = v
+            .get("token")
+            .and_then(|t| t.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AdminMailboxError::Http("bind missing token".into()))?;
+        *self.token.lock() = Some(token.to_string());
+        Ok(())
+    }
+
+    fn node_auth_header(&self) -> Option<String> {
+        self.token.lock().as_ref().map(|t| format!("Bearer {t}"))
     }
 
     pub async fn put_inbox(
@@ -716,10 +835,17 @@ impl AdminMailboxClient {
             return Err(AdminMailboxError::TooLarge);
         }
         let url = self.admin_url(did, lane);
-        let res = self
+        let mut req = self
             .client
             .post(&url)
-            .header("content-type", "application/octet-stream")
+            .header("content-type", "application/octet-stream");
+        // Node writes outbox; phone writes inbox (no bind token).
+        if lane == "outbox" {
+            if let Some(h) = self.node_auth_header() {
+                req = req.header("authorization", h);
+            }
+        }
+        let res = req
             .body(bytes.to_vec())
             .send()
             .await
@@ -750,10 +876,17 @@ impl AdminMailboxClient {
         wait_ms: u64,
     ) -> std::result::Result<Option<Vec<u8>>, AdminMailboxError> {
         let url = self.admin_url(did, lane);
-        let res = self
+        let mut req = self
             .client
             .get(&url)
-            .query(&[("wait_ms", wait_ms.min(ADMIN_MAILBOX_POLL_MS))])
+            .query(&[("wait_ms", wait_ms.min(ADMIN_MAILBOX_POLL_MS))]);
+        // Node reads inbox; phone reads outbox (no bind token).
+        if lane == "inbox" {
+            if let Some(h) = self.node_auth_header() {
+                req = req.header("authorization", h);
+            }
+        }
+        let res = req
             .send()
             .await
             .map_err(|e| AdminMailboxError::Http(truncate_http(&e.to_string())))?;
@@ -782,6 +915,7 @@ fn map_empty_status(status: u16) -> std::result::Result<(), AdminMailboxError> {
     match status {
         200 | 204 => Ok(()),
         404 => Err(AdminMailboxError::Unbound),
+        401 => Err(AdminMailboxError::Unauthorized),
         413 => Err(AdminMailboxError::TooLarge),
         429 => Err(AdminMailboxError::RateLimited {
             retry_after_secs: 60,
@@ -793,6 +927,7 @@ fn map_empty_status(status: u16) -> std::result::Result<(), AdminMailboxError> {
 fn map_status_err(status: u16) -> AdminMailboxError {
     match status {
         404 => AdminMailboxError::Unbound,
+        401 => AdminMailboxError::Unauthorized,
         413 => AdminMailboxError::TooLarge,
         429 => AdminMailboxError::RateLimited {
             retry_after_secs: 60,
@@ -881,6 +1016,41 @@ mod tests {
         c.put_inbox(&bind.did, payload).await.unwrap();
         let got = c.get_inbox(&bind.did, 0).await.unwrap();
         assert_eq!(got.as_deref(), Some(payload.as_slice()));
+        let _ = std::fs::remove_dir_all(metrics);
+    }
+
+    #[tokio::test]
+    async fn timed_out_get_does_not_drop_next_put() {
+        let (base, metrics) = start().await;
+        let c = AdminMailboxClient::new(&base);
+        let id = Identity::from_secret_bytes([0x55u8; 32]);
+        let bind = signed_bind(&id);
+        c.bind(&bind).await.unwrap();
+        assert!(c.get_inbox(&bind.did, 1).await.unwrap().is_none());
+        let payload = b"sealed-after-timeout";
+        c.put_inbox(&bind.did, payload).await.unwrap();
+        let got = c.get_inbox(&bind.did, 0).await.unwrap();
+        assert_eq!(got.as_deref(), Some(payload.as_slice()));
+        let _ = std::fs::remove_dir_all(metrics);
+    }
+
+    #[tokio::test]
+    async fn inbox_get_requires_bind_token() {
+        let (base, metrics) = start().await;
+        let c = AdminMailboxClient::new(&base);
+        let id = Identity::from_secret_bytes([0x66u8; 32]);
+        let bind = signed_bind(&id);
+        c.bind(&bind).await.unwrap();
+        c.put_inbox(&bind.did, b"x").await.unwrap();
+        let bare = reqwest::Client::new();
+        let res = bare
+            .get(format!("{base}/v1/admin/{}/inbox?wait_ms=0", bind.did))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status().as_u16(), 401);
+        let got = c.get_inbox(&bind.did, 0).await.unwrap();
+        assert_eq!(got.as_deref(), Some(b"x".as_slice()));
         let _ = std::fs::remove_dir_all(metrics);
     }
 
