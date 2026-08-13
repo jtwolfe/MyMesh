@@ -11,12 +11,12 @@ mod tui_app;
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use console::style;
-use mymesh_core::wire::EnrollWriteBody;
+use mymesh_core::wire::{CatalogRole, EnrollWriteBody};
 use mymesh_core::{
     not_after_days, parse_capabilities, parse_enroll_facet, read_enroll_sig_hex,
     status_pack as continuity_status_pack, wipe_pack as continuity_wipe_pack, ArmState, Capability,
-    Config, DeviceStore, EnrollmentStore, GrantStore, IssuedBy, JoinDecision, JoinStore, MeshState,
-    Paths,
+    Config, DeviceStore, EnrollmentStore, GrantRole, GrantStore, IssuedBy, JoinDecision, JoinStore,
+    MembershipStore, MeshState, Paths,
 };
 use mymesh_crypto::{
     accept_owner_claim, admin_verifying_key_bytes, check_claim_authorized, device_id_to_words,
@@ -31,7 +31,7 @@ use mymesh_net::{
 };
 use mymesh_protocol::{decode_msg, encode_msg, ChannelId, FileMessage, Frame, TerminalMessage};
 use mymesh_session::{
-    apply_kick_target, apply_membership, build_announce, run_guest_pair, run_host_pair_code,
+    apply_kick_target, apply_membership_gossip, build_announce, run_guest_pair, run_host_pair_code,
     run_join_as_guest, sign_kick, Agent, Session,
 };
 use mymesh_terminal::TerminalClient;
@@ -135,6 +135,11 @@ enum Commands {
     Enroll {
         #[command(subcommand)]
         action: EnrollCmd,
+    },
+    /// This-node membership catalog + guest overlap (Wave F8; host-local)
+    Memberships {
+        #[command(subcommand)]
+        action: MembershipsCmd,
     },
     /// Continuity pack status / wipe (S8; host-local)
     Continuity {
@@ -447,6 +452,37 @@ enum EnrollCmd {
         /// Optional phone / person label
         #[arg(long)]
         label: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MembershipsCmd {
+    /// List this node's primary + guest catalog rows
+    List,
+    /// Add guest overlap (host-local). `--role member` is F8b.
+    Add {
+        #[arg(long = "mesh", value_name = "MESH_ID")]
+        mesh: String,
+        /// `guest` this wave; `member` extra → not_implemented
+        #[arg(long, default_value = "guest")]
+        role: String,
+        /// Attach an existing grant id (Grant.mesh_id must match)
+        #[arg(long = "grant", value_name = "GRANT_ID")]
+        grant: Option<String>,
+        /// Object host for a new dest grant (default: this node)
+        #[arg(long = "on", value_name = "DEVICE")]
+        on: Option<String>,
+        /// Caps for a new dest grant (default: terminal,files)
+        #[arg(long = "caps", default_value = "terminal,files")]
+        caps: String,
+        /// Optional expiry in days for a new dest grant
+        #[arg(long = "days")]
+        days: Option<u64>,
+    },
+    /// Leave a guest catalog row (does not revoke the dest grant)
+    Leave {
+        #[arg(long = "mesh", value_name = "MESH_ID")]
+        mesh: String,
     },
 }
 
@@ -837,6 +873,26 @@ async fn main() -> Result<()> {
             }
             GrantCmd::List { json, all } => cmd_grant_list(&paths, json, all)?,
             GrantCmd::Revoke { grant_id } => cmd_grant_revoke(&paths, &grant_id)?,
+        },
+        Commands::Memberships { action } => match action {
+            MembershipsCmd::List => cmd_memberships_list(&paths)?,
+            MembershipsCmd::Add {
+                mesh,
+                role,
+                grant,
+                on,
+                caps,
+                days,
+            } => cmd_memberships_add(
+                &paths,
+                &mesh,
+                &role,
+                grant.as_deref(),
+                on.as_deref(),
+                &caps,
+                days,
+            )?,
+            MembershipsCmd::Leave { mesh } => cmd_memberships_leave(&paths, &mesh)?,
         },
         Commands::Enroll { action } => match action {
             EnrollCmd::List => cmd_enroll_list(&paths)?,
@@ -1734,6 +1790,152 @@ fn cmd_enroll_add(
     println!("  can_drive  {}", rec.can_drive);
     println!("  file       {}", paths.enrollments_file().display());
     println!("  revoke     mymesh enroll revoke {}", rec.person_id);
+    Ok(())
+}
+
+fn cmd_memberships_list(paths: &Paths) -> Result<()> {
+    let mesh = MeshState::load(paths.mesh_file())?;
+    let store = MembershipStore::open_or_migrate(paths.mesh_memberships_file(), &mesh.mesh_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let list = store.list();
+    if list.is_empty() {
+        println!("No memberships.");
+        return Ok(());
+    }
+    println!("primary {}", store.primary_mesh_id());
+    for m in list {
+        let star = if m.primary { "*" } else { " " };
+        let via = m.via_grant_id.as_deref().unwrap_or("-");
+        println!(
+            "{star} {}  {}  primary={}  source={}  via={}  {}",
+            m.mesh_id,
+            m.role.as_str(),
+            m.primary,
+            m.source,
+            via,
+            m.joined_at
+        );
+    }
+    Ok(())
+}
+
+fn cmd_memberships_add(
+    paths: &Paths,
+    mesh_id: &str,
+    role: &str,
+    grant_id: Option<&str>,
+    on: Option<&str>,
+    caps: &str,
+    days: Option<u64>,
+) -> Result<()> {
+    let _auth = mymesh_core::AdminAuthority::host_local();
+    debug_assert!(_auth.may_mutate_local_store());
+
+    let dest = mesh_id.trim();
+    if dest.is_empty() {
+        bail!("--mesh is required");
+    }
+    let role = match role.trim().to_ascii_lowercase().as_str() {
+        "guest" => CatalogRole::Guest,
+        "member" => {
+            bail!("not_implemented: extra role=member is F8b (DeviceRecord.memberships)")
+        }
+        other => bail!("unknown role '{other}' (want guest)"),
+    };
+    let _ = role;
+
+    let identity = Identity::load_or_create(paths.identity_file())?;
+    let local_id = identity.device_id();
+    let mesh = MeshState::load(paths.mesh_file())?;
+    if dest == mesh.mesh_id {
+        bail!("cannot add extra membership on the primary mesh");
+    }
+
+    let mut grants = GrantStore::open(paths.grants_file())?;
+    let via_grant_id = if let Some(gid) = grant_id.map(str::trim).filter(|s| !s.is_empty()) {
+        let g = grants
+            .get(gid)
+            .ok_or_else(|| anyhow::anyhow!("grant {gid} not found"))?;
+        if g.mesh_id != dest {
+            bail!(
+                "grant {gid} mesh_id {} does not match --mesh {dest}",
+                g.mesh_id
+            );
+        }
+        if g.role != GrantRole::Guest {
+            bail!("grant {gid} is not a guest grant");
+        }
+        if g.subject_device_id != local_id {
+            bail!("grant {gid} subject is not this node");
+        }
+        if g.object.as_device_id().is_none() {
+            bail!("grant {gid} object is not GrantObject::Device");
+        }
+        gid.to_string()
+    } else {
+        let store = DeviceStore::open(paths.devices_file())?;
+        let object = match on {
+            Some(q) => resolve_device_or_hex(&store, q)?,
+            None => local_id,
+        };
+        let capabilities = parse_capabilities(caps).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if capabilities.contains(&Capability::Admin) {
+            bail!("Admin is not allowed on guest grants (product policy)");
+        }
+        let grant = grants
+            .create_guest(
+                dest,
+                local_id,
+                object,
+                capabilities,
+                not_after_days(days),
+                IssuedBy::device(&local_id),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        mymesh_core::record_grant_mutate(paths.metrics_dir());
+        println!(
+            "{} grant {}  guest {} → object {}  mesh {}",
+            style("ok").green().bold(),
+            grant.grant_id,
+            local_id.short(),
+            object.short(),
+            dest
+        );
+        grant.grant_id
+    };
+
+    let mut store = MembershipStore::open_or_migrate(paths.mesh_memberships_file(), &mesh.mesh_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let row = store
+        .add_guest(dest, Some(via_grant_id.clone()))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!(
+        "{} guest overlap {}  via {}",
+        style("ok").green().bold(),
+        row.mesh_id,
+        via_grant_id
+    );
+    println!("  file  {}", paths.mesh_memberships_file().display());
+    println!("  leave mymesh memberships leave --mesh {}", row.mesh_id);
+    Ok(())
+}
+
+fn cmd_memberships_leave(paths: &Paths, mesh_id: &str) -> Result<()> {
+    let _auth = mymesh_core::AdminAuthority::host_local();
+    debug_assert!(_auth.may_mutate_local_store());
+    let dest = mesh_id.trim();
+    if dest.is_empty() {
+        bail!("--mesh is required");
+    }
+    let mesh = MeshState::load(paths.mesh_file())?;
+    let mut store = MembershipStore::open_or_migrate(paths.mesh_memberships_file(), &mesh.mesh_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let row = store.leave(dest).map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!(
+        "{} left guest membership {}",
+        style("ok").green().bold(),
+        row.mesh_id
+    );
     Ok(())
 }
 
@@ -2955,7 +3157,7 @@ async fn sync_with_peer(
                             &from_id, &mesh_id, ts, &members, &signature,
                         )?;
                         let mut store = DeviceStore::open(paths.devices_file())?;
-                        added += apply_membership(
+                        added += apply_membership_gossip(
                             &mut store,
                             &paths.mesh_file(),
                             &from_id,

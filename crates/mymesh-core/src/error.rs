@@ -31,6 +31,13 @@ pub enum Error {
     #[error("permission denied: {0}")]
     PermissionDenied(String),
 
+    /// Resource / policy conflict (e.g. `mesh_overlap` when extras block smash).
+    #[error("conflict: {0}")]
+    Conflict(String),
+
+    #[error("not implemented: {0}")]
+    NotImplemented(String),
+
     #[error("master key: {0}")]
     MasterKey(String),
 

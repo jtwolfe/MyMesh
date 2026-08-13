@@ -117,6 +117,11 @@ impl Paths {
         self.data_dir.join("enrollments.json")
     }
 
+    /// This-node membership catalog (`mesh-memberships.json`, mode 0600). Wave F8.
+    pub fn mesh_memberships_file(&self) -> PathBuf {
+        self.data_dir.join("mesh-memberships.json")
+    }
+
     /// Continuity packs root: `continuity/<pack_id>/` mode 0700 (S8).
     pub fn continuity_dir(&self) -> PathBuf {
         self.data_dir.join("continuity")
