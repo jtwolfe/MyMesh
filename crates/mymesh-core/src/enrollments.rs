@@ -95,7 +95,21 @@ impl EnrollmentStore {
             .iter()
             .position(|e| e.person_id == rec.person_id)
         {
+            let existing = &self.file.enrollments[pos];
+            // person_id is a ULID, not a key commitment. Same-key refresh is
+            // ok; a different pk would take over person_enrolled.
+            if existing.can_drive
+                && !pk_hex_eq(&existing.person_public_key_hex, &rec.person_public_key_hex)
+            {
+                return Err(Error::PermissionDenied(
+                    "person_id already enrolled with a different public key; revoke first".into(),
+                ));
+            }
+            let mut rec = rec;
+            rec.enrollment_id = existing.enrollment_id.clone();
             self.file.enrollments[pos] = rec.clone();
+            self.flush()?;
+            return Ok(rec);
         } else {
             if self.file.enrollments.len() >= MAX_ENROLLMENTS {
                 return Err(Error::Config(format!(
@@ -195,6 +209,10 @@ fn parse_sig64_hex(sig_hex: &str) -> Result<[u8; 64]> {
 
 fn new_enrollment_id() -> String {
     crate::new_grant_id()
+}
+
+fn pk_hex_eq(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
 }
 
 /// Parse `--sig-file`: 128 hex chars (whitespace ignored) or raw 64 bytes.
@@ -322,6 +340,41 @@ mod tests {
         assert!(!store3.can_drive(&body.person_id));
         assert!(store3.list().is_empty());
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn same_key_refresh_keeps_id_different_key_rejected() {
+        let dir = temp_dir("keybind");
+        let path = dir.join("enrollments.json");
+        let sk = SigningKey::from_bytes(&[0x42u8; 32]);
+        let pid = "01HZXPERSONKEYBIND0000000";
+        let mut store = EnrollmentStore::open(&path).unwrap();
+        let first = store.add(&target(), &signed_body(&sk, pid)).unwrap();
+
+        let mut again = signed_body(&sk, pid);
+        again.label = Some("refresh".into());
+        let refreshed = store.add(&target(), &again).unwrap();
+        assert_eq!(refreshed.enrollment_id, first.enrollment_id);
+        assert_eq!(refreshed.label.as_deref(), Some("refresh"));
+        assert_eq!(store.list().len(), 1);
+
+        let other = SigningKey::from_bytes(&[0x99u8; 32]);
+        let err = store.add(&target(), &signed_body(&other, pid)).unwrap_err();
+        assert!(
+            err.to_string().contains("different public key")
+                || err.to_string().contains("revoke first"),
+            "{err}"
+        );
+        assert_eq!(
+            store.get(pid).unwrap().person_public_key_hex,
+            first.person_public_key_hex
+        );
+
+        store.revoke(pid).unwrap();
+        let rebound = store.add(&target(), &signed_body(&other, pid)).unwrap();
+        assert!(rebound.can_drive);
+        assert_ne!(rebound.person_public_key_hex, first.person_public_key_hex);
         let _ = std::fs::remove_dir_all(dir);
     }
 

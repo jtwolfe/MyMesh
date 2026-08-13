@@ -1038,10 +1038,10 @@ impl SessionDecisionBody {
 }
 
 /// Write `enrollments.json` only when all four enroll fields verify.
-/// Bad sig / target / facet never fail pair decide.
-fn try_enroll_from_decide(paths: &Paths, host_id: &DeviceId, body: &SessionDecisionBody) {
+/// Bad sig / target / facet never fail pair decide. Returns whether a row was written.
+fn try_enroll_from_decide(paths: &Paths, host_id: &DeviceId, body: &SessionDecisionBody) -> bool {
     if !matches!(body.decision, DecideKind::Accept) || !body.enroll_fields_present() {
-        return;
+        return false;
     }
     let (Some(person_id), Some(facet), Some(pk_hex), Some(sig_hex)) = (
         body.person_id.as_deref(),
@@ -1049,13 +1049,13 @@ fn try_enroll_from_decide(paths: &Paths, host_id: &DeviceId, body: &SessionDecis
         body.person_public_key_hex.as_deref(),
         body.sig_hex.as_deref(),
     ) else {
-        return;
+        return false;
     };
     if let Err(_rl) =
         mymesh_core::rate_limit_check_shared(paths.metrics_dir(), LimitKind::EnrollWrite, person_id)
     {
         info!(person_id, "enroll_write skipped rate_limited");
-        return;
+        return false;
     }
     let enroll = EnrollWriteBody {
         person_id: person_id.to_string(),
@@ -1071,7 +1071,7 @@ fn try_enroll_from_decide(paths: &Paths, host_id: &DeviceId, body: &SessionDecis
         Ok(s) => s,
         Err(e) => {
             info!(error = %e, "enroll_write skipped store");
-            return;
+            return false;
         }
     };
     match store.add(host_id, &enroll) {
@@ -1083,9 +1083,11 @@ fn try_enroll_from_decide(paths: &Paths, host_id: &DeviceId, body: &SessionDecis
                 source = "decide",
                 "enroll_write"
             );
+            true
         }
         Err(e) => {
             info!(error = %e, "enroll_write skipped; pair decide continues");
+            false
         }
     }
 }
@@ -1113,6 +1115,8 @@ struct DecideV2Response {
     state: &'static str,
     sid: String,
     phase: &'static str,
+    /// True only when this decide wrote (or refreshed) `enrollments.json`.
+    enroll_written: bool,
 }
 
 #[allow(clippy::result_large_err)] // axum Response as Err is intentional for early-return handlers
@@ -1438,13 +1442,15 @@ async fn pair_v2_decide(
                 | (Some(JoinDecision::Deny { .. }), JoinDecision::Deny { .. })
         );
         if same_joiner && same_decision {
-            try_enroll_from_decide(&st.paths, &st.identity().device_id(), &body);
+            let enroll_written =
+                try_enroll_from_decide(&st.paths, &st.identity().device_id(), &body);
             record_pair_decide(st.paths.metrics_dir(), "already_decided");
             return Json(DecideV2Response {
                 ok: true,
                 state: "already_decided",
                 sid: sess.sid,
                 phase: sess.phase.as_str(),
+                enroll_written,
             })
             .into_response();
         }
@@ -1569,12 +1575,13 @@ async fn pair_v2_decide(
         "pair/v2 decide written to JoinStore + PairSessionStore"
     );
     record_pair_decide(st.paths.metrics_dir(), state);
-    try_enroll_from_decide(&st.paths, &st.identity().device_id(), &body);
+    let enroll_written = try_enroll_from_decide(&st.paths, &st.identity().device_id(), &body);
     Json(DecideV2Response {
         ok: true,
         state,
         sid: sess.sid,
         phase: PairPhase::Decided.as_str(),
+        enroll_written,
     })
     .into_response()
 }
@@ -2924,7 +2931,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(json_body(resp).await["state"], "accepted");
+        let v = json_body(resp).await;
+        assert_eq!(v["state"], "accepted");
+        assert_eq!(v["enroll_written"], true);
 
         let store = EnrollmentStore::open(paths.enrollments_file()).unwrap();
         let rec = store.get(pid).expect("enroll row");
@@ -2980,7 +2989,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(json_body(resp).await["state"], "accepted");
+        let v = json_body(resp).await;
+        assert_eq!(v["state"], "accepted");
+        assert_eq!(v["enroll_written"], false);
         let store = EnrollmentStore::open(paths.enrollments_file()).unwrap();
         assert!(store.list().is_empty());
         assert!(!paths.enrollments_file().exists() || store.list().is_empty());
@@ -3051,7 +3062,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(json_body(resp).await["state"], "accepted");
+        let v = json_body(resp).await;
+        assert_eq!(v["state"], "accepted");
+        assert_eq!(v["enroll_written"], false);
         let store = EnrollmentStore::open(paths.enrollments_file()).unwrap();
         assert!(store.get(pid).is_none());
         let sess = PairSessionStore::open(paths.pair_sessions_dir())

@@ -1607,14 +1607,14 @@ async fn enrollments_create(
         }
         Err(e) => {
             let msg = e.to_string();
-            if msg.contains("signature")
+            if msg.contains("revoke first") || msg.contains("budget") {
+                mesh_err(StatusCode::CONFLICT, "conflict", msg)
+            } else if msg.contains("signature")
                 || msg.contains("denied")
                 || msg.contains("not this node")
                 || msg.contains("public key")
             {
                 mesh_err(StatusCode::FORBIDDEN, "forbidden", msg)
-            } else if msg.contains("budget") {
-                mesh_err(StatusCode::CONFLICT, "conflict", msg)
             } else {
                 mesh_err(StatusCode::BAD_REQUEST, "bad_request", msg)
             }
@@ -2860,6 +2860,7 @@ mod tests {
         bad.sig_hex.push(if last == '0' { '1' } else { '0' });
         bad.nonce = encode_b64(&[0x34u8; 16]);
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -2873,6 +2874,39 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let store = EnrollmentStore::open(paths.enrollments_file()).unwrap();
         assert_eq!(store.list().len(), 1);
+
+        // Different person key, same person_id → 409 until revoke.
+        let other = Identity::from_secret_bytes([0x99u8; 32]);
+        let hijack = signed_enroll_body(
+            &other,
+            "01HZXPERSON0000000000000",
+            &host.device_id(),
+            &rfc3339(Utc::now()),
+            &[0x35u8; 16],
+        );
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/enrollments")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_string(&hijack).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let v = json_body(resp).await;
+        assert_eq!(v["code"], "conflict");
+        let store = EnrollmentStore::open(paths.enrollments_file()).unwrap();
+        assert_eq!(
+            store
+                .get("01HZXPERSON0000000000000")
+                .unwrap()
+                .person_public_key_hex,
+            body.person_public_key_hex
+        );
     }
 
     #[tokio::test]
