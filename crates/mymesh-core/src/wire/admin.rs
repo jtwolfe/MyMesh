@@ -57,6 +57,15 @@ impl AdminOp {
     }
 }
 
+/// `op=introduce` payload. Last-mile dest is always the joiner (KD-F20).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntroducePayload {
+    pub resident_did: String,
+    pub joiner_did: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resident_fp: Option<String>,
+}
+
 /// Person-signed admin RPC (Wave F1 wire freeze).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminEnvelope {

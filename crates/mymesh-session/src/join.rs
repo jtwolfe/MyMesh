@@ -1,14 +1,14 @@
 //! Join request (joiner) and host-side pending approval + membership handoff.
 use chrono::Utc;
 use mymesh_core::{
-    apply_guest_device_record, ArmState, Capability, DeviceId, DeviceLabel, DeviceRecord,
+    apply_guest_device_record, ArmState, Capability, Config, DeviceId, DeviceLabel, DeviceRecord,
     DeviceStore, Grant, GrantRole, GrantStore, JoinDecision, JoinStore, MeshRole, MeshState,
-    NodeFingerprint, PairPhase, PairSessionStore, PendingJoin, Result, TrustState,
+    NodeFingerprint, PairPhase, PairSessionStore, Paths, PendingJoin, Result, TrustState,
 };
 use mymesh_crypto::Identity;
 use mymesh_net::PeerConnection;
 use mymesh_protocol::{decode_msg, encode_msg, ChannelId, ControlMessage, Frame};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -190,6 +190,50 @@ fn finish_joiner_host_rec(
     r.trust = TrustState::Trusted;
     store.upsert(r.clone())?;
     Ok(Some(r))
+}
+
+/// Same iroh path as `pair_v2_dial` / `mymesh link`: connect + `JoinRequest`.
+///
+/// Fire-and-forget. Host approval may take up to 600s; HTTP must not wait.
+/// Never opens `OpenChannel(Admin)` (KD-F17).
+pub fn spawn_join_as_guest_to_resident(
+    identity: Identity,
+    label: String,
+    paths: Paths,
+    resident: DeviceId,
+) {
+    tokio::spawn(async move {
+        let mut store = match DeviceStore::open(paths.devices_file()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(%e, "introduce/dial: device store");
+                return;
+            }
+        };
+        let cfg = Config::load(paths.config_file()).unwrap_or_default();
+        let sock = PathBuf::from(&cfg.daemon.control_socket);
+        match mymesh_net::connect_mesh(&identity, resident, &sock).await {
+            Ok((conn, transport)) => {
+                match run_join_as_guest(
+                    conn,
+                    &identity,
+                    &label,
+                    &mut store,
+                    &paths.mesh_file(),
+                    Capability::all(),
+                )
+                .await
+                {
+                    Ok(peer) => info!(peer = %peer.id.short(), "join as guest completed"),
+                    Err(e) => tracing::warn!(%e, "join as guest failed"),
+                }
+                if let Some(tr) = transport {
+                    tr.shutdown().await;
+                }
+            }
+            Err(e) => tracing::warn!(%e, "connect_mesh failed — is mymesh serve running?"),
+        }
+    });
 }
 
 /// Outcome of a host-side join attempt (for mesh dirty / gossip side-effects).

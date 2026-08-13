@@ -10,9 +10,9 @@ pub mod membership;
 pub use admin::{
     admin_envelope_preimage, admin_seal_preimage, mailbox_bind_preimage, parse_admin_envelope_json,
     person_enrolled_auth_preimage, unwrap_hint_blob, wrap_hint_blob, AdminEnvelope, AdminOp,
-    AdminSealPayload, AdminWireError, HintBlob, MailboxBind, ADMIN_ENVELOPE_DOMAIN,
-    ADMIN_ENVELOPE_MAX_BYTES, ADMIN_ENVELOPE_VERSION, ADMIN_HINT_INFO, ADMIN_SEAL_DOMAIN,
-    HINT_BLOB_VERSION, MAILBOX_BIND_DOMAIN, PERSON_ENROLLED_METHOD,
+    AdminSealPayload, AdminWireError, HintBlob, IntroducePayload, MailboxBind,
+    ADMIN_ENVELOPE_DOMAIN, ADMIN_ENVELOPE_MAX_BYTES, ADMIN_ENVELOPE_VERSION, ADMIN_HINT_INFO,
+    ADMIN_SEAL_DOMAIN, HINT_BLOB_VERSION, MAILBOX_BIND_DOMAIN, PERSON_ENROLLED_METHOD,
 };
 pub use enroll::{
     carrier_enroll_v1_preimage, enroll_write_preimage, EnrollAckPayload, EnrollWriteBody,

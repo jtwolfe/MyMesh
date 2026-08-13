@@ -20,10 +20,10 @@ use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
 use mymesh_core::wire::{EnrollWriteBody, PersonFacet};
 use mymesh_core::{
-    client_ip_key, hash_pair_token, record_pair_decide, record_pair_status, ArmState, Capability,
-    Config, DeviceId, DeviceStore, EnrollmentStore, JoinDecision, JoinStore, LimitKind, MeshState,
-    NodeFingerprint, PairEndpointClass, PairPhase, PairSessionFile, PairSessionStore, Paths,
-    PendingJoin, RateLimitState,
+    client_ip_key, hash_pair_token, record_pair_decide, record_pair_status, ArmState, Config,
+    DeviceId, EnrollmentStore, JoinDecision, JoinStore, LimitKind, MeshState, NodeFingerprint,
+    PairEndpointClass, PairPhase, PairSessionFile, PairSessionStore, Paths, PendingJoin,
+    RateLimitState,
 };
 use mymesh_crypto::{device_id_to_words, device_join_uri, Identity};
 use rand::rngs::OsRng;
@@ -36,7 +36,7 @@ use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
-use crate::join::run_join_as_guest;
+use crate::join::spawn_join_as_guest_to_resident;
 use crate::mesh_api::{self, MeshApiState, MeshAuthStore};
 use async_trait::async_trait;
 use mymesh_net::LocalAdmin;
@@ -1641,48 +1641,11 @@ async fn pair_v2_dial(
         }
     }
 
-    let identity = st.identity();
-    let paths = st.paths.clone();
-    let label = st.label.clone();
-    let cfg = Config::load(paths.config_file()).unwrap_or_default();
-    let sock = PathBuf::from(&cfg.daemon.control_socket);
     info!(
         resident = %resident.short(),
         "pair/v2 dial — joining resident (same path as mymesh link)"
     );
-    tokio::spawn(async move {
-        let mut store = match DeviceStore::open(paths.devices_file()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(%e, "pair/v2 dial: device store");
-                return;
-            }
-        };
-        match mymesh_net::connect_mesh(&identity, resident, &sock).await {
-            Ok((conn, transport)) => {
-                match run_join_as_guest(
-                    conn,
-                    &identity,
-                    &label,
-                    &mut store,
-                    &paths.mesh_file(),
-                    Capability::all(),
-                )
-                .await
-                {
-                    Ok(peer) => info!(
-                        peer = %peer.id.short(),
-                        "pair/v2 dial join completed"
-                    ),
-                    Err(e) => tracing::warn!(%e, "pair/v2 dial join failed"),
-                }
-                if let Some(tr) = transport {
-                    tr.shutdown().await;
-                }
-            }
-            Err(e) => tracing::warn!(%e, "pair/v2 dial connect failed — is mymesh serve running?"),
-        }
-    });
+    spawn_join_as_guest_to_resident(st.identity(), st.label.clone(), st.paths.clone(), resident);
 
     Json(DialResponse {
         ok: true,

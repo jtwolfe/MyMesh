@@ -22,6 +22,8 @@
 //! GET  /mesh/v1/enrollments             # host-local | person_enrolled (own) | mrk_proof
 //! POST /mesh/v1/enrollments             # carrier-enroll-v1 person sig | host-local
 //! DELETE /mesh/v1/enrollments/{id}      # own person_enrolled | host-local | mrk_proof
+//! POST /mesh/v1/admin/rpc               # AdminEnvelope; introduce = last-mile to joiner
+//! POST /admin/rpc                       # alias of /mesh/v1/admin/rpc
 //! ```
 //!
 //! Auth methods (S0 freeze / CARRIER-NEXT Issue 4):
@@ -57,7 +59,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use mymesh_core::wire::{
-    person_enrolled_auth_preimage, EnrollWriteBody, EnrollmentRecord, PersonFacet,
+    parse_admin_envelope_json, person_enrolled_auth_preimage, AdminEnvelope, AdminOp,
+    EnrollWriteBody, EnrollmentRecord, IntroducePayload, PersonFacet,
 };
 use mymesh_core::{
     client_ip_key, load_state as load_continuity_state, materialize_pack, not_after_days,
@@ -291,6 +294,8 @@ pub fn mesh_v1_routes(st: MeshApiState) -> Router {
             "/mesh/v1/enrollments/{person_id}",
             delete(enrollments_revoke),
         )
+        .route("/mesh/v1/admin/rpc", post(admin_rpc))
+        .route("/admin/rpc", post(admin_rpc))
         .with_state(st)
 }
 
@@ -1676,6 +1681,236 @@ async fn enrollments_revoke(
     }
 }
 
+/// `POST /mesh/v1/admin/rpc` (and `/admin/rpc`) — last-mile + person-signed AdminEnvelope.
+///
+/// Wave F5 implements `introduce` only. Last-mile dest is always the joiner
+/// (KD-F20). This node never iroh-forwards admin (no `OpenChannel(Admin)`).
+async fn admin_rpc(State(st): State<MeshApiState>, headers: HeaderMap, body: String) -> Response {
+    if let Err(r) = check_x_mesh_id(&st.paths, &headers) {
+        return r;
+    }
+    let env = match parse_admin_envelope_json(&body) {
+        Ok(e) => e,
+        Err(e) => return mesh_err(StatusCode::BAD_REQUEST, e.code, e.message),
+    };
+    if let Err(rl) = mymesh_core::rate_limit_check_shared(
+        st.paths.metrics_dir(),
+        LimitKind::AdminEnvelope,
+        &env.person_id,
+    ) {
+        return mesh_rate_limited(rl.retry_after_secs);
+    }
+    let ts = match DateTime::parse_from_rfc3339(&env.ts) {
+        Ok(t) => t.with_timezone(&Utc),
+        Err(_) => {
+            return mesh_err(StatusCode::BAD_REQUEST, "bad_request", "ts must be RFC3339");
+        }
+    };
+    if (Utc::now() - ts).num_seconds().abs() > ENROLL_TS_SKEW_SECS {
+        return mesh_err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "ts outside allowed skew (±5 min)",
+        );
+    }
+    let mut nonces = match AdminNonceStore::open_or_create(st.paths.admin_nonces_file()) {
+        Ok(s) => s,
+        Err(e) => {
+            return mesh_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("admin nonces: {e}"),
+            );
+        }
+    };
+    if let Err(e) = nonces.insert(&env.nonce) {
+        return mesh_err(
+            StatusCode::CONFLICT,
+            "conflict",
+            format!("admin nonce replay: {e}"),
+        );
+    }
+
+    tracing::info!(
+        op = env.op.as_str(),
+        target = %short_did_hex(&env.target_device_id_hex),
+        last_mile = "http",
+        "admin_rpc"
+    );
+
+    match env.op {
+        AdminOp::Introduce => introduce_op(&st, env),
+        other => mesh_err(
+            StatusCode::NOT_IMPLEMENTED,
+            "not_implemented",
+            format!("{} is not available yet", other.as_str()),
+        ),
+    }
+}
+
+fn introduce_op(st: &MeshApiState, env: AdminEnvelope) -> Response {
+    let host = host_identity(&st.secret);
+    let self_id = host.device_id();
+    let payload: IntroducePayload = match serde_json::from_str(env.payload_json.trim()) {
+        Ok(p) => p,
+        Err(e) => {
+            return mesh_err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                format!("introduce payload: {e}"),
+            );
+        }
+    };
+    let joiner: DeviceId = match payload.joiner_did.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return mesh_err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "joiner_did must be 64 hex chars",
+            );
+        }
+    };
+    let resident: DeviceId = match payload.resident_did.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return mesh_err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "resident_did must be 64 hex chars",
+            );
+        }
+    };
+    let target: DeviceId = match env.target_device_id_hex.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return mesh_err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "target_device_id_hex must be 64 hex chars",
+            );
+        }
+    };
+
+    // KD-F20: last-mile dest is always the joiner. Never bounce via A.
+    if target != self_id || joiner != self_id {
+        let words = mymesh_crypto::device_id_to_words(&joiner).unwrap_or_else(|_| joiner.short());
+        tracing::info!(
+            reason = "no_last_mile_to_joiner",
+            joiner = %joiner.short(),
+            "introduce_denied"
+        );
+        return mesh_err(
+            StatusCode::FORBIDDEN,
+            "no_last_mile_to_joiner",
+            format!("Reach {words} (mailbox or same LAN) or confirm on B."),
+        );
+    }
+    if resident == self_id {
+        return mesh_err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "cannot introduce self — joiner must dial the resident",
+        );
+    }
+    if let Some(ref fp) = payload.resident_fp {
+        let want = NodeFingerprint::from_device_id(&resident);
+        if !fp.is_empty() && fp != want.as_str() {
+            return mesh_err(
+                StatusCode::CONFLICT,
+                "conflict",
+                "resident_fp does not match resident_did",
+            );
+        }
+    }
+
+    let store = match EnrollmentStore::open(st.paths.enrollments_file()) {
+        Ok(s) => s,
+        Err(_) => {
+            tracing::info!(reason = "enrollment_pending", "introduce_denied");
+            return mesh_err(
+                StatusCode::FORBIDDEN,
+                "enrollment_pending",
+                "joiner is not enrolled for this person (not can_drive)",
+            );
+        }
+    };
+    let rec = match store.get(&env.person_id).filter(|e| e.can_drive) {
+        Some(r) => r,
+        None => {
+            tracing::info!(reason = "enrollment_pending", "introduce_denied");
+            return mesh_err(
+                StatusCode::FORBIDDEN,
+                "enrollment_pending",
+                "joiner is not enrolled for this person (not can_drive)",
+            );
+        }
+    };
+    let pk = match mymesh_core::wire::parse_id32_hex(&rec.person_public_key_hex) {
+        Ok(p) => p,
+        Err(_) => {
+            return mesh_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "enrolled person_public_key_hex invalid",
+            );
+        }
+    };
+    let pre = match env.preimage(&pk) {
+        Ok(p) => p,
+        Err(e) => return mesh_err(StatusCode::BAD_REQUEST, e.code, e.message),
+    };
+    let sig = match parse_sig_hex(&env.sig_hex) {
+        Some(s) => s,
+        None => {
+            return mesh_err(
+                StatusCode::BAD_REQUEST,
+                "invalid_proof",
+                "sig_hex required (64-byte Ed25519 hex)",
+            );
+        }
+    };
+    let pubk = IdentityPublic { verifying_key: pk };
+    if pubk.verify(&pre, &sig).is_err() {
+        return mesh_err(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "introduce signature verification failed",
+        );
+    }
+
+    crate::join::spawn_join_as_guest_to_resident(
+        host,
+        st.label.clone(),
+        st.paths.clone(),
+        resident,
+    );
+    tracing::info!(
+        op = "introduce",
+        target = %self_id.short(),
+        last_mile = "http",
+        result = "dialing",
+        "admin_rpc"
+    );
+    Json(serde_json::json!({
+        "ok": true,
+        "op": "introduce",
+        "state": "dialing",
+        "resident_did": resident.to_string(),
+        "joiner_did": joiner.to_string(),
+    }))
+    .into_response()
+}
+
+fn short_did_hex(hex_str: &str) -> String {
+    let t = hex_str.trim();
+    if t.len() >= 8 {
+        t[..8].to_string()
+    } else {
+        t.to_string()
+    }
+}
+
 async fn require_mesh_session(
     st: &MeshApiState,
     headers: &HeaderMap,
@@ -3023,6 +3258,192 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    fn signed_introduce_env(
+        person: &Identity,
+        person_id: &str,
+        target: &DeviceId,
+        joiner: &DeviceId,
+        resident: &DeviceId,
+        ts: &str,
+        nonce: &[u8; 16],
+    ) -> AdminEnvelope {
+        let payload = IntroducePayload {
+            resident_did: resident.to_string(),
+            joiner_did: joiner.to_string(),
+            resident_fp: Some(
+                NodeFingerprint::from_device_id(resident)
+                    .as_str()
+                    .to_string(),
+            ),
+        };
+        let payload_json = serde_json::to_string(&payload).unwrap();
+        let pk = person.verifying_key_bytes();
+        let ts_unix = mymesh_core::wire::parse_rfc3339_unix(ts).unwrap();
+        let pre = mymesh_core::wire::admin_envelope_preimage(
+            AdminOp::Introduce,
+            target.as_bytes(),
+            "",
+            ts_unix,
+            nonce,
+            &pk,
+            payload_json.as_bytes(),
+        )
+        .unwrap();
+        AdminEnvelope {
+            v: 1,
+            op: AdminOp::Introduce,
+            target_device_id_hex: target.to_string(),
+            mesh_id: None,
+            ts: ts.into(),
+            nonce: encode_b64(nonce),
+            person_id: person_id.into(),
+            facet: PersonFacet::Personal,
+            payload_json,
+            sig_hex: hex::encode(person.sign(&pre)),
+        }
+    }
+
+    async fn post_admin_rpc(
+        app: &axum::Router,
+        env: &AdminEnvelope,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/admin/rpc")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_string(env).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        (resp.status(), json_body(resp).await)
+    }
+
+    #[tokio::test]
+    async fn introduce_to_resident_fails_no_last_mile_to_joiner() {
+        // Two enrolled, never linked. Phone can only reach A (resident).
+        let paths_a = tmp_paths();
+        let secret_a = [0xAAu8; 32];
+        let host_a = Identity::from_secret_bytes(secret_a);
+        let host_b = Identity::from_secret_bytes([0xBBu8; 32]);
+        MeshState::new_mesh().save(paths_a.mesh_file()).unwrap();
+        let person = Identity::from_secret_bytes([0x42u8; 32]);
+        let pid = "01HZXPERSON0000000000000";
+        let ts = rfc3339(Utc::now());
+        let enroll = signed_enroll_body(&person, pid, &host_a.device_id(), &ts, &[0x11u8; 16]);
+        let mut store = EnrollmentStore::open_or_create(paths_a.enrollments_file()).unwrap();
+        store.add(&host_a.device_id(), &enroll).unwrap();
+
+        let paths_b = tmp_paths();
+        MeshState::new_mesh().save(paths_b.mesh_file()).unwrap();
+        let enroll_b = signed_enroll_body(&person, pid, &host_b.device_id(), &ts, &[0x12u8; 16]);
+        let mut store_b = EnrollmentStore::open_or_create(paths_b.enrollments_file()).unwrap();
+        store_b.add(&host_b.device_id(), &enroll_b).unwrap();
+
+        let st = test_state(paths_a, secret_a, "resident-a");
+        let app = mesh_v1_routes(st);
+        let env = signed_introduce_env(
+            &person,
+            pid,
+            &host_b.device_id(),
+            &host_b.device_id(),
+            &host_a.device_id(),
+            &ts,
+            &[0x21u8; 16],
+        );
+        let fut = post_admin_rpc(&app, &env);
+        let (status, v) = tokio::time::timeout(std::time::Duration::from_secs(2), fut)
+            .await
+            .expect("introduce to A must not hang");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(v["code"], "no_last_mile_to_joiner");
+        let err = v["error"].as_str().unwrap();
+        assert!(err.contains("Reach"));
+        assert!(err.contains("mailbox") || err.contains("confirm"));
+    }
+
+    #[tokio::test]
+    async fn introduce_joiner_requires_enrolled_can_drive() {
+        let paths = tmp_paths();
+        let secret = [0xB1u8; 32];
+        let joiner = Identity::from_secret_bytes(secret);
+        let resident = Identity::from_secret_bytes([0xA1u8; 32]);
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        let person = Identity::from_secret_bytes([0x42u8; 32]);
+        let ts = rfc3339(Utc::now());
+        let st = test_state(paths, secret, "joiner-b");
+        let app = mesh_v1_routes(st);
+        let env = signed_introduce_env(
+            &person,
+            "01HZXPERSON0000000000000",
+            &joiner.device_id(),
+            &joiner.device_id(),
+            &resident.device_id(),
+            &ts,
+            &[0x22u8; 16],
+        );
+        let (status, v) = post_admin_rpc(&app, &env).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(v["code"], "enrollment_pending");
+    }
+
+    #[tokio::test]
+    async fn introduce_on_enrolled_joiner_dials_without_admin_channel() {
+        let paths = tmp_paths();
+        let secret = [0xB2u8; 32];
+        let joiner = Identity::from_secret_bytes(secret);
+        let resident = Identity::from_secret_bytes([0xA2u8; 32]);
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        let person = Identity::from_secret_bytes([0x42u8; 32]);
+        let pid = "01HZXPERSON0000000000000";
+        let ts = rfc3339(Utc::now());
+        let enroll = signed_enroll_body(&person, pid, &joiner.device_id(), &ts, &[0x13u8; 16]);
+        let mut store = EnrollmentStore::open_or_create(paths.enrollments_file()).unwrap();
+        store.add(&joiner.device_id(), &enroll).unwrap();
+
+        let st = test_state(paths, secret, "joiner-b");
+        let app = mesh_v1_routes(st);
+        let env = signed_introduce_env(
+            &person,
+            pid,
+            &joiner.device_id(),
+            &joiner.device_id(),
+            &resident.device_id(),
+            &ts,
+            &[0x23u8; 16],
+        );
+        let (status, v) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            post_admin_rpc(&app, &env),
+        )
+        .await
+        .expect("introduce must return before join");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["op"], "introduce");
+        assert_eq!(v["state"], "dialing");
+        assert_eq!(v["joiner_did"], joiner.device_id().to_string());
+        assert_eq!(v["resident_did"], resident.device_id().to_string());
+
+        // Alias path + replay on the same nonce.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/rpc")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_string(&env).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(json_body(resp).await["code"], "conflict");
     }
 
     #[tokio::test]

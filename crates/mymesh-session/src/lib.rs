@@ -28,7 +28,8 @@ pub use mesh_api::{auth_challenge_preimage, mrk_admin_identity, AuthMethod, MESH
 // Re-export owner types from crypto for callers that used mesh_api::MeshOwnerFile (B3).
 pub use host_metrics::sample_metrics;
 pub use join::{
-    handle_join_as_host, handle_join_as_host_with_grants, run_join_as_guest, JoinHostOutcome,
+    handle_join_as_host, handle_join_as_host_with_grants, run_join_as_guest,
+    spawn_join_as_guest_to_resident, JoinHostOutcome,
 };
 pub use magic::MagicPlane;
 pub use mesh_sync::{
