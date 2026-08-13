@@ -1851,28 +1851,59 @@ fn cmd_memberships_add(
         bail!("cannot add extra membership on the primary mesh");
     }
 
+    let mut cat = MembershipStore::open_or_migrate(paths.mesh_memberships_file(), &mesh.mesh_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    cat.ensure_can_add_guest(dest)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
     let mut grants = GrantStore::open(paths.grants_file())?;
-    let via_grant_id = if let Some(gid) = grant_id.map(str::trim).filter(|s| !s.is_empty()) {
-        let g = grants
-            .get(gid)
-            .ok_or_else(|| anyhow::anyhow!("grant {gid} not found"))?;
-        if g.mesh_id != dest {
+    let mut created_grant_id: Option<String> = None;
+    let via_grant_id = if let Some(raw) = grant_id.map(str::trim).filter(|s| !s.is_empty()) {
+        if raw.len() > 32
+            || !raw
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            bail!("--grant is not a valid grant id");
+        }
+        match grants.get(raw) {
+            None => {
+                // Dest-issued pointer: GrantAnnounce does not replicate foreign mesh_id.
+                raw.to_string()
+            }
+            Some(g) => {
+                if !g.is_active(chrono::Utc::now()) {
+                    bail!("grant {raw} is revoked or expired");
+                }
+                if g.mesh_id != dest {
+                    bail!(
+                        "grant {raw} mesh_id {} does not match --mesh {dest}",
+                        g.mesh_id
+                    );
+                }
+                if g.role != GrantRole::Guest {
+                    bail!("grant {raw} is not a guest grant");
+                }
+                if g.subject_device_id != local_id {
+                    bail!("grant {raw} subject is not this node");
+                }
+                if g.object.as_device_id().is_none() {
+                    bail!("grant {raw} object is not GrantObject::Device");
+                }
+                raw.to_string()
+            }
+        }
+    } else {
+        if let Err(rl) = mymesh_core::rate_limit_check_shared(
+            paths.metrics_dir(),
+            mymesh_core::LimitKind::GrantMutate,
+            mymesh_core::HOST_LOCAL_SESSION,
+        ) {
             bail!(
-                "grant {gid} mesh_id {} does not match --mesh {dest}",
-                g.mesh_id
+                "rate_limited: grant mutate; retry after {}s",
+                rl.retry_after_secs
             );
         }
-        if g.role != GrantRole::Guest {
-            bail!("grant {gid} is not a guest grant");
-        }
-        if g.subject_device_id != local_id {
-            bail!("grant {gid} subject is not this node");
-        }
-        if g.object.as_device_id().is_none() {
-            bail!("grant {gid} object is not GrantObject::Device");
-        }
-        gid.to_string()
-    } else {
         let store = DeviceStore::open(paths.devices_file())?;
         let object = match on {
             Some(q) => resolve_device_or_hex(&store, q)?,
@@ -1901,14 +1932,19 @@ fn cmd_memberships_add(
             object.short(),
             dest
         );
+        created_grant_id = Some(grant.grant_id.clone());
         grant.grant_id
     };
 
-    let mut store = MembershipStore::open_or_migrate(paths.mesh_memberships_file(), &mesh.mesh_id)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let row = store
-        .add_guest(dest, Some(via_grant_id.clone()))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let row = match cat.add_guest(dest, Some(via_grant_id.clone())) {
+        Ok(row) => row,
+        Err(e) => {
+            if let Some(gid) = created_grant_id {
+                let _ = grants.revoke(&gid);
+            }
+            return Err(anyhow::anyhow!("{e}"));
+        }
+    };
     println!(
         "{} guest overlap {}  via {}",
         style("ok").green().bold(),

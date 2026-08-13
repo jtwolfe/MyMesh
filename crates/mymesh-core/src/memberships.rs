@@ -109,6 +109,31 @@ impl MembershipStore {
         self.has_extra_rows() && foreign_mesh_id != self.file.primary_mesh_id
     }
 
+    /// Fail closed before writing a dest grant so a later `add_guest` is not surprising.
+    pub fn ensure_can_add_guest(&self, mesh_id: &str) -> Result<()> {
+        let mesh_id = mesh_id.trim();
+        if mesh_id.is_empty() {
+            return Err(Error::Config("mesh_id must not be empty".into()));
+        }
+        if mesh_id == self.file.primary_mesh_id {
+            return Err(Error::Conflict(
+                "cannot add extra membership on primary mesh".into(),
+            ));
+        }
+        if let Some(existing) = self.get(mesh_id) {
+            return Err(Error::Conflict(format!(
+                "membership for {mesh_id} already exists ({})",
+                existing.role.as_str()
+            )));
+        }
+        if self.file.memberships.len() >= MAX_CATALOG_ROWS {
+            return Err(Error::Config(format!(
+                "memberships budget is {MAX_CATALOG_ROWS} rows"
+            )));
+        }
+        Ok(())
+    }
+
     /// Add a guest overlap row. Extra `role=member` is F8b.
     pub fn add_guest(
         &mut self,
@@ -125,31 +150,13 @@ impl MembershipStore {
         role: CatalogRole,
         via_grant_id: Option<String>,
     ) -> Result<CatalogMembership> {
-        let mesh_id = mesh_id.trim();
-        if mesh_id.is_empty() {
-            return Err(Error::Config("mesh_id must not be empty".into()));
-        }
-        if mesh_id == self.file.primary_mesh_id {
-            return Err(Error::Conflict(
-                "cannot add extra membership on primary mesh".into(),
-            ));
-        }
         if role == CatalogRole::Member {
             return Err(Error::NotImplemented(
                 "member overlap is F8b (DeviceRecord.memberships)".into(),
             ));
         }
-        if let Some(existing) = self.get(mesh_id) {
-            return Err(Error::Conflict(format!(
-                "membership for {mesh_id} already exists ({})",
-                existing.role.as_str()
-            )));
-        }
-        if self.file.memberships.len() >= MAX_CATALOG_ROWS {
-            return Err(Error::Config(format!(
-                "memberships budget is {MAX_CATALOG_ROWS} rows"
-            )));
-        }
+        self.ensure_can_add_guest(mesh_id)?;
+        let mesh_id = mesh_id.trim();
         let row = CatalogMembership {
             mesh_id: mesh_id.to_string(),
             role: CatalogRole::Guest,
