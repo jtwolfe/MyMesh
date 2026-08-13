@@ -597,7 +597,9 @@ impl MeshMasterFile {
 
     /// First-init only: `create_new` so a second writer cannot overwrite.
     ///
-    /// Recover/rotate keep [`Self::save`]. Failure is `mesh_already_inited`.
+    /// Recover/rotate keep [`Self::save`]. `AlreadyExists` is `mesh_already_inited`.
+    /// Any error after the dest is created unlinks it so a retry is not 409
+    /// on truncated JSON.
     pub fn save_new(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         if path.exists() {
@@ -621,19 +623,27 @@ impl MeshMasterFile {
                 e.into()
             }
         })?;
-        f.write_all(body.as_bytes())?;
-        f.sync_all()?;
+        let write_res = f.write_all(body.as_bytes()).and_then(|_| f.sync_all());
         drop(f);
+        if let Err(e) = write_res {
+            let _ = std::fs::remove_file(path);
+            return Err(e.into());
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-            let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
-            if mode != 0o600 {
+            if let Err(e) = (|| -> Result<()> {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+                let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+                if mode != 0o600 {
+                    return Err(Error::MasterKey(format!(
+                        "mesh-master.json expected mode 0600, got {mode:04o}"
+                    )));
+                }
+                Ok(())
+            })() {
                 let _ = std::fs::remove_file(path);
-                return Err(Error::MasterKey(format!(
-                    "mesh-master.json expected mode 0600, got {mode:04o}"
-                )));
+                return Err(e);
             }
         }
         Ok(())
@@ -875,6 +885,25 @@ mod tests {
             assert_eq!(&code.hash_hex(), h);
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_new_second_is_already_inited() {
+        let password = b"test-pass-1234";
+        let init = mesh_init(password, Some(test_params())).unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("mymesh-mmk-savenew-{}-{}", std::process::id(), {
+                let mut n = [0u8; 8];
+                OsRng.fill_bytes(&mut n);
+                u64::from_le_bytes(n)
+            }));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mesh-master.json");
+        init.file.save_new(&path).unwrap();
+        let err = init.file.save_new(&path).unwrap_err();
+        assert!(err.to_string().contains("mesh_already_inited"));
+        assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

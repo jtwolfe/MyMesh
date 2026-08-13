@@ -1488,7 +1488,6 @@ fn start_prompt(app: &mut App, kind: PromptKind, title: &str, hint: &str) {
 }
 
 fn maybe_open_recovery_modal(app: &mut App) {
-    let _ = mark_tui_attached(app.paths.tui_attached_file());
     if app.prompt.kind != PromptKind::None || app.recovery_snooze {
         return;
     }
