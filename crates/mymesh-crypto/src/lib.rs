@@ -11,6 +11,7 @@
 
 mod admin_seal;
 mod continuity;
+mod create;
 mod identity;
 mod master_key;
 mod owner;
@@ -28,6 +29,11 @@ pub use continuity::{
     CONTINUITY_PACK_KEY_LEN, CONTINUITY_PACK_VERSION, CONTINUITY_PAYLOAD_ALG,
     CONTINUITY_WIPE_DOMAIN, CONTINUITY_WIPE_TOKEN_LEN, CONTINUITY_WRAP_ALG, CONTINUITY_WRAP_DOMAIN,
     CONTINUITY_X25519_PK_LEN,
+};
+pub use create::{
+    apply_first_mesh_init, check_create_authorized, clear_tui_attached, generate_mmk_password,
+    mark_tui_attached, sanitize_display_name, take_recovery_once, write_recovery_once,
+    CreateAuthMethod, CreateWindowFile, FirstMeshInit,
 };
 pub use identity::{Identity, IdentityPublic};
 pub use master_key::{

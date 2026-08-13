@@ -122,6 +122,28 @@ impl Paths {
         self.data_dir.join("admin-nonces.json")
     }
 
+    /// This-node membership catalog (`mesh-memberships.json`, mode 0600). F7 writes the
+    /// primary row at first init; F8 owns guest rows.
+    pub fn mesh_memberships_file(&self) -> PathBuf {
+        self.data_dir.join("mesh-memberships.json")
+    }
+
+    /// MMK-authorized first-create window (`create-window.json`, mode 0600).
+    pub fn create_window_file(&self) -> PathBuf {
+        self.data_dir.join("create-window.json")
+    }
+
+    /// One-shot MMK recovery codes (and generated password, if any). Mode 0600.
+    /// Printed by `mymesh mesh recovery-show-once` or a TUI modal, then deleted.
+    pub fn mesh_recovery_once_file(&self) -> PathBuf {
+        self.data_dir.join("mesh-recovery-once.txt")
+    }
+
+    /// Heartbeat written while the TUI is attached (best-effort IPC).
+    pub fn tui_attached_file(&self) -> PathBuf {
+        self.data_dir.join("tui.attached")
+    }
+
     /// Continuity packs root: `continuity/<pack_id>/` mode 0700 (S8).
     pub fn continuity_dir(&self) -> PathBuf {
         self.data_dir.join("continuity")
@@ -147,6 +169,18 @@ mod tests {
         assert_eq!(
             p.admin_nonces_file(),
             PathBuf::from("/tmp/data/admin-nonces.json")
+        );
+        assert_eq!(
+            p.mesh_memberships_file(),
+            PathBuf::from("/tmp/data/mesh-memberships.json")
+        );
+        assert_eq!(
+            p.create_window_file(),
+            PathBuf::from("/tmp/data/create-window.json")
+        );
+        assert_eq!(
+            p.mesh_recovery_once_file(),
+            PathBuf::from("/tmp/data/mesh-recovery-once.txt")
         );
     }
 }

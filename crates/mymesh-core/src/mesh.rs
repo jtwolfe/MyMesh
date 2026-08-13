@@ -32,6 +32,9 @@ pub struct MeshState {
     /// remote Admin still requires explicit grant or MRK proof (KD15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creator_device_id: Option<DeviceId>,
+    /// Household display name set at first `mesh init` / `POST /meshes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -52,6 +55,7 @@ impl MeshState {
             roster_generation: 0,
             mrk_fingerprint: None,
             creator_device_id: None,
+            display_name: None,
         }
     }
 

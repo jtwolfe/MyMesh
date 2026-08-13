@@ -19,11 +19,12 @@ use mymesh_core::{
     Paths,
 };
 use mymesh_crypto::{
-    accept_owner_claim, admin_verifying_key_bytes, check_claim_authorized, device_id_to_words,
-    device_join_uri, mesh_init, mesh_recover_with_code, mesh_rotate_password, mesh_unlock_password,
-    parse_device_id, resolve_claim_fingerprint, seal_owner_backup, sign_mrk_proof_ed25519,
-    unseal_owner_backup, ClaimAuthMethod, ClaimWindowFile, Identity, MeshMasterFile, MeshOwnerFile,
-    MmkRuntime, OwnerBackupSealed, OwnerClaimRequest, RecoveryCode,
+    accept_owner_claim, admin_verifying_key_bytes, apply_first_mesh_init, check_claim_authorized,
+    device_id_to_words, device_join_uri, mesh_recover_with_code, mesh_rotate_password,
+    mesh_unlock_password, parse_device_id, resolve_claim_fingerprint, seal_owner_backup,
+    sign_mrk_proof_ed25519, take_recovery_once, unseal_owner_backup, ClaimAuthMethod,
+    ClaimWindowFile, CreateWindowFile, Identity, MeshMasterFile, MeshOwnerFile, MmkRuntime,
+    OwnerBackupSealed, OwnerClaimRequest, RecoveryCode,
 };
 use mymesh_net::{
     serve_control_socket, FsMailbox, HttpMailbox, IrohTransport, LocalFabric, LocalRendezvous,
@@ -480,7 +481,22 @@ enum MeshCmd {
         /// Overwrite existing mesh-master.json (destructive)
         #[arg(long)]
         force: bool,
+        /// Household display name (default: hostname / existing mesh.json)
+        #[arg(long)]
+        name: Option<String>,
     },
+    /// Open a first-create window so Carrier POST /meshes may init this box
+    #[command(name = "allow-create")]
+    AllowCreate {
+        /// Window lifetime in seconds (default 300, max 86400)
+        #[arg(long, default_value_t = 300)]
+        secs: u64,
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
+    },
+    /// Print and delete one-shot recovery codes (`mesh-recovery-once.txt`)
+    #[command(name = "recovery-show-once")]
+    RecoveryShowOnce,
     /// Unlock MMK into host-local runtime cache (re-prompt after lock; not OS keyring)
     Unlock {
         #[arg(long, value_name = "PATH")]
@@ -921,7 +937,13 @@ async fn main() -> Result<()> {
             MeshCmd::Init {
                 password_file,
                 force,
-            } => cmd_mesh_init(&paths, password_file, force)?,
+                name,
+            } => cmd_mesh_init(&paths, password_file, force, name)?,
+            MeshCmd::AllowCreate {
+                secs,
+                password_file,
+            } => cmd_mesh_allow_create(&paths, secs, password_file)?,
+            MeshCmd::RecoveryShowOnce => cmd_mesh_recovery_show_once(&paths)?,
             MeshCmd::Unlock { password_file } => cmd_mesh_unlock(&paths, password_file)?,
             MeshCmd::Lock => cmd_mesh_lock(&paths)?,
             MeshCmd::Status => cmd_mesh_status(&paths).await?,
@@ -2357,7 +2379,12 @@ fn print_mmk_status(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn cmd_mesh_init(paths: &Paths, password_file: Option<PathBuf>, force: bool) -> Result<()> {
+fn cmd_mesh_init(
+    paths: &Paths,
+    password_file: Option<PathBuf>,
+    force: bool,
+    name: Option<String>,
+) -> Result<()> {
     paths.ensure()?;
     let path = paths.mesh_master_file();
     if MeshMasterFile::exists(&path) && !force {
@@ -2366,17 +2393,24 @@ fn cmd_mesh_init(paths: &Paths, password_file: Option<PathBuf>, force: bool) -> 
             path.display()
         );
     }
+    if MeshMasterFile::exists(&path) && force {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("remove {} for --force", path.display()))?;
+        // Stale one-shot codes would belong to the previous MRK.
+        let _ = std::fs::remove_file(paths.mesh_recovery_once_file());
+    }
     let password = read_mmk_password(password_file.as_deref(), "New mesh master password", true)?;
-    let init = mesh_init(password.as_bytes(), None)?;
-    init.file.save(&path)?;
-
-    // Migration (KD15): record creator + fingerprint. Existing Trusted peers keep
-    // stored capabilities (no Admin auto-grant). Host-local CLI always node-admin.
-    let identity = Identity::load_or_create(paths.identity_file())?;
-    let mut mesh = MeshState::load(paths.mesh_file())?;
-    mesh.mrk_fingerprint = Some(init.file.mrk_fingerprint.clone());
-    mesh.creator_device_id = Some(identity.device_id());
-    mesh.save(paths.mesh_file())?;
+    let display_name = name
+        .or_else(|| {
+            Config::load(paths.config_file())
+                .ok()
+                .map(|c| c.device_label)
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "Home".into());
+    let first =
+        apply_first_mesh_init(paths, password.as_bytes(), &display_name, None, false, None)?;
+    let init = &first.init;
 
     // Existing Trusted devices: leave capabilities as stored (no Admin auto-grant).
     let store = DeviceStore::open(paths.devices_file())?;
@@ -2389,12 +2423,12 @@ fn cmd_mesh_init(paths: &Paths, password_file: Option<PathBuf>, force: bool) -> 
         })
         .count();
 
-    // Default re-prompt: do not leave runtime unlocked unless user runs unlock.
-    let _ = MmkRuntime::clear(paths.mmk_runtime_file());
+    let identity = Identity::load_or_create(paths.identity_file())?;
 
     println!("{}", style("Mesh master key initialized").green().bold());
     println!("  file          {}", path.display());
     println!("  fingerprint   {}", init.file.mrk_fingerprint);
+    println!("  display_name  {}", first.display_name);
     println!(
         "  creator       {} (host-local admin on this node)",
         identity.device_id().short()
@@ -2425,6 +2459,48 @@ fn cmd_mesh_init(paths: &Paths, password_file: Option<PathBuf>, force: bool) -> 
     println!("Next: mymesh mesh unlock   # then mymesh mesh prove  (admin proof)");
     println!("      mymesh devices grant-admin <id>   # remote Admin for a Trusted peer");
     Ok(())
+}
+
+fn cmd_mesh_allow_create(paths: &Paths, secs: u64, password_file: Option<PathBuf>) -> Result<()> {
+    paths.ensure()?;
+    if MeshMasterFile::exists(paths.mesh_master_file()) {
+        bail!(
+            "mesh already inited at {} — pick a box that has not been inited (no dual-MMK)",
+            paths.mesh_master_file().display()
+        );
+    }
+    let password = read_mmk_password(password_file.as_deref(), "New mesh master password", true)?;
+    let win = CreateWindowFile::mint(secs, Some(password));
+    win.save(paths.create_window_file())?;
+    println!("{}", style("create window open").green().bold());
+    println!("  until  {}", win.until.to_rfc3339());
+    println!("  secs   {}", win.secs);
+    println!(
+        "  file   {} (mode 0600; Carrier POST /meshes may init this box)",
+        paths.create_window_file().display()
+    );
+    println!("  note   phone never receives MMK — password stays on this node");
+    Ok(())
+}
+
+fn cmd_mesh_recovery_show_once(paths: &Paths) -> Result<()> {
+    match take_recovery_once(paths.mesh_recovery_once_file())? {
+        None => {
+            println!("no mesh-recovery-once.txt — already shown, or init used a TTY");
+            Ok(())
+        }
+        Some(body) => {
+            println!(
+                "{}",
+                style("RECOVERY — save now; this file is deleted")
+                    .red()
+                    .bold()
+            );
+            print!("{body}");
+            println!("deleted {}", paths.mesh_recovery_once_file().display());
+            Ok(())
+        }
+    }
 }
 
 /// Sign challenge with unlocked MRK (Ed25519 admin proof). Demonstrates B2 without Carrier.

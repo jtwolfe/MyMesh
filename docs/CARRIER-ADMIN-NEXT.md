@@ -460,8 +460,8 @@ Authorization: Bearer <person_enrolled session>
    Copy: “Kitchen-PC already has a mesh master. Pick a box that has not
    been inited, or use CLI on that machine.”
 3. If mesh-master.json absent:
-   a) MRK/password ceremony on the node: unlocked serve, or
-      `mymesh mesh allow-create --secs 300`, or TUI modal.
+   a) MRK/password ceremony on the node: `mymesh mesh allow-create
+      --secs 300` or TUI modal. Unlock alone is not enough.
    b) Node runs mesh init: wrap new MRK, set mesh.json display_name,
       write mesh-memberships.json single primary row.
    c) Recovery codes → TUI modal if TUI attached, else one-shot
@@ -817,7 +817,7 @@ mymesh enroll revoke <person_id>
 mymesh enroll add --person-id … --facet personal|work \
   --ts … --nonce … --person-pubkey … --sig-file …   # airgap; flags = preimage
 mymesh mesh init                                 # existing; F7 Carrier create calls this
-mymesh mesh allow-create --secs 300
+mymesh mesh allow-create --secs 300              # F7 — MMK window for POST /meshes
 mymesh mesh recovery-show-once                   # prints + deletes mesh-recovery-once.txt
 mymesh memberships list
 mymesh memberships add --mesh <id> --role guest  # --role member errors until F8b
