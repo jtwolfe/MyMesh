@@ -22,7 +22,9 @@ pub use enroll::{
     ENROLLMENTS_FILE_VERSION, ENROLL_DOMAIN, ENROLL_FACET_PERSONAL, ENROLL_FACET_WORK,
 };
 pub use membership::{
-    CatalogMembership, CatalogRole, MeshMembershipsFile, MESH_MEMBERSHIPS_FILE_VERSION,
+    CatalogMembership, CatalogRole, CreateMembershipBody, CreateMembershipGrant,
+    CreateMembershipResponse, MembershipsListResponse, MeshMembershipsFile,
+    MESH_MEMBERSHIPS_FILE_VERSION,
 };
 
 use base64::Engine;

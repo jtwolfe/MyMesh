@@ -25,6 +25,9 @@
 //! POST /mesh/v1/admin/rpc               # AdminEnvelope; introduce = last-mile to joiner
 //! POST /admin/rpc                       # alias of /mesh/v1/admin/rpc
 //! POST /mesh/v1/meshes                 # person_enrolled + create window + no mesh-master
+//! GET  /mesh/v1/memberships             # this-node catalog (F8)
+//! POST /mesh/v1/memberships             # guest overlap; role=member → 501
+//! DELETE /mesh/v1/memberships/{mesh_id} # leave guest row
 //! ```
 //!
 //! Auth methods (S0 freeze / CARRIER-NEXT Issue 4):
@@ -77,6 +80,16 @@ use mymesh_crypto::{
     verify_wipe_token, ClaimAuthMethod, ContinuityPack, ContinuityStatus, CreateWindowFile,
     Identity, IdentityPublic, MeshMasterFile, MeshOwnerFile, MmkRuntime, Mrk, OwnerBackupSealed,
     OwnerClaimRequest, CONTINUITY_MAX_CIPHERTEXT_BYTES, CONTINUITY_PACK_VERSION, HKDF_ADMIN_SIGN,
+use mymesh_core::wire::{CatalogRole, CreateMembershipBody, CreateMembershipResponse};
+    wipe_pack as continuity_wipe_pack, Capability, ContinuityHostManifest, ContinuityHostStatus,
+    DeviceId, DeviceRecord, DeviceStore, Error, Grant, GrantConstraints, GrantObject, GrantRole,
+    GrantStore, IssuedBy, LimitKind, MaterializeInput, MembershipStore, MeshState, NodeFingerprint,
+    PairPhase, PairSessionStore, Paths, RateLimitState, TrustState,
+    accept_owner_claim, check_claim_authorized, open_continuity_pack_for_device,
+    resolve_claim_fingerprint, verify_wipe_token, ClaimAuthMethod, ContinuityPack,
+    ContinuityStatus, Identity, IdentityPublic, MeshMasterFile, MeshOwnerFile, MmkRuntime, Mrk,
+    OwnerBackupSealed, OwnerClaimRequest, CONTINUITY_MAX_CIPHERTEXT_BYTES, CONTINUITY_PACK_VERSION,
+    HKDF_ADMIN_SIGN,
 };
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -283,6 +296,11 @@ pub fn mesh_v1_routes(st: MeshApiState) -> Router {
         )
         .route("/mesh/v1/grants", post(grants_create).get(grants_list))
         .route("/mesh/v1/grants/{id}/revoke", post(grants_revoke))
+        .route(
+            "/mesh/v1/memberships",
+            get(memberships_list).post(memberships_create),
+        )
+        .route("/mesh/v1/memberships/{mesh_id}", delete(memberships_delete))
         .route(
             "/mesh/v1/continuity/materialize",
             post(continuity_materialize),
@@ -2422,6 +2440,423 @@ async fn grants_revoke(
             format!("revoke grant: {e}"),
         ),
     }
+}
+
+// ── Memberships catalog + guest overlap (F8) ────────────────────────────────
+
+fn require_x_mesh_id(headers: &HeaderMap, primary: &str) -> Result<(), Response> {
+    match headers
+        .get("x-mesh-id")
+        .or_else(|| headers.get("X-Mesh-Id"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        None => Ok(()),
+        Some(id) if id == primary => Ok(()),
+        Some(_) => Err(mesh_err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "X-Mesh-Id does not match this node's primary mesh",
+        )),
+    }
+}
+
+fn require_memberships_read_authz(session: &MeshSession) -> Result<(), Response> {
+    match session.auth_mode {
+        AuthMethod::PersonOwner | AuthMethod::MrkProof | AuthMethod::DeviceMember => Ok(()),
+        AuthMethod::PairRead => Err(mesh_err(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "pair_read cannot read memberships (this-node catalog is not topology)",
+        )),
+    }
+}
+
+fn load_mesh_and_catalog(paths: &Paths) -> Result<(MeshState, MembershipStore), Response> {
+    let mesh = MeshState::load(paths.mesh_file()).map_err(|e| {
+        mesh_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("mesh load: {e}"),
+        )
+    })?;
+    let cat = MembershipStore::open_or_migrate(paths.mesh_memberships_file(), &mesh.mesh_id)
+        .map_err(|e| {
+            mesh_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("memberships: {e}"),
+            )
+        })?;
+    Ok((mesh, cat))
+}
+
+fn catalog_http_err(e: Error) -> Response {
+    match e {
+        Error::NotImplemented(msg) => mesh_err(StatusCode::NOT_IMPLEMENTED, "not_implemented", msg),
+        Error::Conflict(msg) => mesh_err(StatusCode::CONFLICT, "conflict", msg),
+        Error::NotFound(msg) => mesh_err(StatusCode::NOT_FOUND, "not_found", msg),
+        Error::Config(msg) => mesh_err(StatusCode::BAD_REQUEST, "bad_request", msg),
+        other => mesh_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("memberships: {other}"),
+        ),
+    }
+}
+
+async fn memberships_list(State(st): State<MeshApiState>, headers: HeaderMap) -> Response {
+    let session = match require_mesh_session(&st, &headers).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_memberships_read_authz(&session) {
+        return r;
+    }
+    let (mesh, cat) = match load_mesh_and_catalog(&st.paths) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_x_mesh_id(&headers, &mesh.mesh_id) {
+        return r;
+    }
+    Json(cat.file().clone()).into_response()
+}
+
+async fn memberships_create(
+    State(st): State<MeshApiState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateMembershipBody>,
+) -> Response {
+    let session = match require_mesh_session(&st, &headers).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let (mesh, mut cat) = match load_mesh_and_catalog(&st.paths) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_x_mesh_id(&headers, &mesh.mesh_id) {
+        return r;
+    }
+
+    if body.role == CatalogRole::Member {
+        if body.mesh_id == mesh.mesh_id {
+            return mesh_err(
+                StatusCode::CONFLICT,
+                "conflict",
+                "primary member row already exists",
+            );
+        }
+        return mesh_err(
+            StatusCode::NOT_IMPLEMENTED,
+            "not_implemented",
+            "member overlap is F8b (DeviceRecord.memberships)",
+        );
+    }
+    if body.role != CatalogRole::Guest {
+        return mesh_err(StatusCode::BAD_REQUEST, "bad_request", "role must be guest");
+    }
+
+    let subject = match DeviceId::from_str_hex(&body.device_id_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return mesh_err(
+                StatusCode::BAD_REQUEST,
+                "invalid_device_id",
+                format!("device_id_hex: {e}"),
+            );
+        }
+    };
+    let dest = body.mesh_id.trim();
+    if dest.is_empty() {
+        return mesh_err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "mesh_id is required",
+        );
+    }
+    let host_id = host_identity(&st.secret).device_id();
+    let is_subject = subject == host_id;
+
+    if !is_subject {
+        // Dest policy node: create guest grant only. Catalog lives on the subject.
+        if dest != mesh.mesh_id {
+            return mesh_err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "dest grant mesh_id must be this node's primary",
+            );
+        }
+        if body.grant.is_none() {
+            return mesh_err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "grant payload required to create dest guest grant",
+            );
+        }
+        if let Err(r) = require_grants_mutate_authz(&st, &session) {
+            return r;
+        }
+        let grant = match create_overlap_grant(&st, &session, dest, subject, body.grant.as_ref()) {
+            Ok(g) => g,
+            Err(r) => return r,
+        };
+        return (
+            StatusCode::CREATED,
+            Json(CreateMembershipResponse {
+                membership: None,
+                via_grant_id: Some(grant.grant_id),
+            }),
+        )
+            .into_response();
+    }
+
+    // Subject node: accept guest catalog row (+ optional local grant).
+    if dest == mesh.mesh_id {
+        return mesh_err(
+            StatusCode::CONFLICT,
+            "conflict",
+            "cannot add extra membership on the primary mesh",
+        );
+    }
+    if let Err(r) = require_grants_mutate_authz(&st, &session) {
+        // Host-local subject accept reuses dest-grant authz on this box (person_owner /
+        // mrk / Admin device). person_enrolled is F4.
+        return r;
+    }
+
+    if let Err(e) = cat.ensure_can_add_guest(dest) {
+        return catalog_http_err(e);
+    }
+
+    let mut created_grant_id: Option<String> = None;
+    let via = if body.grant.is_some() {
+        match create_overlap_grant(&st, &session, dest, subject, body.grant.as_ref()) {
+            Ok(g) => {
+                created_grant_id = Some(g.grant_id.clone());
+                Some(g.grant_id)
+            }
+            Err(r) => return r,
+        }
+    } else if let Some(raw) = body.via_grant_id.as_deref() {
+        match resolve_overlap_grant(&st.paths, raw, dest, &subject) {
+            Ok(gid) => Some(gid),
+            Err(r) => return r,
+        }
+    } else if let Some(gid) = find_overlap_grant(&st.paths, dest, &subject) {
+        Some(gid)
+    } else {
+        return mesh_err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "guest overlap requires an active dest Device grant (create on dest, or pass via_grant_id)",
+        );
+    };
+
+    match cat.add_guest(dest, via.clone()) {
+        Ok(row) => (
+            StatusCode::CREATED,
+            Json(CreateMembershipResponse {
+                membership: Some(row),
+                via_grant_id: via,
+            }),
+        )
+            .into_response(),
+        Err(e) => {
+            if let Some(gid) = created_grant_id {
+                rollback_created_grant(&st.paths, &gid);
+            }
+            catalog_http_err(e)
+        }
+    }
+}
+
+async fn memberships_delete(
+    State(st): State<MeshApiState>,
+    headers: HeaderMap,
+    Path(mesh_id): Path<String>,
+) -> Response {
+    let session = match require_mesh_session(&st, &headers).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_grants_mutate_authz(&st, &session) {
+        return r;
+    }
+    let (mesh, mut cat) = match load_mesh_and_catalog(&st.paths) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_x_mesh_id(&headers, &mesh.mesh_id) {
+        return r;
+    }
+    match cat.leave(&mesh_id) {
+        Ok(row) => Json(row).into_response(),
+        Err(e) => catalog_http_err(e),
+    }
+}
+
+fn create_overlap_grant(
+    st: &MeshApiState,
+    session: &MeshSession,
+    dest_mesh_id: &str,
+    subject: DeviceId,
+    grant: Option<&mymesh_core::wire::CreateMembershipGrant>,
+) -> Result<Grant, Response> {
+    let spec = grant.ok_or_else(|| {
+        mesh_err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "grant payload required",
+        )
+    })?;
+    let object = DeviceId::from_str_hex(&spec.object_device_id_hex).map_err(|e| {
+        mesh_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_device_id",
+            format!("object_device_id_hex: {e}"),
+        )
+    })?;
+    let capabilities = parse_grant_capabilities(&spec.capabilities)?;
+    if capabilities.contains(&Capability::Admin) {
+        return Err(mesh_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_caps",
+            "Admin capability is not allowed on guest grants",
+        ));
+    }
+    let mut grants = GrantStore::open(st.paths.grants_file()).map_err(|e| {
+        mesh_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("grant store: {e}"),
+        )
+    })?;
+    grants
+        .create_guest(
+            dest_mesh_id,
+            subject,
+            object,
+            capabilities,
+            not_after_days(spec.not_after_days),
+            issued_by_for_session(st, session),
+        )
+        .map_err(|e| match e {
+            Error::Config(msg) => mesh_err(StatusCode::BAD_REQUEST, "invalid_caps", msg),
+            other => mesh_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("create grant: {other}"),
+            ),
+        })
+}
+
+/// Crockford ULID / grant id on the catalog pointer (not a filesystem path).
+fn parse_via_grant_id(raw: &str) -> Result<&str, Response> {
+    let t = raw.trim();
+    if t.is_empty() || t.len() > 32 {
+        return Err(mesh_err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "via_grant_id must be 1..=32 chars",
+        ));
+    }
+    if !t
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(mesh_err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "via_grant_id has invalid characters",
+        ));
+    }
+    Ok(t)
+}
+
+/// Resolve a subject `via_grant_id`.
+///
+/// - Present locally: must be an **active** guest `GrantObject::Device` for dest + subject
+///   (same bar as join-as-guest).
+/// - Absent locally: dest-issued opaque pointer. Dest GrantAnnounce does not replicate
+///   a foreign `mesh_id`, so the subject must not 404.
+fn resolve_overlap_grant(
+    paths: &Paths,
+    grant_id: &str,
+    dest_mesh_id: &str,
+    subject: &DeviceId,
+) -> Result<String, Response> {
+    let grant_id = parse_via_grant_id(grant_id)?;
+    let grants = GrantStore::open(paths.grants_file()).map_err(|e| {
+        mesh_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("grant store: {e}"),
+        )
+    })?;
+    let Some(g) = grants.get(grant_id) else {
+        return Ok(grant_id.to_string());
+    };
+    if !g.is_active(Utc::now()) {
+        return Err(mesh_err(
+            StatusCode::BAD_REQUEST,
+            "grant_inactive",
+            "via_grant_id is revoked or expired",
+        ));
+    }
+    if g.mesh_id != dest_mesh_id {
+        return Err(mesh_err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "via_grant_id mesh_id does not match dest",
+        ));
+    }
+    if g.role != GrantRole::Guest {
+        return Err(mesh_err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "via_grant_id is not a guest grant",
+        ));
+    }
+    if &g.subject_device_id != subject {
+        return Err(mesh_err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "via_grant_id subject is not the membership device",
+        ));
+    }
+    if g.object.as_device_id().is_none() {
+        return Err(mesh_err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "via_grant_id object must be GrantObject::Device",
+        ));
+    }
+    Ok(grant_id.to_string())
+}
+
+fn rollback_created_grant(paths: &Paths, grant_id: &str) {
+    if let Ok(mut grants) = GrantStore::open(paths.grants_file()) {
+        let _ = grants.revoke(grant_id);
+    }
+}
+
+fn find_overlap_grant(paths: &Paths, dest_mesh_id: &str, subject: &DeviceId) -> Option<String> {
+    let grants = GrantStore::open(paths.grants_file()).ok()?;
+    let now = Utc::now();
+    grants
+        .list()
+        .into_iter()
+        .find(|g| {
+            g.mesh_id == dest_mesh_id
+                && g.subject_device_id == *subject
+                && g.role == GrantRole::Guest
+                && g.object.as_device_id().is_some()
+                && g.is_active(now)
+        })
+        .map(|g| g.grant_id.clone())
 }
 
 // ── Continuity materialize / wipe / status (S8 / E4) ────────────────────────
@@ -6046,6 +6481,374 @@ mod tests {
 
         let counters = mymesh_core::EventCounters::load(&metrics).unwrap();
         assert!(counters.mesh_auth_challenge_total > limit as u64);
+    }
+
+    // ── F8 memberships catalog + guest overlap ─────────────────────────────
+
+    fn write_owner_file(paths: &Paths, mesh_id: &str, person: &Identity, person_id: &str) {
+        MeshOwnerFile {
+            mesh_id: mesh_id.into(),
+            person_id: person_id.into(),
+            person_public_key_hex: hex::encode(person.verifying_key_bytes()),
+            display_name: "Owner".into(),
+            claimed_at: Utc::now(),
+            claim_ts_unix: Utc::now().timestamp(),
+            claimed_from_device_id: None,
+            mrk_fingerprint: "fp".into(),
+            mrk_epoch: 0,
+            claim_sig_hex: "00".repeat(64),
+            backup_stored_at: None,
+        }
+        .save(paths.mesh_owner_file())
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn memberships_get_post_delete_guest_grant_path() {
+        let paths = tmp_paths();
+        let secret = [0x81u8; 32];
+        let host = Identity::from_secret_bytes(secret);
+        let mut mesh = MeshState::new_mesh();
+        mesh.mesh_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into();
+        mesh.save(paths.mesh_file()).unwrap();
+        let person = Identity::generate();
+        let person_id = "01MEMBERPERSON00000000000";
+        write_owner_file(&paths, &mesh.mesh_id, &person, person_id);
+
+        let st = test_state(paths.clone(), secret, "host");
+        let app = mesh_v1_routes(st);
+        let token = mint_person_owner_token(&app, &mesh.mesh_id, &person, person_id).await;
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/mesh/v1/memberships")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/mesh/v1/memberships")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let listed = json_body(resp).await;
+        assert_eq!(listed["primary_mesh_id"], mesh.mesh_id);
+        assert_eq!(listed["memberships"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["memberships"][0]["role"], "member");
+        assert_eq!(listed["memberships"][0]["primary"], true);
+
+        let dest = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let body = serde_json::json!({
+            "device_id_hex": host.device_id().to_string(),
+            "mesh_id": dest,
+            "role": "guest",
+            "grant": {
+                "object_device_id_hex": host.device_id().to_string(),
+                "capabilities": ["terminal", "files"],
+                "not_after_days": 7
+            }
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/memberships")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "{}",
+            json_body(resp).await
+        );
+        // Re-fetch body — previous json_body consumes. Recreate request result via store.
+        let grants = GrantStore::open(paths.grants_file()).unwrap();
+        assert_eq!(grants.list().len(), 1);
+        let g = grants.list()[0];
+        assert_eq!(g.mesh_id, dest);
+        assert_eq!(g.role, GrantRole::Guest);
+        assert_eq!(g.subject_device_id, host.device_id());
+        assert!(g.object.as_device_id().is_some());
+
+        let cat = MembershipStore::open(paths.mesh_memberships_file()).unwrap();
+        assert!(cat.has_extra_rows());
+        assert_eq!(
+            cat.get(dest).unwrap().via_grant_id.as_deref(),
+            Some(g.grant_id.as_str())
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/mesh/v1/memberships/{dest}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cat = MembershipStore::open(paths.mesh_memberships_file()).unwrap();
+        assert!(!cat.has_extra_rows());
+    }
+
+    #[tokio::test]
+    async fn memberships_role_member_extra_501() {
+        let paths = tmp_paths();
+        let secret = [0x82u8; 32];
+        let host = Identity::from_secret_bytes(secret);
+        let mut mesh = MeshState::new_mesh();
+        mesh.mesh_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into();
+        mesh.save(paths.mesh_file()).unwrap();
+        let person = Identity::generate();
+        let person_id = "01MEMBERPERSON50100000000";
+        write_owner_file(&paths, &mesh.mesh_id, &person, person_id);
+        let st = test_state(paths, secret, "host");
+        let app = mesh_v1_routes(st);
+        let token = mint_person_owner_token(&app, &mesh.mesh_id, &person, person_id).await;
+
+        let body = serde_json::json!({
+            "device_id_hex": host.device_id().to_string(),
+            "mesh_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "role": "member"
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/memberships")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let j = json_body(resp).await;
+        assert_eq!(j["code"], "not_implemented");
+    }
+
+    #[tokio::test]
+    async fn memberships_x_mesh_id_foreign_400() {
+        let paths = tmp_paths();
+        let secret = [0x83u8; 32];
+        let mut mesh = MeshState::new_mesh();
+        mesh.mesh_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into();
+        mesh.save(paths.mesh_file()).unwrap();
+        let person = Identity::generate();
+        let person_id = "01MEMBERPERSONXMESH00000";
+        write_owner_file(&paths, &mesh.mesh_id, &person, person_id);
+        let st = test_state(paths, secret, "host");
+        let app = mesh_v1_routes(st);
+        let token = mint_person_owner_token(&app, &mesh.mesh_id, &person, person_id).await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mesh/v1/memberships")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header("X-Mesh-Id", "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(resp).await["code"], "bad_request");
+    }
+
+    #[tokio::test]
+    async fn memberships_dest_via_grant_id_accepted_on_subject() {
+        // Dest creates the grant; subject has no replica (GrantAnnounce drops foreign mesh_id).
+        let dest_paths = tmp_paths();
+        let dest_secret = [0x91u8; 32];
+        let dest_host = Identity::from_secret_bytes(dest_secret);
+        let dest_mesh = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+        let mut dest_state = MeshState::new_mesh();
+        dest_state.mesh_id = dest_mesh.into();
+        dest_state.save(dest_paths.mesh_file()).unwrap();
+        let dest_person = Identity::generate();
+        let dest_pid = "01DESTOWNER000000000000000";
+        write_owner_file(&dest_paths, dest_mesh, &dest_person, dest_pid);
+
+        let subj_paths = tmp_paths();
+        let subj_secret = [0x92u8; 32];
+        let subj_host = Identity::from_secret_bytes(subj_secret);
+        let mut subj_state = MeshState::new_mesh();
+        subj_state.mesh_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into();
+        subj_state.save(subj_paths.mesh_file()).unwrap();
+        let subj_person = Identity::generate();
+        let subj_pid = "01SUBJOWNER000000000000000";
+        write_owner_file(&subj_paths, &subj_state.mesh_id, &subj_person, subj_pid);
+
+        let dest_app = mesh_v1_routes(test_state(dest_paths.clone(), dest_secret, "dest"));
+        let dest_tok = mint_person_owner_token(&dest_app, dest_mesh, &dest_person, dest_pid).await;
+        let dest_body = serde_json::json!({
+            "device_id_hex": subj_host.device_id().to_string(),
+            "mesh_id": dest_mesh,
+            "role": "guest",
+            "grant": {
+                "object_device_id_hex": dest_host.device_id().to_string(),
+                "capabilities": ["terminal"]
+            }
+        });
+        let dest_resp = dest_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/memberships")
+                    .header(header::AUTHORIZATION, format!("Bearer {dest_tok}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(dest_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dest_resp.status(), StatusCode::CREATED);
+        let dest_j = json_body(dest_resp).await;
+        assert!(dest_j["membership"].is_null());
+        let via = dest_j["via_grant_id"].as_str().unwrap().to_string();
+        assert!(!via.is_empty());
+        assert!(
+            GrantStore::open(subj_paths.grants_file())
+                .unwrap()
+                .get(&via)
+                .is_none(),
+            "subject must not already have dest grant"
+        );
+
+        let subj_app = mesh_v1_routes(test_state(subj_paths.clone(), subj_secret, "subj"));
+        let subj_tok =
+            mint_person_owner_token(&subj_app, &subj_state.mesh_id, &subj_person, subj_pid).await;
+        let subj_body = serde_json::json!({
+            "device_id_hex": subj_host.device_id().to_string(),
+            "mesh_id": dest_mesh,
+            "role": "guest",
+            "via_grant_id": via,
+        });
+        let subj_resp = subj_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/memberships")
+                    .header(header::AUTHORIZATION, format!("Bearer {subj_tok}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(subj_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            subj_resp.status(),
+            StatusCode::CREATED,
+            "{}",
+            json_body(subj_resp).await
+        );
+        let cat = MembershipStore::open(subj_paths.mesh_memberships_file()).unwrap();
+        assert_eq!(
+            cat.get(dest_mesh).unwrap().via_grant_id.as_deref(),
+            Some(via.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn memberships_subject_requires_active_grant() {
+        let paths = tmp_paths();
+        let secret = [0x93u8; 32];
+        let host = Identity::from_secret_bytes(secret);
+        let mut mesh = MeshState::new_mesh();
+        mesh.mesh_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into();
+        mesh.save(paths.mesh_file()).unwrap();
+        let person = Identity::generate();
+        let person_id = "01MEMBERPERSONNOGRANT0000";
+        write_owner_file(&paths, &mesh.mesh_id, &person, person_id);
+        let dest = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+
+        // Revoked local grant must not attach.
+        let mut grants = GrantStore::open(paths.grants_file()).unwrap();
+        let g = grants
+            .create_guest(
+                dest,
+                host.device_id(),
+                host.device_id(),
+                vec![Capability::Terminal],
+                None,
+                IssuedBy::device(&host.device_id()),
+            )
+            .unwrap();
+        grants.revoke(&g.grant_id).unwrap();
+
+        let st = test_state(paths.clone(), secret, "host");
+        let app = mesh_v1_routes(st);
+        let token = mint_person_owner_token(&app, &mesh.mesh_id, &person, person_id).await;
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/memberships")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "device_id_hex": host.device_id().to_string(),
+                            "mesh_id": dest,
+                            "role": "guest",
+                            "via_grant_id": g.grant_id,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(resp).await["code"], "grant_inactive");
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/memberships")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "device_id_hex": host.device_id().to_string(),
+                            "mesh_id": dest,
+                            "role": "guest"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(resp).await["code"], "bad_request");
+        let cat = MembershipStore::open(paths.mesh_memberships_file()).unwrap();
+        assert!(!cat.has_extra_rows());
     }
 
     // ── Continuity materialize / wipe / status (S8 / E4) ───────────────────

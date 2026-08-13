@@ -124,6 +124,7 @@ impl Paths {
 
     /// This-node membership catalog (`mesh-memberships.json`, mode 0600). F7 writes the
     /// primary row at first init; F8 owns guest rows.
+    /// This-node membership catalog (`mesh-memberships.json`, mode 0600). Wave F8.
     pub fn mesh_memberships_file(&self) -> PathBuf {
         self.data_dir.join("mesh-memberships.json")
     }

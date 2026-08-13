@@ -37,12 +37,45 @@ pub struct CatalogMembership {
     pub source: String,
 }
 
-/// On-disk catalog (not persisted in F1).
+/// On-disk catalog (`Paths::mesh_memberships_file`, mode 0600).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshMembershipsFile {
     pub version: u32,
     pub primary_mesh_id: String,
     pub memberships: Vec<CatalogMembership>,
+}
+
+/// `GET /mesh/v1/memberships` — this node's catalog (same shape as the file).
+pub type MembershipsListResponse = MeshMembershipsFile;
+
+/// Grant fragment on `POST /mesh/v1/memberships` (existing `GrantObject::Device`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateMembershipGrant {
+    pub object_device_id_hex: String,
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_after_days: Option<u64>,
+}
+
+/// `POST /mesh/v1/memberships` body (guest overlap this wave).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateMembershipBody {
+    pub device_id_hex: String,
+    pub mesh_id: String,
+    pub role: CatalogRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<CreateMembershipGrant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_grant_id: Option<String>,
+}
+
+/// `POST /mesh/v1/memberships` result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateMembershipResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership: Option<CatalogMembership>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_grant_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -75,5 +108,25 @@ mod tests {
         assert!(!j.contains("via_grant_id"));
         let back: MeshMembershipsFile = serde_json::from_str(&j).unwrap();
         assert_eq!(back, file);
+    }
+
+    #[test]
+    fn create_membership_body_guest_roundtrip() {
+        let body = CreateMembershipBody {
+            device_id_hex: "ab".repeat(32),
+            mesh_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".into(),
+            role: CatalogRole::Guest,
+            grant: Some(CreateMembershipGrant {
+                object_device_id_hex: "cd".repeat(32),
+                capabilities: vec!["terminal".into(), "files".into()],
+                not_after_days: Some(7),
+            }),
+            via_grant_id: None,
+        };
+        let j = serde_json::to_string(&body).unwrap();
+        assert!(j.contains("\"guest\""));
+        assert!(!j.contains("via_grant_id"));
+        let back: CreateMembershipBody = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, body);
     }
 }

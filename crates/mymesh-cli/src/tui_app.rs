@@ -3547,7 +3547,7 @@ async fn mesh_sync_all(paths: &Paths) -> anyhow::Result<usize> {
     use mymesh_core::{Config, DeviceStore, MeshState};
     use mymesh_crypto::Identity;
     use mymesh_protocol::{decode_msg, encode_msg, ChannelId, ControlMessage, Frame};
-    use mymesh_session::{apply_membership, build_announce};
+    use mymesh_session::{apply_membership_gossip, build_announce};
     let identity = Identity::load_or_create(paths.identity_file())?;
     let cfg = Config::load(paths.config_file())?;
     let store = DeviceStore::open(paths.devices_file())?;
@@ -3596,7 +3596,7 @@ async fn mesh_sync_all(paths: &Paths) -> anyhow::Result<usize> {
                     .is_ok()
                 {
                     let mut store = DeviceStore::open(paths.devices_file())?;
-                    added += apply_membership(
+                    added += apply_membership_gossip(
                         &mut store,
                         &paths.mesh_file(),
                         &from_id,

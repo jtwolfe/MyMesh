@@ -39,10 +39,10 @@ pub use magic::MagicPlane;
 pub use mailbox_poller::spawn_admin_mailbox_poller;
 pub use mesh_sync::{
     apply_grant_revoke, apply_kick_notice_local, apply_kick_target, apply_membership,
-    build_announce, build_grant_revoke, build_snapshot, bump_mesh_dirty, members_from_store,
-    peer_may_mutate_grants, peer_receives_mesh_gossip, sign_grant_announce, sign_grant_revoke,
-    sign_kick, sign_leave_ack, verify_grant_announce, verify_grant_revoke, verify_kick,
-    verify_leave_ack, verify_membership,
+    apply_membership_gossip, build_announce, build_grant_revoke, build_snapshot, bump_mesh_dirty,
+    members_from_store, peer_may_mutate_grants, peer_receives_mesh_gossip, sign_grant_announce,
+    sign_grant_revoke, sign_kick, sign_leave_ack, verify_grant_announce, verify_grant_revoke,
+    verify_kick, verify_leave_ack, verify_membership,
 };
 pub use mymesh_crypto::MeshOwnerFile;
 pub use pair::{run_guest_pair, run_host_pair, run_host_pair_code, PairOutcome};
