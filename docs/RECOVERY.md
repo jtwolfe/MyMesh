@@ -71,6 +71,7 @@ Password sources (order): `--password-file`, `MYMESH_MMK_PASSWORD`, interactive 
 | `devices grant-admin \| revoke-admin` | **Implemented** | Remote Admin only; not MMK |
 | `pair dual` / `pair confirm` | **Implemented** | Re-pair after nuclear re-init — [DEMO-PAIR.md](DEMO-PAIR.md) |
 | `reset --links` / `--identity` | **Implemented** | Local nuclear helpers (see nuclear runbook) |
+| `enroll list \| add \| revoke <person_id>` | **Implemented** | Stolen phone — revoke `can_drive` on **this** node (**C9**) |
 
 ### On-disk artifacts (agent `Paths`, mode 0600 where written)
 
@@ -82,6 +83,7 @@ Password sources (order): `--password-file`, `MYMESH_MMK_PASSWORD`, interactive 
 | `owner-backup.sealed` | Password-AEAD person seed backup |
 | `claim-window.json` | Short-lived MMK-authorized claim window |
 | `devices.json` / `grants.json` | Trust + guest grants |
+| `enrollments.json` | Person enrollments (`can_drive`); mode 0600 |
 
 ---
 
@@ -98,6 +100,7 @@ Same matrix as [MASTER-KEY.md](MASTER-KEY.md); runbooks below expand each row.
 | R5 | MMK + owner phone | Sealed backup on disk + password | Restore phone first (R1), then R4 if MMK still lost |
 | R6 | MMK + owner + backup | Trusted member + host-local CLI | Node still runs; **no** remote MMK proof; codes at init recommended; else nuclear |
 | — | Guest device compromised | Host / owner / MMK intact | Revoke grant; optional unlink (not kick) |
+| — | Enrolled phone stolen / lost | Host + MMK intact | **Runbook ER** — `enroll revoke` on each node; pair confirm is not enroll |
 | — | MMK password **leaked** (not lost) | Still know password | `rotate-master` (same MRK) **or** recover + new codes if wrap may be offline-attacked |
 
 ---
@@ -339,6 +342,50 @@ mymesh mesh unlock
 
 ---
 
+## Runbook ER — Enroll revoke (stolen / lost phone)
+
+**Goal:** Stop a stolen Carrier from **driving** enrolled nodes. This is **not** owner clear and **not** MMK rotate.
+
+### Threat context
+
+- Enroll is **not** mesh ownership ([CARRIER-ADMIN-NEXT.md](CARRIER-ADMIN-NEXT.md), [THREATS.md](THREATS.md) **C8** / **C9**).
+- Confirm-on-machine completes **pair** only — it does not write `enrollments.json`.
+- `person_enrolled` can introduce / create-first-mesh / read this-node catalog; it **cannot** mutate grants or smash MMK.
+- Standing last-mile sessions last **15 minutes**. Revoke does not kill an already-minted Bearer until it expires; re-enroll after revoke needs a new verified person sig.
+
+### Steps (each enrolled node)
+
+```bash
+mymesh enroll list
+# person_id  facet  drive  …
+
+mymesh enroll revoke <person_id>
+mymesh enroll list    # that person gone; can_drive false
+```
+
+HTTP equivalent (host-local or that person's `person_enrolled` / `mrk_proof`):
+
+```bash
+# loopback
+curl -X DELETE http://127.0.0.1:17878/mesh/v1/enrollments/<person_id>
+```
+
+### Checklist
+
+- [ ] Revoked on **every** box that listed the stolen phone (`enroll list`)
+- [ ] Phone cannot `POST /enrollments` again without a new ceremony (different key after revoke is allowed)
+- [ ] Optional: revoke guest grants the phone created ([Runbook G](#runbook-g--compromised-guest))
+- [ ] Do **not** `owner clear` or `mesh init --force` solely because a phone was stolen
+- [ ] Re-enroll the replacement phone with a verified `carrier-enroll-v1` sig (TOFU fp again)
+
+### Related
+
+- CLI: `mymesh enroll --help`
+- Authz matrix: [CARRIER-ADMIN-NEXT.md](CARRIER-ADMIN-NEXT.md)
+- Controls: [THREATS.md](THREATS.md) **C9**
+
+---
+
 ## Runbook G — Compromised guest
 
 **Goal:** End guest access immediately without rotating MMK or owner.
@@ -485,6 +532,7 @@ mymesh owner allow-claim --secs 300
 | `mesh lock` on shared hosts | Clear host-local MRK cache |
 | Prefer pair v2 confirm over LAN decide on hostile networks | [DEMO-PAIR.md](DEMO-PAIR.md) · [THREATS.md](THREATS.md) C1–C2 |
 | Revoke guest grants promptly | Runbook G · [GRANTS.md](GRANTS.md) |
+| Revoke enrollments on stolen phones | Runbook ER · [THREATS.md](THREATS.md) **C9** |
 | Do not put MMK / recovery codes on the phone | Normative forbidden ([MASTER-KEY.md](MASTER-KEY.md)) |
 
 ---
@@ -496,7 +544,7 @@ mymesh owner allow-claim --secs 300
 | [MASTER-KEY.md](MASTER-KEY.md) | MMK crypto, recovery matrix contract, owner claim patterns |
 | Carrier `docs/OWNERSHIP.md` | Phone claim / sealed backup restore UX (Carrier repo) |
 | [SECURITY.md](SECURITY.md) | Trust model, dual authority summary |
-| [THREATS.md](THREATS.md) | C1–C7, backup theft, MMK lockout threats |
+| [THREATS.md](THREATS.md) | C1–C7 + Wave F C8–C13, backup theft, MMK lockout, enroll revoke |
 | [DEMO-PAIR.md](DEMO-PAIR.md) | Re-pair after nuclear recovery |
 | [GUEST.md](GUEST.md) · [GRANTS.md](GRANTS.md) | Guest isolation + revoke |
 | [USAGE.md](USAGE.md) | Day-to-day CLI |

@@ -1,8 +1,5 @@
-//! This-node membership catalog (`mesh-memberships.json`, mode 0600).
-//!
-//! F7 writes a single primary row at first mesh init. Guest overlap is F8.
-
 //! Membership catalog (`mesh-memberships.json` mode 0600).
+//!
 //! Primary row mirrors `mesh.json`. Extra rows this wave are **guest** only
 //! (existing Grant). Extra `role=member` is F8b (`not_implemented`).
 use crate::wire::{
@@ -10,20 +7,19 @@ use crate::wire::{
 };
 use crate::{Error, Result};
 use chrono::{SecondsFormat, Utc};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Persist / load this node's membership catalog.
-#[derive(Debug)]
-pub struct MembershipCatalog {
 /// Quantified budget: catalog rows per node (CARRIER-ADMIN-NEXT).
 pub const MAX_CATALOG_ROWS: usize = 8;
+
 /// `source` for the primary row written from `mesh init` / first migrate.
 pub const MEMBERSHIP_SOURCE_INIT: &str = "init";
 /// `source` for guest overlap rows.
 pub const MEMBERSHIP_SOURCE_OVERLAP: &str = "overlap";
-/// On-disk this-node catalog under agent Paths (`mesh-memberships.json`, 0600).
-pub struct MembershipStore {
+
+/// Persist / load this node's membership catalog (F7 first-init helper).
+#[derive(Debug)]
+pub struct MembershipCatalog {
     path: PathBuf,
     file: MeshMembershipsFile,
 }
@@ -44,9 +40,89 @@ impl MembershipCatalog {
             )));
         }
         Ok(Some(Self { path, file }))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn file(&self) -> &MeshMembershipsFile {
+        &self.file
+    }
+}
+
+/// Write (or replace) the single primary `source=init` row for first mesh init.
+///
+/// F7 is first-init only: one primary membership. F8 may add guest rows later.
+pub fn write_init_primary(path: impl AsRef<Path>, mesh_id: &str) -> Result<MeshMembershipsFile> {
+    let mesh_id = mesh_id.trim();
+    if mesh_id.is_empty() {
+        return Err(Error::Config(
+            "mesh_id required for memberships init".into(),
+        ));
+    }
+    let joined_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let file = MeshMembershipsFile {
+        version: MESH_MEMBERSHIPS_FILE_VERSION,
+        primary_mesh_id: mesh_id.to_string(),
+        memberships: vec![CatalogMembership {
+            mesh_id: mesh_id.to_string(),
+            role: CatalogRole::Member,
+            primary: true,
+            joined_at,
+            via_grant_id: None,
+            source: MEMBERSHIP_SOURCE_INIT.into(),
+        }],
+    };
+    write_private_0600(path.as_ref(), serde_json::to_vec_pretty(&file)?.as_slice())?;
+    Ok(file)
+}
+
+/// Write `bytes` via a 0600 tmp file, then rename. Fails if dest is not 0600.
+pub fn write_private_0600(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp.0600");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(Error::Config(format!(
+                "{}: expected mode 0600, got {mode:04o}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// On-disk this-node catalog under agent Paths (`mesh-memberships.json`, 0600).
+#[derive(Debug)]
+pub struct MembershipStore {
+    path: PathBuf,
+    file: MeshMembershipsFile,
+}
+
 impl MembershipStore {
     /// Load existing file. Missing → empty in-memory store (no write).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
         let file = if path.exists() {
             let raw = std::fs::read_to_string(&path)?;
             let file: MeshMembershipsFile = serde_json::from_str(&raw)?;
@@ -87,6 +163,7 @@ impl MembershipStore {
         } else if store.file.primary_mesh_id != primary_mesh_id && !store.has_extra_rows() {
             // mesh.json is source of truth for primary when no overlap extras.
             store.rebind_primary(primary_mesh_id)?;
+        }
         Ok(store)
     }
 
@@ -94,71 +171,14 @@ impl MembershipStore {
         &self.path
     }
 
+    pub fn primary_mesh_id(&self) -> &str {
+        &self.file.primary_mesh_id
+    }
+
     pub fn file(&self) -> &MeshMembershipsFile {
         &self.file
     }
-}
 
-/// Write (or replace) the single primary `source=init` row for first mesh init.
-///
-/// F7 is first-init only: one primary membership. F8 may add guest rows later.
-pub fn write_init_primary(path: impl AsRef<Path>, mesh_id: &str) -> Result<MeshMembershipsFile> {
-    let mesh_id = mesh_id.trim();
-    if mesh_id.is_empty() {
-        return Err(Error::Config(
-            "mesh_id required for memberships init".into(),
-        ));
-    }
-    let joined_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let file = MeshMembershipsFile {
-        version: MESH_MEMBERSHIPS_FILE_VERSION,
-        primary_mesh_id: mesh_id.to_string(),
-        memberships: vec![CatalogMembership {
-            mesh_id: mesh_id.to_string(),
-            role: CatalogRole::Member,
-            primary: true,
-            joined_at,
-            via_grant_id: None,
-            source: "init".into(),
-        }],
-    };
-    write_private_0600(path.as_ref(), serde_json::to_vec_pretty(&file)?.as_slice())?;
-    Ok(file)
-}
-
-/// Write `bytes` via a 0600 tmp file, then rename. Fails if dest is not 0600.
-pub fn write_private_0600(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
-    let path = path.as_ref();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("tmp.0600");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
-        if mode != 0o600 {
-            return Err(Error::Config(format!(
-                "{}: expected mode 0600, got {mode:04o}",
-                path.display()
-            )));
-        }
-    }
-    Ok(())
-    pub fn primary_mesh_id(&self) -> &str {
-        &self.file.primary_mesh_id
     pub fn list(&self) -> Vec<&CatalogMembership> {
         let mut v: Vec<_> = self.file.memberships.iter().collect();
         v.sort_by(|a, b| {
@@ -168,30 +188,47 @@ pub fn write_private_0600(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
                 .then(a.mesh_id.cmp(&b.mesh_id))
         });
         v
+    }
+
     pub fn get(&self, mesh_id: &str) -> Option<&CatalogMembership> {
         self.file.memberships.iter().find(|m| m.mesh_id == mesh_id)
+    }
+
     /// Any non-primary catalog row (guest overlap this wave).
     pub fn has_extra_rows(&self) -> bool {
         self.file.memberships.iter().any(|m| !m.primary)
+    }
+
     /// True when gossip must not `adopt_mesh_id` a foreign mesh.
     pub fn blocks_adopt(&self, foreign_mesh_id: &str) -> bool {
         self.has_extra_rows() && foreign_mesh_id != self.file.primary_mesh_id
+    }
+
     /// Fail closed before writing a dest grant so a later `add_guest` is not surprising.
     pub fn ensure_can_add_guest(&self, mesh_id: &str) -> Result<()> {
         let mesh_id = mesh_id.trim();
         if mesh_id.is_empty() {
             return Err(Error::Config("mesh_id must not be empty".into()));
+        }
         if mesh_id == self.file.primary_mesh_id {
             return Err(Error::Conflict(
                 "cannot add extra membership on primary mesh".into(),
             ));
+        }
         if let Some(existing) = self.get(mesh_id) {
             return Err(Error::Conflict(format!(
                 "membership for {mesh_id} already exists ({})",
                 existing.role.as_str()
+            )));
+        }
         if self.file.memberships.len() >= MAX_CATALOG_ROWS {
+            return Err(Error::Config(format!(
                 "memberships budget is {MAX_CATALOG_ROWS} rows"
+            )));
+        }
         Ok(())
+    }
+
     /// Add a guest overlap row. Extra `role=member` is F8b.
     pub fn add_guest(
         &mut self,
@@ -199,6 +236,8 @@ pub fn write_private_0600(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
         via_grant_id: Option<String>,
     ) -> Result<CatalogMembership> {
         self.add_row(mesh_id, CatalogRole::Guest, via_grant_id)
+    }
+
     /// Insert an extra catalog row. `role=member` extra → not_implemented.
     pub fn add_row(
         &mut self,
@@ -210,9 +249,11 @@ pub fn write_private_0600(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
             return Err(Error::NotImplemented(
                 "member overlap is F8b (DeviceRecord.memberships)".into(),
             ));
+        }
         self.ensure_can_add_guest(mesh_id)?;
         let mesh_id = mesh_id.trim();
         let row = CatalogMembership {
+            mesh_id: mesh_id.to_string(),
             role: CatalogRole::Guest,
             primary: false,
             joined_at: rfc3339_now(),
@@ -222,6 +263,8 @@ pub fn write_private_0600(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
         self.file.memberships.push(row.clone());
         self.flush()?;
         Ok(row)
+    }
+
     /// Drop a guest row. Primary cannot be left this way.
     pub fn leave(&mut self, mesh_id: &str) -> Result<CatalogMembership> {
         let mesh_id = mesh_id.trim();
@@ -229,6 +272,7 @@ pub fn write_private_0600(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
             return Err(Error::Conflict(
                 "cannot leave primary membership (use mesh leave / kick)".into(),
             ));
+        }
         let pos = self
             .file
             .memberships
@@ -239,22 +283,30 @@ pub fn write_private_0600(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
             return Err(Error::Conflict(
                 "cannot leave primary membership (use mesh leave / kick)".into(),
             ));
+        }
         let row = self.file.memberships.remove(pos);
         self.flush()?;
         Ok(row)
+    }
+
     /// Point the primary row at `new_primary` (after a legal `adopt_mesh_id`).
     pub fn rebind_primary(&mut self, new_primary: &str) -> Result<()> {
         if new_primary == self.file.primary_mesh_id {
             return Ok(());
+        }
         self.file.primary_mesh_id = new_primary.to_string();
         if let Some(row) = self.file.memberships.iter_mut().find(|m| m.primary) {
             row.mesh_id = new_primary.to_string();
         } else {
             self.file.memberships.insert(0, primary_row(new_primary));
+        }
         self.flush()
+    }
+
     fn flush(&self) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
+        }
         let raw = serde_json::to_string_pretty(&self.file)?;
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, &raw)?;
@@ -262,12 +314,17 @@ pub fn write_private_0600(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
         std::fs::rename(&tmp, &self.path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+        }
         Ok(())
+    }
+}
+
 fn primary_row(mesh_id: &str) -> CatalogMembership {
     CatalogMembership {
         mesh_id: mesh_id.to_string(),
@@ -276,36 +333,51 @@ fn primary_row(mesh_id: &str) -> CatalogMembership {
         joined_at: rfc3339_now(),
         via_grant_id: None,
         source: MEMBERSHIP_SOURCE_INIT.into(),
+    }
+}
+
 fn rfc3339_now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
 /// Env escape hatch: permit legacy `adopt_mesh_id` smash with extra catalog rows.
 pub fn allow_mesh_smash() -> bool {
     std::env::var_os("MYMESH_ALLOW_MESH_SMASH").is_some_and(|v| v == "1")
+}
+
 /// True when `mesh-memberships.json` next to `mesh.json` has extras that block smash.
 pub fn catalog_blocks_adopt(mesh_path: impl AsRef<Path>, foreign_mesh_id: &str) -> bool {
     let Some(parent) = mesh_path.as_ref().parent() else {
         return false;
+    };
     let path = parent.join("mesh-memberships.json");
     match MembershipStore::open(&path) {
         Ok(store) => store.blocks_adopt(foreign_mesh_id),
         Err(_) => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn write_init_primary_roundtrip() {
+    fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "mymesh-memb-{}-{}",
+            "mymesh-memberships-{}-{}-{}",
+            tag,
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
         ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn write_init_primary_roundtrip() {
+        let dir = temp_dir("init-primary");
         let path = dir.join("mesh-memberships.json");
         let file = write_init_primary(&path, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
         assert_eq!(file.primary_mesh_id, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
@@ -316,23 +388,29 @@ mod tests {
 
         let loaded = MembershipCatalog::try_load(&path).unwrap().unwrap();
         assert_eq!(loaded.file().primary_mesh_id, file.primary_mesh_id);
-    fn temp_dir(tag: &str) -> PathBuf {
-            "mymesh-memberships-{}-{}-{}",
-            tag,
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        let _ = std::fs::create_dir_all(&dir);
-        dir
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
     fn open_missing_is_empty() {
         let dir = temp_dir("missing");
+        let path = dir.join("mesh-memberships.json");
         let store = MembershipStore::open(&path).unwrap();
         assert!(store.list().is_empty());
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
     fn migrate_writes_primary_0600() {
         let dir = temp_dir("migrate");
+        let path = dir.join("mesh-memberships.json");
         let store = MembershipStore::open_or_migrate(&path, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
             .unwrap();
         assert!(path.exists());
@@ -350,7 +428,6 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
-        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -1,9 +1,7 @@
 //! Background agent: join, sessions, mesh gossip, pending kicks, periodic sync.
 use mymesh_core::{
     allows, AdminNonceStore, ArmState, Capability, Config, DeviceStore, EnrollmentStore,
-    GrantStore, MeshState, Paths, PendingKick, PendingKickStore, Result,
-    allows, ArmState, Capability, Config, DeviceStore, EnrollmentStore, GrantStore,
-    MembershipStore, MeshState, Paths, PendingKick, PendingKickStore, Result,
+    GrantStore, MembershipStore, MeshState, Paths, PendingKick, PendingKickStore, Result,
 };
 use mymesh_crypto::Identity;
 use mymesh_files::{apply_host_message, FileTransferEngine, PathSandbox};

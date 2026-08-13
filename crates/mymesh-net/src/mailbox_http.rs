@@ -1054,6 +1054,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(metrics);
     }
 
+    #[test]
+    fn lane_ttl_prunes_expired() {
+        let mut lane = ByteLane::new();
+        lane.push(b"old".to_vec(), Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(lane.pop(Duration::from_millis(1)).is_none());
+        lane.push(b"fresh".to_vec(), Duration::from_secs(60));
+        assert_eq!(
+            lane.pop(Duration::from_secs(60)).as_deref(),
+            Some(&b"fresh"[..])
+        );
+    }
+
     #[tokio::test]
     async fn put_rejects_oversize() {
         let (base, metrics) = start().await;

@@ -4,7 +4,7 @@
 |-------|--------|
 | **Audience** | Operators, reviewers, implementers |
 | **Status** | Living threat model aligned with [CARRIER-NEXT.md](CARRIER-NEXT.md) §S9 — **not** a formal audit |
-| **Related** | [SECURITY.md](SECURITY.md) (operator model), [RECOVERY.md](RECOVERY.md) (ops runbooks), [PAIR-V2.md](PAIR-V2.md), [MASTER-KEY.md](MASTER-KEY.md), [GRANTS.md](GRANTS.md), [GUEST.md](GUEST.md), [DEMO-PAIR.md](DEMO-PAIR.md) |
+| **Related** | [SECURITY.md](SECURITY.md) (operator model), [RECOVERY.md](RECOVERY.md) (ops runbooks), [CARRIER-ADMIN-NEXT.md](CARRIER-ADMIN-NEXT.md) (Wave F C8–C13), [PAIR-V2.md](PAIR-V2.md), [MASTER-KEY.md](MASTER-KEY.md), [GRANTS.md](GRANTS.md), [GUEST.md](GUEST.md), [DEMO-PAIR.md](DEMO-PAIR.md) |
 
 ---
 
@@ -67,6 +67,12 @@ MyMesh is a **personal mesh**: machines you explicitly link, plus optional Carri
 | Owner lost, MMK alive | Person lockout | MMK clear owner; new claim — [RECOVERY.md](RECOVERY.md) R2 | S4 |
 | Audit secret leak | Tokens in logs | Redaction (Carrier S9) | S9 |
 | Compromised Trusted peer | Full agent-user power | Unlink / kick; no remote-user isolation yet | alpha |
+| Enroll confused with owner/destroy | Wipe MMK / claim by accident | **C8** create only if uninited; claim MMK-gated | Wave F |
+| Stolen phone drives enrolled nodes | Remote admin of household boxes | **C9** L2 drive ops; enroll revoke; 15 m session | Wave F |
+| Gateway confused deputy | A forwards admin meant for B | **C10** no iroh admin forward; last-mile = target | Wave F |
+| Mailbox operator reads ops | Admin payload leak | **C11** required seal to device pk; opaque store | Wave F |
+| Overlap roster leak | Dest mesh members visible | **C12** guest path only; refuse smash; extra member 501 | Wave F |
+| Last-hint IP leak | LAN URL in UI/logs | **C13** never log/render host; HintBlob wrap | Wave F |
 
 ---
 
@@ -168,6 +174,57 @@ Normative IDs from [CARRIER-NEXT.md](CARRIER-NEXT.md) §S9. Status reflects **th
 
 ---
 
+## Wave F control checklist (C8–C13)
+
+Normative IDs from [CARRIER-ADMIN-NEXT.md](CARRIER-ADMIN-NEXT.md). Status is this MyMesh tree after F1–F10.
+
+| ID | Threat | Control | Status | Where |
+|----|--------|---------|--------|-------|
+| **C8** | Enroll ≠ owner confused for destroy | Separate ceremonies; `POST /meshes` only if no `mesh-master.json`; claim still MMK-gated | **Implemented** | `meshes_create` 409 `mesh_already_inited`; `apply_first_mesh_init` |
+| **C9** | Stolen phone drives enrolled nodes | L2 on Carrier drive ops; `person_enrolled` cannot mutate grants; enroll revoke CLI + `DELETE /enrollments`; session 15 m | **Implemented** | `enrollments_revoke`, `mymesh enroll revoke`, `require_grants_mutate_authz` |
+| **C10** | Gateway confused deputy | Wave F does **not** iroh-forward admin; execute on last-mile **target** after person sig; miss → `no_last_mile_to_joiner` | **Implemented** | `introduce_op`; no `OpenChannel(Admin)` |
+| **C11** | Mailbox operator reads ops | Required seal to device pk; opaque store; TTL prune; no body logs | **Implemented** | `seal_admin_envelope`; `ADMIN_MAILBOX_TTL_SECS` |
+| **C12** | Overlap roster leak | Guest path only; extra `role=member` → 501; refuse `adopt_mesh_id` when extras exist | **Implemented** | `MembershipStore::add_row` / `blocks_adopt`; topology still this-mesh members |
+| **C13** | Last-hint IP leak | Never log/render last-mile URL; HintBlob wrap; Advanced only for plaintext host | **Implemented** | TUI redact; Carrier `LastMile` Debug; QR `host=` stays private hint |
+
+### C8 — Enroll ≠ owner / destroy (detail)
+
+**Threat:** Phone “create mesh” or enroll UX is mistaken for owner claim or `mesh init --force`, wiping MMK.
+
+**Control:** Create is first-init only (`mesh-master.json` exclusive). Second create is **409** `mesh_already_inited`. Owner claim remains MMK- or window-gated. Confirm-on-machine completes **pair**, not enroll.
+
+### C9 — Stolen phone drives enrolled nodes (detail)
+
+**Threat:** Lost phone with an enrolled person key `POST /admin/rpc` / introduce / create on household boxes.
+
+**Control:** Drive ops need last-mile + person sig + `can_drive`. `person_enrolled` cannot mutate grants. Operator runs `mymesh enroll revoke <person_id>` (or `DELETE /enrollments/{id}`) on **each** enrolled node. Mesh sessions expire in 15 minutes.
+
+### C10 — Gateway confused deputy (detail)
+
+**Threat:** Phone reaches enrolled A and asks A to admin B over iroh.
+
+**Control:** Wave F never opens `ChannelKind::Admin`. Introduce last-mile is always the **joiner**. If the phone cannot reach B → `no_last_mile_to_joiner` (confirm on B or mailbox).
+
+### C11 — Mailbox operator (detail)
+
+**Threat:** Self-host mailbox operator reads introduce/enroll JSON.
+
+**Control:** PUT body is `AdminSealPayload` sealed to the target device pk. Store is opaque bytes. Lanes prune after `ADMIN_MAILBOX_TTL_SECS` (15 min). Raw envelope is not a seal.
+
+### C12 — Overlap roster leak (detail)
+
+**Threat:** Guest overlap or smash `adopt_mesh_id` exposes dest-mesh members.
+
+**Control:** Extra catalog rows are **guest** only this wave. Extra `role=member` → 501 / `not_implemented` (F8b). `has_extra_rows` blocks foreign `adopt_mesh_id`. Topology members stay the **primary** mesh roster.
+
+### C13 — Last-hint IP leak (detail)
+
+**Threat:** LAN `host=` from QR appears in TUI, logs, or Carrier chrome.
+
+**Control:** `host=` stays in the QR (private last-mile hint; stripping is wontfix). Product chrome never renders `192.168.` / `:17878`. Errors truncate hosts. HintBlob wrap for standing inventory.
+
+---
+
 ## Rate limits & hardening backlog (S9)
 
 | Item | PR / slice | Notes |
@@ -190,13 +247,15 @@ Normative IDs from [CARRIER-NEXT.md](CARRIER-NEXT.md) §S9. Status reflects **th
 4. Do not rebind SOCKS or carrier HTTP to `0.0.0.0` without understanding exposure ([SECURITY.md](SECURITY.md)).
 5. Treat every **Trusted** peer with Terminal/Files/TCP as equivalent to local user access on the agent host.
 6. Store **MMK recovery codes** offline at `mesh init`; export sealed owner backup — full procedures in **[RECOVERY.md](RECOVERY.md)**.
+7. Lost/stolen enrolled phone: `mymesh enroll revoke <person_id>` on **each** node (**C9**). Confirm-on-machine is pair-only — it does not enroll.
 
 ---
 
 ## See also
 
 - [SECURITY.md](SECURITY.md) — alpha trust model, privilege, reporting  
-- **[RECOVERY.md](RECOVERY.md)** — dual-authority recovery runbooks (lost phone/MMK, guest, rotate, backup)  
+- **[RECOVERY.md](RECOVERY.md)** — dual-authority recovery runbooks (lost phone/MMK, guest, enroll revoke, rotate, backup)  
+- [CARRIER-ADMIN-NEXT.md](CARRIER-ADMIN-NEXT.md) — Wave F C8–C13 + authz matrix  
 - [CARRIER-NEXT.md](CARRIER-NEXT.md) — full S0–S9 design, control checklist source  
 - [PAIR-V2.md](PAIR-V2.md) · [DEMO-PAIR.md](DEMO-PAIR.md) · [MASTER-KEY.md](MASTER-KEY.md)  
 - [GRANTS.md](GRANTS.md) · [GUEST.md](GUEST.md) · [JOIN.md](JOIN.md)

@@ -32,10 +32,8 @@ use mymesh_net::{
 };
 use mymesh_protocol::{decode_msg, encode_msg, ChannelId, FileMessage, Frame, TerminalMessage};
 use mymesh_session::{
-    apply_kick_target, apply_membership, build_announce, run_guest_pair, run_host_pair_code,
-    run_join_as_guest, sign_kick, Agent, PairArmAdmin, Session, PAIR_HTTP_PORT,
-    apply_kick_target, apply_membership_gossip, build_announce, run_guest_pair, run_host_pair_code,
-    run_join_as_guest, sign_kick, Agent, Session,
+    apply_kick_target, apply_membership, apply_membership_gossip, build_announce, run_guest_pair,
+    run_host_pair_code, run_join_as_guest, sign_kick, Agent, PairArmAdmin, Session, PAIR_HTTP_PORT,
 };
 use mymesh_terminal::TerminalClient;
 use std::net::SocketAddr;

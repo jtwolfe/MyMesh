@@ -2,8 +2,8 @@
 
 **Audience:** operators running MyMesh v0.1.0-alpha.x  
 **Status:** best-effort documentation; not a formal audit.  
-**Threat model & S9 controls:** **[THREATS.md](THREATS.md)** (C1–C7 checklist, implemented vs planned)  
-**Recovery runbooks (dual authority):** **[RECOVERY.md](RECOVERY.md)** (lost phone/MMK, compromised guest, MMK rotate, sealed backup)  
+**Threat model & S9 / Wave F controls:** **[THREATS.md](THREATS.md)** (C1–C7 + C8–C13, implemented vs planned)  
+**Recovery runbooks (dual authority):** **[RECOVERY.md](RECOVERY.md)** (lost phone/MMK, enroll revoke, compromised guest, MMK rotate, sealed backup)  
 **S0 contracts:** [MASTER-KEY.md](MASTER-KEY.md), [GRANTS.md](GRANTS.md), [GUEST.md](GUEST.md), [PAIR-V2.md](PAIR-V2.md), [CARRIER-NEXT.md](CARRIER-NEXT.md)
 
 ## Trust model
@@ -49,8 +49,14 @@ Full detail, threat narratives, and honest status: **[THREATS.md](THREATS.md)**.
 | **C5** | Topology MITM | mesh-auth session; optional sig | **Partial** — mesh session enforced; `snapshot_sig` not yet |
 | **C6** | Facet bleed | allowlists enforced S7 | **Planned** (schema only today) |
 | **C7** | Decide brute force | rate limits | **Planned** (PR D1) |
+| **C8** | Enroll ≠ owner / destroy | create only if uninited; claim MMK-gated | **Implemented** (Wave F) |
+| **C9** | Stolen phone drives nodes | enroll revoke; `person_enrolled` ≠ grant mutate | **Implemented** (Wave F) |
+| **C10** | Gateway confused deputy | no iroh admin forward; last-mile = target | **Implemented** (Wave F) |
+| **C11** | Mailbox operator reads ops | required seal + TTL | **Implemented** (Wave F) |
+| **C12** | Overlap roster leak | guest only; extra member 501; no smash | **Implemented** (Wave F) |
+| **C13** | Last-hint IP leak | never render/log host URL | **Implemented** (Wave F) |
 
-Do **not** claim full S9 hardening until D1–D3 land and C4 residual wipe (Wave E) is real.
+Do **not** claim full S9 hardening until D1–D3 land and C4 residual wipe (Wave E) is real. Wave F **C8–C13** fail-closed proofs are separate from that S9 claim.
 
 ## What linking proves
 
@@ -100,7 +106,7 @@ Prefer private disclosure for exploitable bugs until a security contact is forma
 
 ## See also
 
-- **[THREATS.md](THREATS.md)** — threat catalog + C1–C7 implemented vs planned  
-- **[RECOVERY.md](RECOVERY.md)** — dual-authority recovery runbooks  
+- **[THREATS.md](THREATS.md)** — threat catalog + C1–C7 / C8–C13 implemented vs planned  
+- **[RECOVERY.md](RECOVERY.md)** — dual-authority recovery runbooks (including enroll revoke)  
 - [MASTER-KEY.md](MASTER-KEY.md) · [GRANTS.md](GRANTS.md) · [GUEST.md](GUEST.md) · [PAIR-V2.md](PAIR-V2.md)  
 - [DEMO-PAIR.md](DEMO-PAIR.md) · [JOIN.md](JOIN.md) · [CARRIER-NEXT.md](CARRIER-NEXT.md) · [ARCHITECTURE.md](ARCHITECTURE.md)
