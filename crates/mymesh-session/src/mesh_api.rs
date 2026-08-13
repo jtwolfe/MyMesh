@@ -1705,10 +1705,6 @@ async fn enrollments_revoke(
     }
 }
 
-/// `POST /mesh/v1/admin/rpc` (and `/admin/rpc`) — last-mile + person-signed AdminEnvelope.
-///
-/// Wave F5 implements `introduce` only. Last-mile dest is always the joiner
-/// (KD-F20). This node never iroh-forwards admin (no `OpenChannel(Admin)`).
 // ── POST /meshes (first init only) ───────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -1855,6 +1851,10 @@ async fn meshes_create(
     .into_response()
 }
 
+/// `POST /mesh/v1/admin/rpc` (and `/admin/rpc`) — last-mile + person-signed AdminEnvelope.
+///
+/// Wave F5 implements `introduce` only. Last-mile dest is always the joiner
+/// (KD-F20). This node never iroh-forwards admin (no `OpenChannel(Admin)`).
 async fn admin_rpc(State(st): State<MeshApiState>, headers: HeaderMap, body: String) -> Response {
     if let Err(r) = check_x_mesh_id(&st.paths, &headers) {
         return r;
@@ -3217,6 +3217,7 @@ fn build_full_members(
     host_label: &str,
 ) -> mymesh_core::Result<Vec<TopologyMember>> {
     let store = DeviceStore::open(paths.devices_file())?;
+    let primary = MeshState::load(paths.mesh_file()).ok().map(|m| m.mesh_id);
     let mut out: Vec<TopologyMember> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -3231,6 +3232,12 @@ fn build_full_members(
         }
         if rec.mesh_role.is_guest() {
             continue;
+        }
+        // C12: dest-mesh DeviceStore rows must not appear on this-mesh roster.
+        if let (Some(primary), Some(mid)) = (primary.as_deref(), rec.mesh_id.as_deref()) {
+            if mid != primary {
+                continue;
+            }
         }
         if !seen.insert(rec.id) {
             continue;
@@ -3906,6 +3913,7 @@ mod tests {
         store.add(&host.device_id(), &other_body).unwrap();
         let token_other = person_enrolled_token(&app, &other, other_pid, &host).await;
         let resp = app
+            .clone()
             .oneshot(with_remote(
                 Request::builder()
                     .method("DELETE")
@@ -3918,6 +3926,44 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(json_body(resp).await["code"], "forbidden");
+
+        // Revoke deletes the row; it is not a blocklist. Introduce cannot drive
+        // until a new verified enroll write. Same key may POST /enrollments again.
+        let resident = Identity::from_secret_bytes([0xA1u8; 32]);
+        let env = signed_introduce_env(
+            &person,
+            pid,
+            &host.device_id(),
+            &host.device_id(),
+            &resident.device_id(),
+            &rfc3339(Utc::now()),
+            &[0x38u8; 16],
+        );
+        let (status, v) = post_admin_rpc(&app, &env).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(v["code"], "enrollment_pending");
+
+        let again = signed_enroll_body(
+            &person,
+            pid,
+            &host.device_id(),
+            &rfc3339(Utc::now()),
+            &[0x39u8; 16],
+        );
+        let resp = app
+            .oneshot(with_remote(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mesh/v1/enrollments")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_string(&again).unwrap()))
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{}", json_body(resp).await);
+        let store = EnrollmentStore::open(paths.enrollments_file()).unwrap();
+        assert!(store.can_drive(pid));
     }
 
     async fn person_enrolled_token(
@@ -7130,6 +7176,26 @@ mod tests {
         write_owner_file(&paths, &mesh.mesh_id, &person, person_id);
 
         let dest = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let dest_peer = Identity::generate();
+        let mut devices = DeviceStore::open(paths.devices_file()).unwrap();
+        devices
+            .upsert(DeviceRecord {
+                id: dest_peer.device_id(),
+                label: DeviceLabel::new("dest-peer"),
+                fingerprint: NodeFingerprint::from_device_id(&dest_peer.device_id())
+                    .as_str()
+                    .to_string(),
+                capabilities: vec![Capability::Terminal],
+                trust: TrustState::Trusted,
+                linked_at: Utc::now(),
+                last_seen: None,
+                endpoint_hint: None,
+                mesh_id: Some(dest.into()),
+                aliases: vec![],
+                groups: vec![],
+                mesh_role: mymesh_core::MeshRole::Member,
+            })
+            .unwrap();
 
         let st = test_state(paths.clone(), secret, "host");
         let app = mesh_v1_routes(st);
@@ -7206,17 +7272,23 @@ mod tests {
             after_ids, before_ids,
             "guest overlap must not add dest members to this-mesh roster"
         );
+        let dest_hex = dest_peer.device_id().to_string();
+        assert!(
+            !after_ids.iter().any(|id| id == &dest_hex),
+            "dest-mesh Trusted device must stay off this-mesh members"
+        );
+        let summary = after_j["grants_summary"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let dumped = serde_json::to_string(&summary).unwrap();
+        assert!(
+            !dumped.contains(&dest_hex),
+            "dest device id must not appear in grants_summary: {dumped}"
+        );
         let cat = MembershipStore::open(paths.mesh_memberships_file()).unwrap();
         assert!(cat.has_extra_rows());
         assert!(cat.blocks_adopt(dest));
-        assert!(
-            DeviceStore::open(paths.devices_file())
-                .unwrap()
-                .list()
-                .iter()
-                .all(|d| d.trust != TrustState::Trusted || d.id == host.device_id()),
-            "overlap must not write dest members into DeviceStore"
-        );
     }
 
     // ── Continuity materialize / wipe / status (S8 / E4) ───────────────────

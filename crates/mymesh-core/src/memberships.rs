@@ -304,24 +304,10 @@ impl MembershipStore {
     }
 
     fn flush(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let raw = serde_json::to_string_pretty(&self.file)?;
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, &raw)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        }
-        std::fs::rename(&tmp, &self.path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(())
+        write_private_0600(
+            &self.path,
+            serde_json::to_vec_pretty(&self.file)?.as_slice(),
+        )
     }
 }
 

@@ -180,6 +180,10 @@ impl Default for ByteLane {
 }
 
 impl ByteLane {
+    fn new() -> Self {
+        Self::default()
+    }
+
     fn prune(&mut self, ttl: Duration) {
         let now = Instant::now();
         while let Some((_, t)) = self.queue.front() {
@@ -218,6 +222,18 @@ impl ByteLane {
         self.prune(ttl);
         self.last = Instant::now();
         self.queue.pop_front().map(|(m, _)| m)
+    }
+
+    #[cfg(test)]
+    fn expire_queued(&mut self) {
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(
+                ADMIN_MAILBOX_TTL_SECS.saturating_add(60),
+            ))
+            .unwrap_or_else(Instant::now);
+        for (_, t) in self.queue.iter_mut() {
+            *t = past;
+        }
     }
 }
 
@@ -258,11 +274,22 @@ impl MailboxState {
             metrics_dir,
         }
     }
+
+    #[cfg(test)]
+    fn expire_admin_inbox(&self, did: &str) {
+        let mut g = self.admin.lock();
+        if let Some(box_) = g.get_mut(did) {
+            box_.inbox.expire_queued();
+        }
+    }
 }
 
 /// Router used by `mymesh mailbox` and tests.
 pub fn mailbox_router(metrics_dir: Option<PathBuf>) -> Router {
-    let state = MailboxState::new(metrics_dir);
+    mailbox_router_from_state(MailboxState::new(metrics_dir))
+}
+
+fn mailbox_router_from_state(state: MailboxState) -> Router {
     let gc_state = state.clone();
     tokio::spawn(async move {
         loop {
@@ -964,8 +991,14 @@ mod tests {
     }
 
     async fn start() -> (String, PathBuf) {
+        let (base, metrics, _) = start_with_state().await;
+        (base, metrics)
+    }
+
+    async fn start_with_state() -> (String, PathBuf, MailboxState) {
         let metrics = tmp_metrics();
-        let app = mailbox_router(Some(metrics.clone()));
+        let state = MailboxState::new(Some(metrics.clone()));
+        let app = mailbox_router_from_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -976,7 +1009,7 @@ mod tests {
             .await
             .unwrap();
         });
-        (format!("http://{addr}"), metrics)
+        (format!("http://{addr}"), metrics, state)
     }
 
     fn signed_bind(id: &Identity) -> MailboxBind {
@@ -1065,6 +1098,20 @@ mod tests {
             lane.pop(Duration::from_secs(60)).as_deref(),
             Some(&b"fresh"[..])
         );
+    }
+
+    #[tokio::test]
+    async fn inbox_get_after_ttl_is_empty() {
+        let (base, metrics, state) = start_with_state().await;
+        let c = AdminMailboxClient::new(&base);
+        let id = Identity::from_secret_bytes([0x77u8; 32]);
+        let bind = signed_bind(&id);
+        c.bind(&bind).await.unwrap();
+        c.put_inbox(&bind.did, b"sealed-ttl").await.unwrap();
+        state.expire_admin_inbox(&bind.did);
+        let got = c.get_inbox(&bind.did, 0).await.unwrap();
+        assert!(got.is_none(), "expired inbox must prune on GET");
+        let _ = std::fs::remove_dir_all(metrics);
     }
 
     #[tokio::test]

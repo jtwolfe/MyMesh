@@ -351,7 +351,8 @@ mymesh mesh unlock
 - Enroll is **not** mesh ownership ([CARRIER-ADMIN-NEXT.md](CARRIER-ADMIN-NEXT.md), [THREATS.md](THREATS.md) **C8** / **C9**).
 - Confirm-on-machine completes **pair** only — it does not write `enrollments.json`.
 - `person_enrolled` can introduce / create-first-mesh / read this-node catalog; it **cannot** mutate grants or smash MMK.
-- Standing last-mile sessions last **15 minutes**. Revoke does not kill an already-minted Bearer until it expires; re-enroll after revoke needs a new verified person sig.
+- Standing last-mile sessions last **15 minutes**. Revoke does not kill an already-minted Bearer until it expires.
+- Revoke **deletes** the row (`can_drive` gone). It is **not** a blocklist: the **same** person key can `POST /enrollments` again with a new verified `carrier-enroll-v1` if it still has last-mile. Keep the stolen phone off last-mile (power off / firewall) until revoke, then re-enroll the **replacement** phone (new ceremony / TOFU fp).
 
 ### Steps (each enrolled node)
 
@@ -373,7 +374,8 @@ curl -X DELETE http://127.0.0.1:17878/mesh/v1/enrollments/<person_id>
 ### Checklist
 
 - [ ] Revoked on **every** box that listed the stolen phone (`enroll list`)
-- [ ] Phone cannot `POST /enrollments` again without a new ceremony (different key after revoke is allowed)
+- [ ] Stolen phone cannot **introduce** / drive until a new verified enroll write (`enrollment_pending`)
+- [ ] Revoke is not a blocklist — same key can re-`POST /enrollments` if last-mile still works
 - [ ] Optional: revoke guest grants the phone created ([Runbook G](#runbook-g--compromised-guest))
 - [ ] Do **not** `owner clear` or `mesh init --force` solely because a phone was stolen
 - [ ] Re-enroll the replacement phone with a verified `carrier-enroll-v1` sig (TOFU fp again)
