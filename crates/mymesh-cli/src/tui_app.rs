@@ -233,7 +233,7 @@ struct App {
     poll: PeerPoll,
     kick: KickWizard,
     prompt: Prompt,
-    /// Active carrier page URL (if started from TUI)
+    /// Internal pair-HTTP host_base (remint / join poll). Never render (KD-F18).
     carrier_url: Option<String>,
     /// Scrollable detail text for Status tab extras
     detail: String,
@@ -2754,12 +2754,12 @@ fn draw_home(f: &mut TuiFrame, area: Rect, app: &App) {
             }
         }
     }
-    if let Some(url) = &app.carrier_url {
+    // host_base / carrier_url is QR payload only (KD-F18) — do not render LAN :17878.
+    if app.carrier_url.is_some() {
         left_lines.push(Line::from(Span::styled(
-            "Carrier active",
+            "Pair QR armed",
             Style::default().fg(C_OK).add_modifier(Modifier::BOLD),
         )));
-        left_lines.push(Line::from(Span::raw(format!("  {url}"))));
         left_lines.push(Line::from(""));
     }
     left_lines.push(Line::from(""));

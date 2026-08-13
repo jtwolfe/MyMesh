@@ -317,7 +317,7 @@ mymesh expose laptop 7878 --local-port 17878
 
 ## Firewall helper (explicit only)
 
-MyMesh **never** opens firewall ports by default. Carrier HTTP (`TCP 17878`) often needs a hole on the host running `mymesh carrier`.
+MyMesh **never** opens firewall ports by default. Pair HTTP (`TCP 17878`) is bound by **`mymesh serve`** and often needs a hole for a phone on the LAN. Lab `mymesh carrier` only binds that port if serve is down.
 
 ```bash
 mymesh firewall explain             # ports & rationale

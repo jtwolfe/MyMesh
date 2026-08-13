@@ -1858,18 +1858,19 @@ async fn cmd_serve(paths: &Paths) -> Result<()> {
     );
     let transport = std::sync::Arc::new(IrohTransport::bind(&identity).await?);
     let agent = Agent::from_paths(&identity, paths, cfg.clone())?;
-    // KD-F16: serve owns pair/v2 + mesh/v1 (do not require `mymesh carrier`).
-    let host_base = match agent.spawn_pair_http(paths, PAIR_HTTP_PORT).await {
-        Ok(h) => {
-            println!("  pair HTTP   0.0.0.0:{PAIR_HTTP_PORT}  /pair/v2 /mesh/v1");
-            h.host_base
-        }
-        Err(e) => {
-            eprintln!("  pair HTTP   bind :{PAIR_HTTP_PORT} failed: {e}");
-            tracing::error!(%e, "pair/mesh HTTP bind failed");
-            format!("http://127.0.0.1:{PAIR_HTTP_PORT}")
-        }
-    };
+    // KD-F16: serve owns pair/v2 + mesh/v1. Fail closed so MMA1 never mints a
+    // QR against a port we do not hold (lab `mymesh carrier` leftover, etc.).
+    let http = agent
+        .spawn_pair_http(paths, PAIR_HTTP_PORT)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "pair HTTP bind :{PAIR_HTTP_PORT} failed: {e}\n\
+             stop lab `mymesh carrier` if it owns the port"
+            )
+        })?;
+    println!("  pair HTTP   0.0.0.0:{PAIR_HTTP_PORT}  /pair/v2 /mesh/v1");
+    let host_base = http.host_base;
     // Single iroh endpoint: dial proxy so CLI/TUI never re-bind the same identity.
     // MMA1 arm_pair_qr shares this socket; MMD1 dial is unchanged after 4-byte magic.
     let sock = std::path::PathBuf::from(&cfg.daemon.control_socket);

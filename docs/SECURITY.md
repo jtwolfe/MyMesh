@@ -94,7 +94,7 @@ Prefer private disclosure for exploitable bugs until a security contact is forma
 
 - **TCP tunnels** (SSH, expose, SOCKS, auto-ports) allow a trusted peer to reach **localhost ports** on the agent host as the agent user.
 - Treat linked devices like accounts that can open `sshd` and any bound service on loopback.
-- **Carrier** listens on a LAN-reachable HTTP port only while you run `mymesh carrier`; use firewall helpers explicitly.
+- **`mymesh serve`** binds LAN-reachable pair/mesh HTTP (`TCP 17878`, `/pair/v2` + `/mesh/v1`) for the life of the agent. Standalone `mymesh carrier` is lab-only if serve is down. Use firewall helpers explicitly.
 - **SOCKS** is bound to loopback by default — do not rebind to `0.0.0.0` without understanding exposure.
 - System DNS is **not** rewritten by MyMesh; that limits surprise traffic hijack.
 

@@ -48,7 +48,7 @@ mymesh pair retry [sid]                                # expire + re-arm dual (c
 | `pair status` | Active session phase, ep, joiner bind, pending joins. |
 | `pair retry` | Expire previous session; arm a fresh dual (confirm path). |
 
-Host process: **`mymesh serve`** (or user unit) must be running so join completes. **Path A** decide (`mymesh pair confirm`) is agent-integrated and does **not** need `mymesh carrier`. **Path B** direct HTTP decide requires **`mymesh carrier`** on the same `Paths` (default port **17878**) — `pair dual --host` only puts the host hint in QR_A; it does not start HTTP.
+Host process: **`mymesh serve`** (or user unit) must be running so join completes. After F4p, serve also binds `/pair/v2` + `/mesh/v1` on **:17878**. **Path A** decide (`mymesh pair confirm`) is agent-integrated and does not need HTTP. **Path B** LAN HTTP decide uses **serve-owned** `/pair/v2` — `pair dual --host` only puts the host hint in QR_A. Standalone `mymesh carrier` is **lab-only** (refuses bind when serve is up).
 
 ---
 
@@ -152,13 +152,13 @@ Confirm-on-machine without Carrier is only practical if codes are computed by a 
 ## Path B — dual-scan + direct host (LAN optimization)
 
 Same as Path A through dual-scan bind, but QR_A includes a reachable `host=` (`ep=direct`).  
-`/pair/v2/decide` is served by **`mymesh carrier`** (same agent `Paths` as `serve` / `pair dual`). `mymesh serve` and `pair dual --host` do **not** start HTTP; without carrier, the phone falls back to confirm codes (Path A).
+`/pair/v2/decide` is served by **`mymesh serve`** on `:17878`. `pair dual --host` only puts the host hint in QR_A. If serve is down, lab `mymesh carrier` may bind; if serve is up, `mymesh carrier` refuses (`serve owns pair HTTP`). Without HTTP, the phone falls back to confirm codes (Path A).
 
 ```bash
 # --- Machine A (resident) ---
-mymesh serve &
+mymesh serve &                     # iroh + pair/v2 + mesh/v1 on :17878
 mymesh firewall ufw allow          # TCP 17878 for phone LAN HTTP (explicit only)
-mymesh carrier                     # pair HTTP on :17878; same Paths as serve
+# mymesh carrier                   # lab-only if serve is down; refuses when serve owns :17878
 mymesh pair dual --host http://<lan-ip>:17878
 # QR_A: ep=direct + host hint. Leave session armed.
 
@@ -179,15 +179,15 @@ mymesh pair dual --join --resident <did_or_words_from_A>
 
 ---
 
-## Path C — carrier single-host LAN (default v2; `--pair-v1` escape)
+## Path C — carrier single-host LAN (lab; `--pair-v1` escape)
 
-Single-host LAN helper via `mymesh carrier`. Default QR is **pair/v2** after D5; `--pair-v1` restores alpha.1. **Not** the Wave A dual-scan product exit.
+Lab helper when **serve is down**. After F4p, product path is `mymesh serve` + TUI MMA1 arm. Default QR is **pair/v2**; `--pair-v1` restores alpha.1. **Not** the Wave A dual-scan product exit. `mymesh carrier` **refuses** if serve already owns `:17878`.
 
 ```bash
 # --- Host A ---
-mymesh serve &
+mymesh serve &                     # owns /pair/v2 on :17878; TUI arms QR via MMA1
 mymesh firewall ufw allow          # or firewalld / ufw 17878/tcp
-mymesh carrier                     # arms; prints pair API base + carrier://pair?v=2&… QR (default)
+# mymesh carrier                   # lab-only if serve is down
 # mymesh carrier --pair-v1         # escape: alpha.1 carrier://pair?v=1&… LAN QR
 
 # --- Joiner B ---
@@ -200,7 +200,7 @@ mymesh link '<host-hex-or-words-or-uri>'
 
 | Note | Detail |
 |------|--------|
-| Default QR from `mymesh carrier` | **v2** (`ep=direct` + LAN `host`; PairSession armed). Escape: `--pair-v1` |
+| Default QR from TUI / MMA1 (or lab `mymesh carrier`) | **v2** (`ep=direct` + LAN `host`; PairSession armed). Escape: `--pair-v1` |
 | `mymesh pair dual` | Emits **v2** (post A3) |
 | Port | **17878** |
 
@@ -264,7 +264,7 @@ Confirm algorithm (normative): [PAIR-V2.md](PAIR-V2.md) — pepper = bootstrap t
 
 - `mymesh requests accept` / `deny` remain available on the host.  
 - `mymesh pair retry [sid]` expires a stale session and arms a fresh dual.  
-- Stop `mymesh carrier` if used (`Ctrl-C` / stop unit).  
+- Stop `mymesh serve` (pair HTTP lives with the agent). Lab `mymesh carrier` only if serve was down.  
 - Lab only: stop mock-pair-host in the Carrier tree.
 
 ---
