@@ -5,6 +5,7 @@ mod carrier;
 mod host_metrics;
 mod join;
 mod magic;
+mod mailbox_poller;
 mod mesh_api;
 mod mesh_sync;
 mod pair;
@@ -24,7 +25,10 @@ pub use carrier::{
     decode_pair_nonce, encode_pair_nonce, start_carrier, start_pair_http, ArmPairQr, CarrierHandle,
     PairArmAdmin, PairHttpHandle, PairQrV2Params, PAIR_HTTP_PORT, PAIR_V1_PREFIX, PAIR_V2_PREFIX,
 };
-pub use mesh_api::{auth_challenge_preimage, mrk_admin_identity, AuthMethod, MESH_V1_PREFIX};
+pub use mesh_api::{
+    auth_challenge_preimage, execute_admin_envelope, mrk_admin_identity, AuthMethod, MeshApiState,
+    MESH_V1_PREFIX,
+};
 // Re-export owner types from crypto for callers that used mesh_api::MeshOwnerFile (B3).
 pub use host_metrics::sample_metrics;
 pub use join::{
@@ -32,6 +36,7 @@ pub use join::{
     spawn_join_as_guest_to_resident, JoinHostOutcome,
 };
 pub use magic::MagicPlane;
+pub use mailbox_poller::spawn_admin_mailbox_poller;
 pub use mesh_sync::{
     apply_grant_revoke, apply_kick_notice_local, apply_kick_target, apply_membership,
     build_announce, build_grant_revoke, build_snapshot, bump_mesh_dirty, members_from_store,

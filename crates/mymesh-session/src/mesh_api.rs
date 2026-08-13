@@ -1693,6 +1693,11 @@ async fn admin_rpc(State(st): State<MeshApiState>, headers: HeaderMap, body: Str
         Ok(e) => e,
         Err(e) => return mesh_err(StatusCode::BAD_REQUEST, e.code, e.message),
     };
+    execute_admin_envelope(&st, env, "http")
+}
+
+/// Verify + dispatch a person-signed envelope (HTTP last-mile or mailbox poller).
+pub fn execute_admin_envelope(st: &MeshApiState, env: AdminEnvelope, last_mile: &str) -> Response {
     if let Err(rl) = mymesh_core::rate_limit_check_shared(
         st.paths.metrics_dir(),
         LimitKind::AdminEnvelope,
@@ -1717,12 +1722,12 @@ async fn admin_rpc(State(st): State<MeshApiState>, headers: HeaderMap, body: Str
     tracing::info!(
         op = env.op.as_str(),
         target = %short_did_hex(&env.target_device_id_hex),
-        last_mile = "http",
+        last_mile,
         "admin_rpc"
     );
 
     match env.op {
-        AdminOp::Introduce => introduce_op(&st, env),
+        AdminOp::Introduce => introduce_op(st, env, last_mile),
         other => mesh_err(
             StatusCode::NOT_IMPLEMENTED,
             "not_implemented",
@@ -1731,7 +1736,7 @@ async fn admin_rpc(State(st): State<MeshApiState>, headers: HeaderMap, body: Str
     }
 }
 
-fn introduce_op(st: &MeshApiState, env: AdminEnvelope) -> Response {
+fn introduce_op(st: &MeshApiState, env: AdminEnvelope, last_mile: &str) -> Response {
     let host = host_identity(&st.secret);
     let self_id = host.device_id();
     let payload: IntroducePayload = match serde_json::from_str(env.payload_json.trim()) {
@@ -1884,7 +1889,7 @@ fn introduce_op(st: &MeshApiState, env: AdminEnvelope) -> Response {
     tracing::info!(
         op = "introduce",
         target = %self_id.short(),
-        last_mile = "http",
+        last_mile,
         result = "dialing",
         "admin_rpc"
     );

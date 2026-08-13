@@ -26,8 +26,8 @@ use mymesh_crypto::{
     MmkRuntime, OwnerBackupSealed, OwnerClaimRequest, RecoveryCode,
 };
 use mymesh_net::{
-    run_mailbox_server, serve_control_socket, FsMailbox, HttpMailbox, IrohTransport, LocalFabric,
-    LocalRendezvous, Rendezvous, Transport,
+    serve_control_socket, FsMailbox, HttpMailbox, IrohTransport, LocalFabric, LocalRendezvous,
+    Rendezvous, Transport,
 };
 use mymesh_protocol::{decode_msg, encode_msg, ChannelId, FileMessage, Frame, TerminalMessage};
 use mymesh_session::{
@@ -190,7 +190,7 @@ enum Commands {
         #[arg(long)]
         foreground: bool,
     },
-    /// Run a standalone HTTP SPAKE2 mailbox
+    /// Run a standalone HTTP SPAKE2 + self-host admin mailbox (not a public product)
     Mailbox {
         #[arg(long, default_value = "0.0.0.0:9876")]
         bind: String,
@@ -897,7 +897,7 @@ async fn main() -> Result<()> {
         Commands::Serve { .. } => cmd_serve(&paths).await?,
         Commands::Mailbox { bind } => {
             let addr: SocketAddr = bind.parse().context("invalid --bind")?;
-            run_mailbox_server(addr).await?;
+            mymesh_net::run_mailbox_server_with_metrics(addr, Some(paths.metrics_dir())).await?;
         }
         Commands::Install {
             system,
@@ -1870,6 +1870,9 @@ async fn cmd_serve(paths: &Paths) -> Result<()> {
             )
         })?;
     println!("  pair HTTP   0.0.0.0:{PAIR_HTTP_PORT}  /pair/v2 /mesh/v1");
+    if cfg.admin_mailbox_url().is_some() {
+        println!("  admin mailbox poller  (self-host, not a product)");
+    }
     let host_base = http.host_base;
     // Single iroh endpoint: dial proxy so CLI/TUI never re-bind the same identity.
     // MMA1 arm_pair_qr shares this socket; MMD1 dial is unchanged after 4-byte magic.
