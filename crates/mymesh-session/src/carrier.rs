@@ -18,11 +18,12 @@ use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
+use mymesh_core::wire::{EnrollWriteBody, PersonFacet};
 use mymesh_core::{
     client_ip_key, hash_pair_token, record_pair_decide, record_pair_status, ArmState, Capability,
-    Config, DeviceId, DeviceStore, JoinDecision, JoinStore, LimitKind, MeshState, NodeFingerprint,
-    PairEndpointClass, PairPhase, PairSessionFile, PairSessionStore, Paths, PendingJoin,
-    RateLimitState,
+    Config, DeviceId, DeviceStore, EnrollmentStore, JoinDecision, JoinStore, LimitKind, MeshState,
+    NodeFingerprint, PairEndpointClass, PairPhase, PairSessionFile, PairSessionStore, Paths,
+    PendingJoin, RateLimitState,
 };
 use mymesh_crypto::{device_id_to_words, device_join_uri, Identity};
 use rand::rngs::OsRng;
@@ -1020,7 +1021,73 @@ struct SessionDecisionBody {
     #[serde(default)]
     sig_hex: Option<String>,
     #[serde(default)]
+    facet: Option<PersonFacet>,
+    #[serde(default)]
+    person_public_key_hex: Option<String>,
+    #[serde(default)]
     reason: Option<String>,
+}
+
+impl SessionDecisionBody {
+    fn enroll_fields_present(&self) -> bool {
+        self.person_id.is_some()
+            && self.facet.is_some()
+            && self.person_public_key_hex.is_some()
+            && self.sig_hex.is_some()
+    }
+}
+
+/// Write `enrollments.json` only when all four enroll fields verify.
+/// Bad sig / target / facet never fail pair decide.
+fn try_enroll_from_decide(paths: &Paths, host_id: &DeviceId, body: &SessionDecisionBody) {
+    if !matches!(body.decision, DecideKind::Accept) || !body.enroll_fields_present() {
+        return;
+    }
+    let (Some(person_id), Some(facet), Some(pk_hex), Some(sig_hex)) = (
+        body.person_id.as_deref(),
+        body.facet,
+        body.person_public_key_hex.as_deref(),
+        body.sig_hex.as_deref(),
+    ) else {
+        return;
+    };
+    if let Err(_rl) =
+        mymesh_core::rate_limit_check_shared(paths.metrics_dir(), LimitKind::EnrollWrite, person_id)
+    {
+        info!(person_id, "enroll_write skipped rate_limited");
+        return;
+    }
+    let enroll = EnrollWriteBody {
+        person_id: person_id.to_string(),
+        facet,
+        target_device_id_hex: body.resident_device_id_hex.clone(),
+        ts: body.ts.clone(),
+        nonce: body.nonce.clone(),
+        person_public_key_hex: pk_hex.to_string(),
+        sig_hex: sig_hex.to_string(),
+        label: None,
+    };
+    let mut store = match EnrollmentStore::open_or_create(paths.enrollments_file()) {
+        Ok(s) => s,
+        Err(e) => {
+            info!(error = %e, "enroll_write skipped store");
+            return;
+        }
+    };
+    match store.add(host_id, &enroll) {
+        Ok(rec) => {
+            info!(
+                person_id = %rec.person_id,
+                facet = rec.facet.as_str(),
+                device = %host_id.short(),
+                source = "decide",
+                "enroll_write"
+            );
+        }
+        Err(e) => {
+            info!(error = %e, "enroll_write skipped; pair decide continues");
+        }
+    }
 }
 
 /// `POST /pair/v2/dial` — phone tells this node to join a resident (24-word link path).
@@ -1282,9 +1349,6 @@ async fn pair_v2_decide(
         return pair_rate_limited(rl.retry_after_secs);
     }
 
-    // Optional person fields unused in Wave A (audit only).
-    let _ = (body.person_id, body.sig_hex);
-
     if sess.sid != body.sid {
         return pair_err(StatusCode::BAD_REQUEST, "bad_request", "sid mismatch");
     }
@@ -1374,6 +1438,7 @@ async fn pair_v2_decide(
                 | (Some(JoinDecision::Deny { .. }), JoinDecision::Deny { .. })
         );
         if same_joiner && same_decision {
+            try_enroll_from_decide(&st.paths, &st.identity().device_id(), &body);
             record_pair_decide(st.paths.metrics_dir(), "already_decided");
             return Json(DecideV2Response {
                 ok: true,
@@ -1504,6 +1569,7 @@ async fn pair_v2_decide(
         "pair/v2 decide written to JoinStore + PairSessionStore"
     );
     record_pair_decide(st.paths.metrics_dir(), state);
+    try_enroll_from_decide(&st.paths, &st.identity().device_id(), &body);
     Json(DecideV2Response {
         ok: true,
         state,
@@ -2771,6 +2837,270 @@ mod tests {
         assert!(matches!(s.decision, Some(JoinDecision::Accept)));
         let d = joins.take_decision(&joiner).unwrap().unwrap();
         assert!(matches!(d, JoinDecision::Accept));
+    }
+
+    fn sign_decide_enroll(
+        person: &Identity,
+        person_id: &str,
+        facet: PersonFacet,
+        resident: &DeviceId,
+        ts: &str,
+        nonce: &[u8; 16],
+    ) -> (String, String) {
+        let ts_unix = mymesh_core::wire::parse_rfc3339_unix(ts).unwrap();
+        let pk = person.verifying_key_bytes();
+        let pre = mymesh_core::wire::carrier_enroll_v1_preimage(
+            person_id,
+            facet,
+            resident.as_bytes(),
+            ts_unix,
+            nonce,
+            &pk,
+        )
+        .unwrap();
+        (hex::encode(pk), hex::encode(person.sign(&pre)))
+    }
+
+    #[tokio::test]
+    async fn v2_decide_with_enroll_fields_writes_row() {
+        let paths = tmp_paths();
+        let secret = [0x76u8; 32];
+        let id = Identity::from_secret_bytes(secret);
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        ArmState::arm(paths.arm_file(), 600).unwrap();
+        let (sid, token, nonce, _) =
+            arm_v2_session(&paths, id.device_id(), PairEndpointClass::Direct);
+
+        let joiner = DeviceId::from_bytes([0xe6u8; 32]);
+        let joins = JoinStore::open(paths.join_dir()).unwrap();
+        joins
+            .write_pending(&PendingJoin {
+                device_id: joiner,
+                label: "joiner".into(),
+                capabilities: Capability::all(),
+                received_at: Utc::now(),
+                fingerprint: NodeFingerprint::from_device_id(&joiner)
+                    .as_str()
+                    .to_string(),
+            })
+            .unwrap();
+
+        let person = Identity::from_secret_bytes([0x42u8; 32]);
+        let ts = rfc3339(Utc::now());
+        let pid = "01HZXPERSON0000000000000";
+        let (pk_hex, sig_hex) = sign_decide_enroll(
+            &person,
+            pid,
+            PersonFacet::Personal,
+            &id.device_id(),
+            &ts,
+            &nonce,
+        );
+
+        let st = test_state(paths.clone(), secret, "host");
+        let app = build_router(st);
+        let body = serde_json::json!({
+            "sid": sid,
+            "decision": "accept",
+            "joiner_device_id_hex": joiner.to_string(),
+            "resident_device_id_hex": id.device_id().to_string(),
+            "ts": ts,
+            "nonce": encode_pair_nonce(&nonce),
+            "person_id": pid,
+            "facet": "personal",
+            "person_public_key_hex": pk_hex,
+            "sig_hex": sig_hex,
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/pair/v2/decide")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await["state"], "accepted");
+
+        let store = EnrollmentStore::open(paths.enrollments_file()).unwrap();
+        let rec = store.get(pid).expect("enroll row");
+        assert!(rec.can_drive);
+        assert_eq!(rec.facet, PersonFacet::Personal);
+        assert_eq!(rec.person_public_key_hex, pk_hex);
+    }
+
+    #[tokio::test]
+    async fn v2_decide_without_enroll_fields_is_pair_only() {
+        let paths = tmp_paths();
+        let secret = [0x77u8; 32];
+        let id = Identity::from_secret_bytes(secret);
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        ArmState::arm(paths.arm_file(), 600).unwrap();
+        let (sid, token, nonce, _) =
+            arm_v2_session(&paths, id.device_id(), PairEndpointClass::Direct);
+
+        let joiner = DeviceId::from_bytes([0xe7u8; 32]);
+        let joins = JoinStore::open(paths.join_dir()).unwrap();
+        joins
+            .write_pending(&PendingJoin {
+                device_id: joiner,
+                label: "joiner".into(),
+                capabilities: Capability::all(),
+                received_at: Utc::now(),
+                fingerprint: NodeFingerprint::from_device_id(&joiner)
+                    .as_str()
+                    .to_string(),
+            })
+            .unwrap();
+
+        let st = test_state(paths.clone(), secret, "host");
+        let app = build_router(st);
+        let body = serde_json::json!({
+            "sid": sid,
+            "decision": "accept",
+            "joiner_device_id_hex": joiner.to_string(),
+            "resident_device_id_hex": id.device_id().to_string(),
+            "ts": rfc3339(Utc::now()),
+            "nonce": encode_pair_nonce(&nonce),
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/pair/v2/decide")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await["state"], "accepted");
+        let store = EnrollmentStore::open(paths.enrollments_file()).unwrap();
+        assert!(store.list().is_empty());
+        assert!(!paths.enrollments_file().exists() || store.list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn v2_decide_bad_enroll_sig_does_not_block_pair() {
+        let paths = tmp_paths();
+        let secret = [0x78u8; 32];
+        let id = Identity::from_secret_bytes(secret);
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        ArmState::arm(paths.arm_file(), 600).unwrap();
+        let (sid, token, nonce, _) =
+            arm_v2_session(&paths, id.device_id(), PairEndpointClass::Direct);
+
+        let joiner = DeviceId::from_bytes([0xe8u8; 32]);
+        let joins = JoinStore::open(paths.join_dir()).unwrap();
+        joins
+            .write_pending(&PendingJoin {
+                device_id: joiner,
+                label: "joiner".into(),
+                capabilities: Capability::all(),
+                received_at: Utc::now(),
+                fingerprint: NodeFingerprint::from_device_id(&joiner)
+                    .as_str()
+                    .to_string(),
+            })
+            .unwrap();
+
+        let person = Identity::from_secret_bytes([0x42u8; 32]);
+        let ts = rfc3339(Utc::now());
+        let pid = "01HZXPERSONBADSIG00000000";
+        let (pk_hex, mut sig_hex) = sign_decide_enroll(
+            &person,
+            pid,
+            PersonFacet::Personal,
+            &id.device_id(),
+            &ts,
+            &nonce,
+        );
+        let last = sig_hex.pop().unwrap();
+        sig_hex.push(if last == '0' { '1' } else { '0' });
+
+        let st = test_state(paths.clone(), secret, "host");
+        let app = build_router(st);
+        let body = serde_json::json!({
+            "sid": sid,
+            "decision": "accept",
+            "joiner_device_id_hex": joiner.to_string(),
+            "resident_device_id_hex": id.device_id().to_string(),
+            "ts": ts,
+            "nonce": encode_pair_nonce(&nonce),
+            "person_id": pid,
+            "facet": "personal",
+            "person_public_key_hex": pk_hex,
+            "sig_hex": sig_hex,
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/pair/v2/decide")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await["state"], "accepted");
+        let store = EnrollmentStore::open(paths.enrollments_file()).unwrap();
+        assert!(store.get(pid).is_none());
+        let sess = PairSessionStore::open(paths.pair_sessions_dir())
+            .unwrap()
+            .load(&sid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sess.phase, mymesh_core::PairPhase::Decided);
+    }
+
+    #[tokio::test]
+    async fn confirm_on_machine_does_not_write_enroll() {
+        let paths = tmp_paths();
+        let secret = [0x79u8; 32];
+        let id = Identity::from_secret_bytes(secret);
+        MeshState::new_mesh().save(paths.mesh_file()).unwrap();
+        ArmState::arm(paths.arm_file(), 600).unwrap();
+        let (sid, _token, _nonce, _) =
+            arm_v2_session(&paths, id.device_id(), PairEndpointClass::Confirm);
+
+        let joiner = DeviceId::from_bytes([0xe9u8; 32]);
+        let joins = JoinStore::open(paths.join_dir()).unwrap();
+        joins
+            .write_pending(&PendingJoin {
+                device_id: joiner,
+                label: "joiner".into(),
+                capabilities: Capability::all(),
+                received_at: Utc::now(),
+                fingerprint: NodeFingerprint::from_device_id(&joiner)
+                    .as_str()
+                    .to_string(),
+            })
+            .unwrap();
+
+        let store = PairSessionStore::open(paths.pair_sessions_dir()).unwrap();
+        let sess = store.load(&sid).unwrap().unwrap();
+        let token_raw = store.load_token_raw(&sid).unwrap().unwrap();
+        let codes = mymesh_core::compute_confirm_codes(
+            &token_raw,
+            &sess.sid,
+            &joiner.to_string(),
+            &id.device_id().to_string(),
+            &sess.nonce,
+        );
+        let applied = apply_pair_confirm(&store, &joins, &codes.accept, Some(&sid), None).unwrap();
+        assert!(matches!(applied.decision, JoinDecision::Accept));
+        let enroll = EnrollmentStore::open(paths.enrollments_file()).unwrap();
+        assert!(enroll.list().is_empty());
+        assert!(!paths.enrollments_file().exists());
     }
 
     #[tokio::test]

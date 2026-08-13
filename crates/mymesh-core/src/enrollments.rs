@@ -1,7 +1,7 @@
 //! Enrollment store (`enrollments.json` mode 0600).
 //!
 //! Host-local `mymesh enroll add` verifies `carrier-enroll-v1` and writes a
-//! row. HTTP decide / POST /enrollments writes are F4.
+//! row. HTTP decide / POST /enrollments reuse this store.
 use crate::wire::{
     enroll_write_preimage, EnrollWriteBody, EnrollmentRecord, EnrollmentsFile, PersonFacet,
     ENROLLMENTS_FILE_VERSION,
