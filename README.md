@@ -150,6 +150,7 @@ Linking model: **[docs/JOIN.md](docs/JOIN.md)**
 
 | Doc | Contents |
 |-----|----------|
+| **[docs/REWORK-UNIFY.md](docs/REWORK-UNIFY.md)** | Design: unify carrier + MyMesh |
 | **[docs/USAGE.md](docs/USAGE.md)** | Comprehensive CLI + TUI + SSH + SOCKS + ops |
 | [docs/ALPHA-3.md](docs/ALPHA-3.md) | Magic plane design & limits |
 | [docs/JOIN.md](docs/JOIN.md) | Arming, ids, carrier, SPAKE, pair v1→v2 migration |
