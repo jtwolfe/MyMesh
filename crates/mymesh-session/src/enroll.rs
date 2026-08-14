@@ -1,30 +1,33 @@
 //! Enrollment handler for `mymesh-enroll/1` ALPN connections.
 //!
-//! When a carrier (phone) scans the node's QR and connects using the enrollment
-//! ALPN, this handler verifies the ticket, checks that the challenge was confirmed
-//! locally, and either accepts or denies the enrollment.
+//! ## ALPN `mymesh-enroll/1` wire protocol (phone-shows-code ceremony)
 //!
-//! ## ALPN `mymesh-enroll/1` wire protocol
+//! Transport: iroh bidirectional stream
+//! Framing: 4-byte big-endian length + UTF-8 JSON
+//! Messages (serde tag = "type"):
+//! - `request`: { ticket, person_public_key_hex, person_id, mesh_name } // phone → node
+//! - `challenge_waiting`: {} // node → phone, ticket ok, show your code
+//! - `challenge_offer`: { digits } // phone → node, 6-digit string the phone is displaying
+//! - `result`: { success, device_id, device_label, error } // node → phone
 //!
-//! The carrier sends an [`EnrollMessage::EnrollRequest`] containing:
-//! - `ticket`: one-time ticket from the QR code
-//! - `person_public_key_hex`: person's Ed25519 public key (hex)
-//! - `person_id`: person identity id (e.g. ULID)
-//! - `mesh_name`: display name for the mesh/person
-//!
-//! This matches the DESIGN protocol for QR+challenge enrollment. The node
-//! verifies the ticket against its pending session, checks the local challenge
-//! confirmation, stores the owner enrollment, and replies with `EnrollAccept`
-//! or `EnrollDeny`. Note: this handler bypasses the full `carrier-enroll-v1`
-//! signature verification because enrollment is via direct iroh connection
-//! with challenge confirmation—the carrier proves key ownership via the
-//! authenticated iroh/QUIC connection.
+//! Flow:
+//! 1. Node starts `mymesh enroll start`, shows QR (device id + ticket), does NOT print a code
+//! 2. Phone scans QR, connects over iroh using ALPN `mymesh-enroll/1`
+//! 3. Phone sends `request` with ticket, person identity, mesh name
+//! 4. Node verifies ticket + session not expired (does NOT require prior challenge confirm)
+//! 5. Node sends `challenge_waiting`
+//! 6. Phone generates 6-digit code, displays it on screen, sends `challenge_offer { digits }`
+//! 7. Node prompts human on stdin to type the digits; constant-time compare
+//! 8. On match: store owner, send `result { success: true, device_id, device_label }`
+//! 9. On mismatch/timeout/expired: send `result { success: false, error }`
 
 use mymesh_core::wire::PersonFacet;
 use mymesh_core::{DeviceId, EnrollSessionFile, EnrollmentStore, Error, Paths, Result};
 use mymesh_crypto::Identity;
 use mymesh_net::PeerConnection;
-use mymesh_protocol::{decode_msg, encode_msg, EnrollMessage, Frame};
+use mymesh_protocol::EnrollMessage;
+use std::future::Future;
+use std::pin::Pin;
 use tracing::{info, warn};
 
 /// Outcome of an enrollment attempt.
@@ -36,40 +39,50 @@ pub enum EnrollOutcome {
     Denied,
 }
 
-/// Handle an incoming enrollment connection.
+/// Callback type for prompting the human to enter the phone's challenge code.
+/// Called with the 6-digit code the phone is displaying; returns the human's input.
+pub type ChallengePromptFn =
+    Box<dyn FnOnce(String) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> + Send>;
+
+/// Handle an incoming enrollment connection (phone-shows-code ceremony).
 ///
 /// This is called when an incoming connection uses the `mymesh-enroll/1` ALPN.
 /// The flow is:
-/// 1. Receive EnrollRequest with ticket, person identity, mesh name
-/// 2. Verify ticket matches the pending enrollment session
-/// 3. Check that the challenge was confirmed locally
-/// 4. Store the owner person id in enrollments
-/// 5. Reply with EnrollAccept or EnrollDeny
+/// 1. Receive `request` with ticket, person identity, mesh name
+/// 2. Verify ticket matches pending session (do NOT require prior challenge confirm)
+/// 3. Send `challenge_waiting`
+/// 4. Receive `challenge_offer { digits }`
+/// 5. Call `prompt_challenge_fn` to get human input (prompts stdin in CLI)
+/// 6. Constant-time compare; on match: store owner, send `result { success: true }`
+/// 7. On mismatch/timeout/expired: send `result { success: false, error }`
 pub async fn handle_enroll_connection(
     conn: Box<dyn PeerConnection>,
     identity: &Identity,
     label: &str,
     paths: &Paths,
+    prompt_challenge_fn: ChallengePromptFn,
 ) -> Result<EnrollOutcome> {
     let device_id = identity.device_id();
     let peer_id = conn.peer_id();
 
-    // Receive the enrollment request
-    let frame = conn.recv_frame().await?;
-    let msg: EnrollMessage = decode_msg(&frame.payload)?;
+    // Step 1: Receive the enrollment request (JSON framing)
+    let msg: EnrollMessage = recv_json_msg(conn.as_ref()).await?;
 
     let (ticket, person_public_key_hex, person_id, mesh_name) = match msg {
-        EnrollMessage::EnrollRequest {
+        EnrollMessage::Request {
             ticket,
             person_public_key_hex,
             person_id,
             mesh_name,
         } => (ticket, person_public_key_hex, person_id, mesh_name),
         _ => {
-            let deny = EnrollMessage::EnrollDeny {
-                reason: "expected EnrollRequest".into(),
+            let result = EnrollMessage::Result {
+                success: false,
+                device_id: None,
+                device_label: None,
+                error: Some("expected request message".into()),
             };
-            let _ = send_msg(conn.as_ref(), &deny).await;
+            let _ = send_json_msg(conn.as_ref(), &result).await;
             let _ = conn.close().await;
             return Ok(EnrollOutcome::Denied);
         }
@@ -81,58 +94,111 @@ pub async fn handle_enroll_connection(
         "received enrollment request"
     );
 
-    // Load the pending enrollment session
+    // Step 2: Load and validate the pending enrollment session
     let session_path = paths.enroll_session_file();
     let session_file = match EnrollSessionFile::try_load(&session_path)? {
         Some(f) => f,
         None => {
             warn!("enrollment request but no pending session");
-            let deny = EnrollMessage::EnrollDeny {
-                reason: "no pending enrollment session".into(),
+            let result = EnrollMessage::Result {
+                success: false,
+                device_id: None,
+                device_label: None,
+                error: Some("no pending enrollment session".into()),
             };
-            let _ = send_msg(conn.as_ref(), &deny).await;
+            let _ = send_json_msg(conn.as_ref(), &result).await;
             let _ = conn.close().await;
             return Ok(EnrollOutcome::Denied);
         }
     };
 
-    let session = &session_file.session;
-
-    // Check session validity
-    if !session.is_valid() {
+    if !session_file.session.is_valid() {
         warn!("enrollment session expired");
         let _ = EnrollSessionFile::clear(&session_path);
-        let deny = EnrollMessage::EnrollDeny {
-            reason: "enrollment session expired".into(),
+        let result = EnrollMessage::Result {
+            success: false,
+            device_id: None,
+            device_label: None,
+            error: Some("enrollment session expired".into()),
         };
-        let _ = send_msg(conn.as_ref(), &deny).await;
+        let _ = send_json_msg(conn.as_ref(), &result).await;
         let _ = conn.close().await;
         return Ok(EnrollOutcome::Denied);
     }
 
-    // Verify the ticket
-    if !session.verify_ticket(&ticket) {
+    if !session_file.session.verify_ticket(&ticket) {
         warn!("ticket mismatch");
-        let deny = EnrollMessage::EnrollDeny {
-            reason: "invalid ticket".into(),
+        let result = EnrollMessage::Result {
+            success: false,
+            device_id: None,
+            device_label: None,
+            error: Some("invalid ticket".into()),
         };
-        let _ = send_msg(conn.as_ref(), &deny).await;
+        let _ = send_json_msg(conn.as_ref(), &result).await;
         let _ = conn.close().await;
         return Ok(EnrollOutcome::Denied);
     }
 
-    // Check that the challenge was confirmed locally
-    if !session.challenge_confirmed {
-        warn!("challenge not confirmed locally");
-        let deny = EnrollMessage::EnrollDeny {
-            reason: "challenge not confirmed on node".into(),
+    // Step 3: Send challenge_waiting (ticket OK, waiting for phone's code)
+    let waiting = EnrollMessage::ChallengeWaiting {};
+    send_json_msg(conn.as_ref(), &waiting).await?;
+
+    info!(peer = %peer_id.short(), "sent challenge_waiting, waiting for phone's code");
+
+    // Step 4: Receive challenge_offer { digits }
+    let offer_msg: EnrollMessage = recv_json_msg(conn.as_ref()).await?;
+
+    let phone_digits = match offer_msg {
+        EnrollMessage::ChallengeOffer { digits } => digits,
+        _ => {
+            warn!("expected challenge_offer, got something else");
+            let result = EnrollMessage::Result {
+                success: false,
+                device_id: None,
+                device_label: None,
+                error: Some("expected challenge_offer message".into()),
+            };
+            let _ = send_json_msg(conn.as_ref(), &result).await;
+            let _ = conn.close().await;
+            return Ok(EnrollOutcome::Denied);
+        }
+    };
+
+    info!(peer = %peer_id.short(), "received challenge_offer, prompting human");
+
+    // Step 5: Prompt the human to enter the phone's code
+    let human_input = match prompt_challenge_fn(phone_digits.clone()).await {
+        Ok(input) => input,
+        Err(e) => {
+            warn!(%e, "challenge prompt failed");
+            let result = EnrollMessage::Result {
+                success: false,
+                device_id: None,
+                device_label: None,
+                error: Some(format!("challenge prompt failed: {e}")),
+            };
+            let _ = send_json_msg(conn.as_ref(), &result).await;
+            let _ = conn.close().await;
+            return Ok(EnrollOutcome::Denied);
+        }
+    };
+
+    // Step 6: Verify the challenge (constant-time compare)
+    let mut session = session_file.session.clone();
+    if let Err(e) = session.verify_phone_challenge(&phone_digits, &human_input) {
+        warn!(%e, "challenge verification failed");
+        let result = EnrollMessage::Result {
+            success: false,
+            device_id: None,
+            device_label: None,
+            error: Some("challenge mismatch".into()),
         };
-        let _ = send_msg(conn.as_ref(), &deny).await;
+        let _ = send_json_msg(conn.as_ref(), &result).await;
         let _ = conn.close().await;
         return Ok(EnrollOutcome::Denied);
     }
 
-    // Store the owner enrollment
+    // Step 7: Store the owner enrollment
     let enroll_result = store_enrollment(
         paths,
         &device_id,
@@ -144,9 +210,8 @@ pub async fn handle_enroll_connection(
     match enroll_result {
         Ok(_) => {
             // Mark session as completed
-            let mut updated_session = session.clone();
-            updated_session.complete(&person_id);
-            let updated_file = EnrollSessionFile::new(updated_session);
+            session.complete(&person_id);
+            let updated_file = EnrollSessionFile::new(session);
             let _ = updated_file.save(&session_path);
 
             info!(
@@ -155,20 +220,25 @@ pub async fn handle_enroll_connection(
                 "enrollment accepted"
             );
 
-            let accept = EnrollMessage::EnrollAccept {
-                device_id,
-                label: label.to_string(),
+            let result = EnrollMessage::Result {
+                success: true,
+                device_id: Some(device_id),
+                device_label: Some(label.to_string()),
+                error: None,
             };
-            send_msg(conn.as_ref(), &accept).await?;
+            send_json_msg(conn.as_ref(), &result).await?;
             let _ = conn.close().await;
             Ok(EnrollOutcome::Accepted)
         }
         Err(e) => {
             warn!(%e, "enrollment storage failed");
-            let deny = EnrollMessage::EnrollDeny {
-                reason: format!("enrollment failed: {e}"),
+            let result = EnrollMessage::Result {
+                success: false,
+                device_id: None,
+                device_label: None,
+                error: Some(format!("enrollment failed: {e}")),
             };
-            let _ = send_msg(conn.as_ref(), &deny).await;
+            let _ = send_json_msg(conn.as_ref(), &result).await;
             let _ = conn.close().await;
             Ok(EnrollOutcome::Denied)
         }
@@ -250,12 +320,31 @@ fn store_enrollment(
     Ok(())
 }
 
-async fn send_msg<M: serde::Serialize>(conn: &dyn PeerConnection, msg: &M) -> Result<()> {
-    conn.send_frame(Frame {
-        channel: mymesh_protocol::ChannelId::control(),
-        payload: encode_msg(msg)?,
-    })
-    .await
+/// Send a length-prefixed JSON message over the connection.
+async fn send_json_msg<M: serde::Serialize>(conn: &dyn PeerConnection, msg: &M) -> Result<()> {
+    let json = serde_json::to_vec(msg).map_err(|e| Error::Protocol(e.to_string()))?;
+    if json.len() > mymesh_protocol::MAX_JSON_MSG_BYTES {
+        return Err(Error::Protocol("JSON message too large".into()));
+    }
+    let len = json.len() as u32;
+    let mut payload = Vec::with_capacity(4 + json.len());
+    payload.extend_from_slice(&len.to_be_bytes());
+    payload.extend_from_slice(&json);
+    conn.send_raw(&payload).await
+}
+
+/// Receive a length-prefixed JSON message from the connection.
+async fn recv_json_msg<M: serde::de::DeserializeOwned>(conn: &dyn PeerConnection) -> Result<M> {
+    let data = conn.recv_raw().await?;
+    if data.len() < 4 {
+        return Err(Error::Protocol("message too short for length prefix".into()));
+    }
+    let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    if data.len() < 4 + len {
+        return Err(Error::Protocol("message truncated".into()));
+    }
+    let json = &data[4..4 + len];
+    serde_json::from_slice(json).map_err(|e| Error::Protocol(e.to_string()))
 }
 
 #[cfg(test)]
@@ -278,6 +367,44 @@ mod tests {
         }
     }
 
+    /// Helper to send a length-prefixed JSON message in tests.
+    async fn test_send_json<M: serde::Serialize>(
+        conn: &dyn mymesh_net::PeerConnection,
+        msg: &M,
+    ) -> Result<()> {
+        let json = serde_json::to_vec(msg).map_err(|e| Error::Protocol(e.to_string()))?;
+        let len = json.len() as u32;
+        let mut payload = Vec::with_capacity(4 + json.len());
+        payload.extend_from_slice(&len.to_be_bytes());
+        payload.extend_from_slice(&json);
+        conn.send_raw(&payload).await
+    }
+
+    /// Helper to receive a length-prefixed JSON message in tests.
+    async fn test_recv_json<M: serde::de::DeserializeOwned>(
+        conn: &dyn mymesh_net::PeerConnection,
+    ) -> Result<M> {
+        let data = conn.recv_raw().await?;
+        if data.len() < 4 {
+            return Err(Error::Protocol("message too short".into()));
+        }
+        let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        if data.len() < 4 + len {
+            return Err(Error::Protocol("message truncated".into()));
+        }
+        let json = &data[4..4 + len];
+        serde_json::from_slice(json).map_err(|e| Error::Protocol(e.to_string()))
+    }
+
+    /// Create a mock challenge prompt that returns a predetermined response.
+    fn mock_prompt(response: &str) -> ChallengePromptFn {
+        let resp = response.to_string();
+        Box::new(move |_digits| {
+            let r = resp.clone();
+            Box::pin(async move { Ok(r) })
+        })
+    }
+
     #[tokio::test]
     async fn enroll_denied_without_session() {
         let paths = tmp_paths("no-session");
@@ -295,47 +422,45 @@ mod tests {
         let node_task = tokio::spawn(async move {
             let id = Identity::from_secret_bytes(node_secret);
             let conn = ep_node.accept().await.unwrap();
-            handle_enroll_connection(conn, &id, "test-node", &paths_clone).await
+            handle_enroll_connection(conn, &id, "test-node", &paths_clone, mock_prompt("123456"))
+                .await
         });
 
         let carrier_task = tokio::spawn(async move {
             let conn = ep_carrier.connect(node_id).await.unwrap();
-            let req = EnrollMessage::EnrollRequest {
+            let req = EnrollMessage::Request {
                 ticket: "fake-ticket".into(),
                 person_public_key_hex: hex::encode([0u8; 32]),
                 person_id: "test-person".into(),
                 mesh_name: "test-mesh".into(),
             };
-            conn.send_frame(Frame {
-                channel: mymesh_protocol::ChannelId::control(),
-                payload: encode_msg(&req).unwrap(),
-            })
-            .await
-            .unwrap();
-            let frame = conn.recv_frame().await.unwrap();
-            let msg: EnrollMessage = decode_msg(&frame.payload).unwrap();
+            test_send_json(conn.as_ref(), &req).await.unwrap();
+            let msg: EnrollMessage = test_recv_json(conn.as_ref()).await.unwrap();
             msg
         });
 
         let (node_res, carrier_res) = tokio::join!(node_task, carrier_task);
         assert_eq!(node_res.unwrap().unwrap(), EnrollOutcome::Denied);
-        assert!(matches!(
-            carrier_res.unwrap(),
-            EnrollMessage::EnrollDeny { .. }
-        ));
+        match carrier_res.unwrap() {
+            EnrollMessage::Result { success, error, .. } => {
+                assert!(!success);
+                assert!(error.unwrap().contains("no pending"));
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(paths.data_dir);
     }
 
     #[tokio::test]
-    async fn enroll_denied_without_challenge_confirm() {
-        let paths = tmp_paths("no-confirm");
+    async fn enroll_accepted_after_phone_code() {
+        let paths = tmp_paths("phone-code-accept");
         let id_node = Identity::generate();
         let id_carrier = Identity::generate();
         let node_id = id_node.device_id();
         let carrier_id = id_carrier.device_id();
 
-        // Create session but don't confirm challenge
+        // Create session (challenge is empty - phone will provide it)
         let session = EnrollSession::new(node_id);
         let ticket = session.ticket.clone();
         let file = EnrollSessionFile::new(session);
@@ -347,56 +472,77 @@ mod tests {
 
         let paths_clone = paths.clone();
         let node_secret = id_node.to_secret_bytes();
+        // Node will receive "654321" from phone and human types the same
         let node_task = tokio::spawn(async move {
             let id = Identity::from_secret_bytes(node_secret);
             let conn = ep_node.accept().await.unwrap();
-            handle_enroll_connection(conn, &id, "test-node", &paths_clone).await
+            handle_enroll_connection(conn, &id, "test-node", &paths_clone, mock_prompt("654321"))
+                .await
         });
 
+        let carrier_pk = id_carrier.verifying_key_bytes();
         let carrier_task = tokio::spawn(async move {
             let conn = ep_carrier.connect(node_id).await.unwrap();
-            let req = EnrollMessage::EnrollRequest {
+
+            // Step 1: Send request
+            let req = EnrollMessage::Request {
                 ticket,
-                person_public_key_hex: hex::encode([0u8; 32]),
-                person_id: "test-person".into(),
-                mesh_name: "test-mesh".into(),
+                person_public_key_hex: hex::encode(carrier_pk),
+                person_id: "test-person-phone".into(),
+                mesh_name: "my-mesh".into(),
             };
-            conn.send_frame(Frame {
-                channel: mymesh_protocol::ChannelId::control(),
-                payload: encode_msg(&req).unwrap(),
-            })
-            .await
-            .unwrap();
-            let frame = conn.recv_frame().await.unwrap();
-            let msg: EnrollMessage = decode_msg(&frame.payload).unwrap();
-            msg
+            test_send_json(conn.as_ref(), &req).await.unwrap();
+
+            // Step 2: Receive challenge_waiting
+            let waiting: EnrollMessage = test_recv_json(conn.as_ref()).await.unwrap();
+            assert!(matches!(waiting, EnrollMessage::ChallengeWaiting {}));
+
+            // Step 3: Send challenge_offer with phone's code
+            let offer = EnrollMessage::ChallengeOffer {
+                digits: "654321".into(),
+            };
+            test_send_json(conn.as_ref(), &offer).await.unwrap();
+
+            // Step 4: Receive result
+            let result: EnrollMessage = test_recv_json(conn.as_ref()).await.unwrap();
+            result
         });
 
         let (node_res, carrier_res) = tokio::join!(node_task, carrier_task);
-        assert_eq!(node_res.unwrap().unwrap(), EnrollOutcome::Denied);
+        assert_eq!(node_res.unwrap().unwrap(), EnrollOutcome::Accepted);
         match carrier_res.unwrap() {
-            EnrollMessage::EnrollDeny { reason } => {
-                assert!(reason.contains("challenge") || reason.contains("confirmed"));
+            EnrollMessage::Result {
+                success,
+                device_id,
+                device_label,
+                ..
+            } => {
+                assert!(success);
+                assert_eq!(device_id, Some(node_id));
+                assert_eq!(device_label.as_deref(), Some("test-node"));
             }
-            other => panic!("expected EnrollDeny, got {other:?}"),
+            other => panic!("expected Result success, got {other:?}"),
         }
+
+        // Verify enrollment was stored
+        let store = EnrollmentStore::open(paths.enrollments_file()).unwrap();
+        let rec = store.get("test-person-phone").expect("enrollment stored");
+        assert!(rec.can_drive);
 
         let _ = std::fs::remove_dir_all(paths.data_dir);
     }
 
     #[tokio::test]
-    async fn enroll_accepted_with_confirmed_challenge() {
-        let paths = tmp_paths("accepted");
+    async fn enroll_denied_on_wrong_code() {
+        let paths = tmp_paths("wrong-code");
         let id_node = Identity::generate();
         let id_carrier = Identity::generate();
         let node_id = id_node.device_id();
         let carrier_id = id_carrier.device_id();
 
-        // Create session and confirm challenge
-        let mut session = EnrollSession::new(node_id);
+        // Create session
+        let session = EnrollSession::new(node_id);
         let ticket = session.ticket.clone();
-        let challenge = session.challenge.clone();
-        session.confirm_challenge(&challenge).unwrap();
         let file = EnrollSessionFile::new(session);
         file.save(paths.enroll_session_file()).unwrap();
 
@@ -406,46 +552,57 @@ mod tests {
 
         let paths_clone = paths.clone();
         let node_secret = id_node.to_secret_bytes();
+        // Phone shows "654321" but human types wrong code "000000"
         let node_task = tokio::spawn(async move {
             let id = Identity::from_secret_bytes(node_secret);
             let conn = ep_node.accept().await.unwrap();
-            handle_enroll_connection(conn, &id, "test-node", &paths_clone).await
+            handle_enroll_connection(conn, &id, "test-node", &paths_clone, mock_prompt("000000"))
+                .await
         });
 
         let carrier_pk = id_carrier.verifying_key_bytes();
         let carrier_task = tokio::spawn(async move {
             let conn = ep_carrier.connect(node_id).await.unwrap();
-            let req = EnrollMessage::EnrollRequest {
+
+            // Send request
+            let req = EnrollMessage::Request {
                 ticket,
                 person_public_key_hex: hex::encode(carrier_pk),
-                person_id: "test-person-123".into(),
+                person_id: "test-person-wrong".into(),
                 mesh_name: "my-mesh".into(),
             };
-            conn.send_frame(Frame {
-                channel: mymesh_protocol::ChannelId::control(),
-                payload: encode_msg(&req).unwrap(),
-            })
-            .await
-            .unwrap();
-            let frame = conn.recv_frame().await.unwrap();
-            let msg: EnrollMessage = decode_msg(&frame.payload).unwrap();
-            msg
+            test_send_json(conn.as_ref(), &req).await.unwrap();
+
+            // Receive challenge_waiting
+            let waiting: EnrollMessage = test_recv_json(conn.as_ref()).await.unwrap();
+            assert!(matches!(waiting, EnrollMessage::ChallengeWaiting {}));
+
+            // Send challenge_offer with phone's code
+            let offer = EnrollMessage::ChallengeOffer {
+                digits: "654321".into(), // Phone shows this
+            };
+            test_send_json(conn.as_ref(), &offer).await.unwrap();
+
+            // Receive result (should be failure)
+            let result: EnrollMessage = test_recv_json(conn.as_ref()).await.unwrap();
+            result
         });
 
         let (node_res, carrier_res) = tokio::join!(node_task, carrier_task);
-        assert_eq!(node_res.unwrap().unwrap(), EnrollOutcome::Accepted);
+        assert_eq!(node_res.unwrap().unwrap(), EnrollOutcome::Denied);
         match carrier_res.unwrap() {
-            EnrollMessage::EnrollAccept { device_id, label } => {
-                assert_eq!(device_id, node_id);
-                assert_eq!(label, "test-node");
+            EnrollMessage::Result {
+                success, error, ..
+            } => {
+                assert!(!success);
+                assert!(error.unwrap().contains("mismatch"));
             }
-            other => panic!("expected EnrollAccept, got {other:?}"),
+            other => panic!("expected Result failure, got {other:?}"),
         }
 
-        // Verify enrollment was stored
+        // Verify enrollment was NOT stored
         let store = EnrollmentStore::open(paths.enrollments_file()).unwrap();
-        let rec = store.get("test-person-123").expect("enrollment stored");
-        assert!(rec.can_drive);
+        assert!(store.get("test-person-wrong").is_none());
 
         let _ = std::fs::remove_dir_all(paths.data_dir);
     }
@@ -458,10 +615,8 @@ mod tests {
         let node_id = id_node.device_id();
         let carrier_id = id_carrier.device_id();
 
-        // Create session and confirm challenge
-        let mut session = EnrollSession::new(node_id);
-        let challenge = session.challenge.clone();
-        session.confirm_challenge(&challenge).unwrap();
+        // Create session
+        let session = EnrollSession::new(node_id);
         let file = EnrollSessionFile::new(session);
         file.save(paths.enroll_session_file()).unwrap();
 
@@ -474,35 +629,32 @@ mod tests {
         let node_task = tokio::spawn(async move {
             let id = Identity::from_secret_bytes(node_secret);
             let conn = ep_node.accept().await.unwrap();
-            handle_enroll_connection(conn, &id, "test-node", &paths_clone).await
+            handle_enroll_connection(conn, &id, "test-node", &paths_clone, mock_prompt("123456"))
+                .await
         });
 
         let carrier_task = tokio::spawn(async move {
             let conn = ep_carrier.connect(node_id).await.unwrap();
-            let req = EnrollMessage::EnrollRequest {
+            let req = EnrollMessage::Request {
                 ticket: "wrong-ticket-value".into(),
                 person_public_key_hex: hex::encode([0u8; 32]),
                 person_id: "test-person".into(),
                 mesh_name: "test-mesh".into(),
             };
-            conn.send_frame(Frame {
-                channel: mymesh_protocol::ChannelId::control(),
-                payload: encode_msg(&req).unwrap(),
-            })
-            .await
-            .unwrap();
-            let frame = conn.recv_frame().await.unwrap();
-            let msg: EnrollMessage = decode_msg(&frame.payload).unwrap();
+            test_send_json(conn.as_ref(), &req).await.unwrap();
+            let msg: EnrollMessage = test_recv_json(conn.as_ref()).await.unwrap();
             msg
         });
 
         let (node_res, carrier_res) = tokio::join!(node_task, carrier_task);
         assert_eq!(node_res.unwrap().unwrap(), EnrollOutcome::Denied);
         match carrier_res.unwrap() {
-            EnrollMessage::EnrollDeny { reason } => {
-                assert!(reason.contains("ticket") || reason.contains("invalid"));
+            EnrollMessage::Result { success, error, .. } => {
+                assert!(!success);
+                let err_msg = error.unwrap();
+                assert!(err_msg.contains("ticket") || err_msg.contains("invalid"));
             }
-            other => panic!("expected EnrollDeny, got {other:?}"),
+            other => panic!("expected Result, got {other:?}"),
         }
 
         let _ = std::fs::remove_dir_all(paths.data_dir);

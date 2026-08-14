@@ -196,6 +196,39 @@ impl PeerConnection for IrohConn {
         self.conn.close(0u32.into(), b"bye");
         Ok(())
     }
+
+    async fn send_raw(&self, data: &[u8]) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let mut send = self.send.lock().await;
+        send.write_all(data)
+            .await
+            .map_err(|e| Error::Session(format!("send raw: {e}")))?;
+        send.flush()
+            .await
+            .map_err(|e| Error::Session(format!("flush raw: {e}")))
+    }
+
+    async fn recv_raw(&self) -> Result<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        let mut recv = self.recv.lock().await;
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf)
+            .await
+            .map_err(|e| Error::Session(format!("recv raw len: {e}")))?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > mymesh_protocol::MAX_JSON_MSG_BYTES {
+            return Err(Error::Protocol("message too large".into()));
+        }
+        let mut payload = vec![0u8; len];
+        recv.read_exact(&mut payload)
+            .await
+            .map_err(|e| Error::Session(format!("recv raw payload: {e}")))?;
+        // Return the full message including the length prefix
+        let mut full = Vec::with_capacity(4 + len);
+        full.extend_from_slice(&len_buf);
+        full.extend_from_slice(&payload);
+        Ok(full)
+    }
 }
 
 #[async_trait]

@@ -17,7 +17,7 @@ mod tcp_tunnel;
 mod two_agent_harness;
 
 pub use agent::Agent;
-pub use enroll::{handle_enroll_connection, EnrollOutcome};
+pub use enroll::{handle_enroll_connection, ChallengePromptFn, EnrollOutcome};
 pub use host_metrics::sample_metrics;
 pub use join::{
     handle_join_as_host, handle_join_as_host_with_grants, run_join_as_guest,

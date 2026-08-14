@@ -422,6 +422,36 @@ impl PeerConnection for UdsFrameConn {
     async fn close(&self) -> Result<()> {
         Ok(())
     }
+
+    async fn send_raw(&self, data: &[u8]) -> Result<()> {
+        let mut w = self.write.lock().await;
+        w.write_all(data)
+            .await
+            .map_err(|e| Error::Session(format!("proxy send raw: {e}")))?;
+        w.flush()
+            .await
+            .map_err(|e| Error::Session(format!("proxy flush raw: {e}")))
+    }
+
+    async fn recv_raw(&self) -> Result<Vec<u8>> {
+        let mut r = self.read.lock().await;
+        let mut len_buf = [0u8; 4];
+        r.read_exact(&mut len_buf)
+            .await
+            .map_err(|e| Error::Session(format!("proxy recv raw len: {e}")))?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > mymesh_protocol::MAX_JSON_MSG_BYTES {
+            return Err(Error::Protocol("message too large".into()));
+        }
+        let mut payload = vec![0u8; len];
+        r.read_exact(&mut payload)
+            .await
+            .map_err(|e| Error::Session(format!("proxy recv raw payload: {e}")))?;
+        let mut full = Vec::with_capacity(4 + len);
+        full.extend_from_slice(&len_buf);
+        full.extend_from_slice(&payload);
+        Ok(full)
+    }
 }
 
 /// Prefer agent proxy; only direct-bind if no agent (with a clear log risk).

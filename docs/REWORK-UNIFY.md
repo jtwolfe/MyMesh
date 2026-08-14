@@ -25,14 +25,20 @@ Strip MyMesh back to a simple device mesh, and make carrier a simple person-app 
 - The person OWNS devices. Devices can still pair to each other with 24-word when no phone is present.
 - The phone is both the person vault AND an iroh peer on the same fabric.
 
-## Own-device ceremony (only this)
+## Own-device ceremony (phone-shows-code)
 
-1. Carrier: Add device
-2. Scan the node's QR
-3. Type a short one-time challenge on the node
-4. Carrier owns that device
+1. Node runs `mymesh enroll start`, shows QR only (no code on the screen)
+2. Phone scans the QR, connects over iroh ALPN `mymesh-enroll/1`
+3. Phone shows a 6-digit code on its screen
+4. Human types the phone's code INTO the node (stdin / TUI prompt)
+5. On match: carrier owns that device
 
-A photo of a QR is not enough. No LAN HTTP enroll dance.
+Security properties:
+- QR contains only the ticket and device id, no challenge code
+- A photo of the QR is not enough (the code lives only on the phone)
+- The code is transmitted from phone → node only after connection
+- Constant-time comparison prevents timing attacks
+- No LAN HTTP enroll dance
 
 ## Mesh
 

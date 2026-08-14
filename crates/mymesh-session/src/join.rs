@@ -723,6 +723,12 @@ mod tests {
         async fn close(&self) -> mymesh_core::Result<()> {
             self.inner.close().await
         }
+        async fn send_raw(&self, data: &[u8]) -> mymesh_core::Result<()> {
+            self.inner.send_raw(data).await
+        }
+        async fn recv_raw(&self) -> mymesh_core::Result<Vec<u8>> {
+            self.inner.recv_raw().await
+        }
     }
 
     #[tokio::test]
@@ -798,6 +804,12 @@ mod tests {
         }
         async fn close(&self) -> mymesh_core::Result<()> {
             Ok(())
+        }
+        async fn send_raw(&self, _data: &[u8]) -> mymesh_core::Result<()> {
+            Ok(())
+        }
+        async fn recv_raw(&self) -> mymesh_core::Result<Vec<u8>> {
+            Err(mymesh_core::Error::Other("not implemented".into()))
         }
     }
 

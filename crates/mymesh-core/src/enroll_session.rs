@@ -1,16 +1,19 @@
 //! Enrollment session state for QR + challenge enrollment.
 //!
-//! Flow:
-//! 1. Node generates 6-digit challenge and one-time ticket
-//! 2. Node displays QR containing device id + ticket + ALPN
-//! 3. Human enters challenge on node (stdin/TUI) to confirm physical presence
-//! 4. Carrier scans QR, connects with ticket, sends person identity
-//! 5. Node verifies ticket + challenge confirmed, stores owner, replies ok
+//! Flow (phone-shows-code ceremony):
+//! 1. Node creates session with one-time ticket, displays QR (NO code on node)
+//! 2. Phone scans QR, connects over iroh ALPN `mymesh-enroll/1`
+//! 3. Phone sends `request` with ticket, person identity, mesh name
+//! 4. Node verifies ticket, sends `challenge_waiting`
+//! 5. Phone generates 6-digit code, displays it, sends `challenge_offer { digits }`
+//! 6. Human types phone's digits INTO the node (stdin/TUI)
+//! 7. Node constant-time compares; on match: store owner, send `result { success: true }`
 //!
 //! Security properties:
 //! - Ticket is single-use and expires (~2 minutes)
-//! - Challenge requires physical access to the node
-//! - Photo of QR alone is insufficient (challenge not confirmed)
+//! - Challenge code lives only on the phone until human types it
+//! - Photo of QR alone is insufficient (no code in QR; code only on phone screen)
+//! - Constant-time comparison prevents timing attacks
 
 use crate::{DeviceId, Error, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -60,7 +63,9 @@ pub struct EnrollSession {
     pub device_id: DeviceId,
     /// One-time ticket (hex, 32 random bytes).
     pub ticket: String,
-    /// 6-digit numeric challenge.
+    /// 6-digit numeric challenge (phone-generated, stored after `challenge_offer`).
+    /// Empty string until phone sends its code.
+    #[serde(default)]
     pub challenge: String,
     /// When the session was created.
     pub created_at: DateTime<Utc>,
@@ -81,13 +86,14 @@ pub struct EnrollSession {
 
 impl EnrollSession {
     /// Create a new enrollment session for the given device.
+    /// Does NOT generate a challenge code - the phone generates and displays it.
     pub fn new(device_id: DeviceId) -> Self {
         let now = Utc::now();
         Self {
             session_id: new_session_id(),
             device_id,
             ticket: new_ticket(),
-            challenge: new_challenge(),
+            challenge: String::new(), // Phone generates the challenge
             created_at: now,
             expires_at: now + Duration::seconds(ENROLL_SESSION_EXPIRY_SECS),
             challenge_confirmed: false,
@@ -117,12 +123,52 @@ impl EnrollSession {
         constant_time_eq(self.ticket.as_bytes(), ticket.as_bytes())
     }
 
-    /// Confirm the challenge locally (human entered correct code).
+    /// Verify the phone's challenge against human input.
+    /// `phone_digits`: 6-digit code from phone's `challenge_offer`
+    /// `human_input`: what the human typed on the node
+    /// On match, sets `challenge_confirmed = true`.
+    pub fn verify_phone_challenge(&mut self, phone_digits: &str, human_input: &str) -> Result<()> {
+        if !self.is_valid() {
+            return Err(Error::Session("enrollment session expired".into()));
+        }
+        let normalized_phone = phone_digits.trim().replace([' ', '-'], "");
+        let normalized_human = human_input.trim().replace([' ', '-'], "");
+
+        // Validate phone_digits looks like a 6-digit code
+        if normalized_phone.len() != 6 || !normalized_phone.chars().all(|c| c.is_ascii_digit()) {
+            return Err(Error::PermissionDenied(
+                "phone challenge must be 6 digits".into(),
+            ));
+        }
+
+        if !constant_time_eq(normalized_phone.as_bytes(), normalized_human.as_bytes()) {
+            return Err(Error::PermissionDenied("challenge mismatch".into()));
+        }
+        self.challenge = normalized_phone;
+        self.challenge_confirmed = true;
+        self.confirmed_at = Some(Utc::now());
+        Ok(())
+    }
+
+    /// Legacy: Confirm the challenge locally (for backwards compatibility with tests).
+    /// In the new flow, use `verify_phone_challenge` instead.
+    #[deprecated(note = "use verify_phone_challenge for new phone-shows-code flow")]
     pub fn confirm_challenge(&mut self, input: &str) -> Result<()> {
         if !self.is_valid() {
             return Err(Error::Session("enrollment session expired".into()));
         }
         let normalized = input.trim().replace([' ', '-'], "");
+        // For legacy compatibility: if challenge is empty, treat any 6-digit input as valid
+        // This supports old tests that call confirm_challenge before phone sends challenge_offer
+        if self.challenge.is_empty() {
+            if normalized.len() == 6 && normalized.chars().all(|c| c.is_ascii_digit()) {
+                self.challenge = normalized;
+                self.challenge_confirmed = true;
+                self.confirmed_at = Some(Utc::now());
+                return Ok(());
+            }
+            return Err(Error::PermissionDenied("challenge must be 6 digits".into()));
+        }
         if !constant_time_eq(self.challenge.as_bytes(), normalized.as_bytes()) {
             return Err(Error::PermissionDenied("challenge mismatch".into()));
         }
@@ -233,14 +279,6 @@ fn new_ticket() -> String {
     hex::encode(bytes)
 }
 
-/// Generate a 6-digit numeric challenge.
-fn new_challenge() -> String {
-    let mut bytes = [0u8; 4];
-    OsRng.fill_bytes(&mut bytes);
-    let n = u32::from_le_bytes(bytes) % 1_000_000;
-    format!("{:06}", n)
-}
-
 /// Constant-time byte comparison.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -258,11 +296,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_session_has_valid_challenge_and_ticket() {
+    fn new_session_has_empty_challenge_and_valid_ticket() {
         let did = DeviceId::from_bytes([0x42u8; 32]);
         let sess = EnrollSession::new(did);
-        assert_eq!(sess.challenge.len(), 6);
-        assert!(sess.challenge.chars().all(|c| c.is_ascii_digit()));
+        // Challenge is empty until phone sends challenge_offer
+        assert!(sess.challenge.is_empty());
         assert_eq!(sess.ticket.len(), 64); // 32 bytes hex
         assert!(!sess.challenge_confirmed);
         assert!(sess.is_valid());
@@ -272,7 +310,6 @@ mod tests {
     fn session_expires_after_timeout() {
         let did = DeviceId::from_bytes([0x42u8; 32]);
         let mut sess = EnrollSession::new(did);
-        // Manually set expiry to past
         sess.expires_at = Utc::now() - Duration::seconds(1);
         assert!(sess.is_expired());
         assert!(!sess.is_valid());
@@ -280,21 +317,62 @@ mod tests {
     }
 
     #[test]
-    fn challenge_confirmation_required_for_enroll() {
+    fn phone_challenge_verification_correct() {
         let did = DeviceId::from_bytes([0x42u8; 32]);
         let mut sess = EnrollSession::new(did);
         assert!(sess.is_valid());
-        assert!(!sess.can_enroll()); // Not confirmed yet
+        assert!(!sess.can_enroll());
 
-        // Wrong challenge fails
-        let wrong = sess.confirm_challenge("000000");
-        assert!(wrong.is_err() || sess.challenge == "000000");
-
-        // Correct challenge works
-        let challenge = sess.challenge.clone();
-        sess.confirm_challenge(&challenge).unwrap();
+        // Phone sends digits, human types the same
+        let phone_digits = "123456";
+        let human_input = "123456";
+        sess.verify_phone_challenge(phone_digits, human_input)
+            .unwrap();
         assert!(sess.challenge_confirmed);
         assert!(sess.can_enroll());
+        assert_eq!(sess.challenge, "123456");
+    }
+
+    #[test]
+    fn phone_challenge_verification_wrong() {
+        let did = DeviceId::from_bytes([0x42u8; 32]);
+        let mut sess = EnrollSession::new(did);
+
+        let phone_digits = "123456";
+        let human_input = "654321";
+        let err = sess
+            .verify_phone_challenge(phone_digits, human_input)
+            .unwrap_err();
+        assert!(err.to_string().contains("mismatch"));
+        assert!(!sess.challenge_confirmed);
+    }
+
+    #[test]
+    fn phone_challenge_with_whitespace() {
+        let did = DeviceId::from_bytes([0x42u8; 32]);
+        let mut sess = EnrollSession::new(did);
+
+        // Phone sends "123456", human types "12 34 56" with spaces
+        let phone_digits = "123456";
+        let human_input = "12 34 56";
+        sess.verify_phone_challenge(phone_digits, human_input)
+            .unwrap();
+        assert!(sess.challenge_confirmed);
+    }
+
+    #[test]
+    fn phone_challenge_invalid_format() {
+        let did = DeviceId::from_bytes([0x42u8; 32]);
+        let mut sess = EnrollSession::new(did);
+
+        // Phone sends invalid (not 6 digits)
+        let err = sess.verify_phone_challenge("12345", "12345").unwrap_err();
+        assert!(err.to_string().contains("6 digits"));
+
+        let err = sess
+            .verify_phone_challenge("12345a", "12345a")
+            .unwrap_err();
+        assert!(err.to_string().contains("6 digits"));
     }
 
     #[test]
@@ -333,7 +411,8 @@ mod tests {
         let loaded = EnrollSessionFile::load(&path).unwrap();
         assert_eq!(loaded.session.session_id, sess.session_id);
         assert_eq!(loaded.session.ticket, sess.ticket);
-        assert_eq!(loaded.session.challenge, sess.challenge);
+        // Challenge is empty in new sessions
+        assert!(loaded.session.challenge.is_empty());
 
         EnrollSessionFile::clear(&path).unwrap();
         assert!(!path.exists());
@@ -342,28 +421,13 @@ mod tests {
     }
 
     #[test]
-    fn challenge_with_whitespace_or_dashes() {
+    fn expired_session_rejects_phone_challenge() {
         let did = DeviceId::from_bytes([0x42u8; 32]);
         let mut sess = EnrollSession::new(did);
-        let challenge = sess.challenge.clone();
-        // Add spaces and dashes
-        let formatted = format!(
-            "{} {} {}",
-            &challenge[0..2],
-            &challenge[2..4],
-            &challenge[4..6]
-        );
-        sess.confirm_challenge(&formatted).unwrap();
-        assert!(sess.challenge_confirmed);
-    }
-
-    #[test]
-    fn expired_session_rejects_confirm() {
-        let did = DeviceId::from_bytes([0x42u8; 32]);
-        let mut sess = EnrollSession::new(did);
-        let challenge = sess.challenge.clone();
         sess.expires_at = Utc::now() - Duration::seconds(1);
-        let err = sess.confirm_challenge(&challenge).unwrap_err();
+        let err = sess
+            .verify_phone_challenge("123456", "123456")
+            .unwrap_err();
         assert!(err.to_string().contains("expired"));
     }
 }

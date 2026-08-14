@@ -431,14 +431,59 @@ pub enum TcpMessage {
 
 /// Enrollment protocol messages (ALPN `mymesh-enroll/1`).
 ///
+/// Wire format: 4-byte big-endian length + UTF-8 JSON.
+/// Messages use serde `tag = "type"` for the discriminant.
+///
 /// Flow:
-/// 1. Carrier scans QR containing node device id and one-time ticket
-/// 2. Carrier connects over iroh using the enrollment ALPN
-/// 3. Carrier sends EnrollRequest with ticket, person identity, mesh name
-/// 4. Node verifies ticket + checks challenge was confirmed locally
-/// 5. Node stores owner person id, replies EnrollAccept or EnrollDeny
+/// 1. Node starts `mymesh enroll start`, shows QR (device id + ticket), does NOT print a code
+/// 2. Carrier scans QR, connects over iroh using ALPN `mymesh-enroll/1`
+/// 3. Carrier sends `EnrollRequest` with ticket, person identity, mesh name
+/// 4. Node verifies ticket + session not expired, sends `EnrollChallengeWaiting`
+/// 5. Carrier displays a 6-digit code on the phone, sends `EnrollChallengeOffer { digits }`
+/// 6. Node prompts human on stdin to type the digits; constant-time compare
+/// 7. On match: store owner, send `EnrollResult { success: true, device_id, device_label }`
+/// 8. On mismatch/timeout/expired: send `EnrollResult { success: false, error }`
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum EnrollMessage {
+    /// Carrier → Node: request ownership enrollment (step 3).
+    Request {
+        /// One-time ticket from QR code.
+        ticket: String,
+        /// Person public key (Ed25519, hex).
+        person_public_key_hex: String,
+        /// Person identity id (e.g. ULID).
+        person_id: String,
+        /// Display name for the mesh/person.
+        mesh_name: String,
+    },
+    /// Node → Carrier: ticket valid, waiting for challenge (step 4).
+    ChallengeWaiting {},
+    /// Carrier → Node: phone is displaying this 6-digit code (step 5).
+    ChallengeOffer {
+        /// 6-digit numeric string (e.g. "123456").
+        digits: String,
+    },
+    /// Node → Carrier: enrollment result (step 7/8).
+    Result {
+        /// True if enrollment succeeded.
+        success: bool,
+        /// Node device id (on success).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_id: Option<DeviceId>,
+        /// Node label (on success).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_label: Option<String>,
+        /// Error message (on failure).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+}
+
+/// Legacy enrollment messages for backwards compatibility during transition.
+/// These will be removed once carrier is fully updated.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum EnrollMessageLegacy {
     /// Carrier → Node: request ownership enrollment.
     EnrollRequest {
         /// One-time ticket from QR code.

@@ -94,6 +94,20 @@ impl PeerConnection for FabricConnection {
     async fn close(&self) -> Result<()> {
         Ok(())
     }
+
+    async fn send_raw(&self, data: &[u8]) -> Result<()> {
+        use mymesh_protocol::ChannelId;
+        let frame = Frame {
+            channel: ChannelId::control(),
+            payload: bytes::Bytes::copy_from_slice(data),
+        };
+        self.send_frame(frame).await
+    }
+
+    async fn recv_raw(&self) -> Result<Vec<u8>> {
+        let frame = self.recv_frame().await?;
+        Ok(frame.payload.to_vec())
+    }
 }
 
 #[async_trait]
