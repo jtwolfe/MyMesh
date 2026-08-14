@@ -3,7 +3,6 @@ mod firewall;
 mod install;
 mod magic_cmd;
 mod mesh_conn;
-mod pair_cmd;
 mod probe;
 mod term_pane;
 mod tui_app;
@@ -33,7 +32,7 @@ use mymesh_net::{
 use mymesh_protocol::{decode_msg, encode_msg, ChannelId, FileMessage, Frame, TerminalMessage};
 use mymesh_session::{
     apply_kick_target, apply_membership_gossip, build_announce, run_guest_pair,
-    run_host_pair_code, run_join_as_guest, sign_kick, Agent, PairArmAdmin, Session, PAIR_HTTP_PORT,
+    run_host_pair_code, run_join_as_guest, sign_kick, Agent, Session,
 };
 use mymesh_terminal::TerminalClient;
 use std::net::SocketAddr;
@@ -331,20 +330,6 @@ enum Commands {
         /// Local listen port (default: same as remote)
         #[arg(long)]
         local: Option<u16>,
-    },
-    /// Lab-only pair HTTP if serve is down (serve owns :17878 after F4p)
-    Carrier {
-        /// HTTP listen port (default 17878)
-        #[arg(long, default_value_t = 17878)]
-        port: u16,
-        /// Emit pair/v1 LAN QR instead of default v2 (compat escape; KD23/D5)
-        #[arg(long = "pair-v1")]
-        pair_v1: bool,
-    },
-    /// Pair v2 dual-scan + confirm-on-machine (no carrier process required)
-    Pair {
-        #[command(subcommand)]
-        action: PairCmd,
     },
     /// Print magic-plane help (DNS / SOCKS / *.mym)
     Magic,
@@ -653,31 +638,15 @@ enum OwnerBackupCmd {
 
 #[derive(Subcommand, Debug)]
 enum FirewallCmd {
-    /// Explain which ports to open and how (not named "help" — reserved by clap)
+    /// Explain firewall status (not named "help" — reserved by clap)
     #[command(name = "explain", visible_alias = "ports")]
     Explain,
     /// Detect ufw/firewalld and show current state
     Status,
-    /// Ubuntu/Debian UFW backend
-    Ufw {
-        #[command(subcommand)]
-        action: FirewallAction,
-    },
-    /// Fedora/RHEL firewalld backend
-    Firewalld {
-        #[command(subcommand)]
-        action: FirewallAction,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum FirewallAction {
-    /// Show MyMesh-related rules / ports
-    Status,
-    /// Open MyMesh LAN ports (requires root)
-    Allow,
-    /// Remove MyMesh LAN rules (requires root)
-    Deny,
+    /// Ubuntu/Debian UFW status
+    Ufw,
+    /// Fedora/RHEL firewalld status
+    Firewalld,
 }
 
 #[derive(Subcommand, Debug)]
@@ -746,50 +715,6 @@ enum DemoCmd {
     Pair,
     /// Local fabric session demo
     Session,
-}
-
-#[derive(Subcommand, Debug)]
-enum PairCmd {
-    /// Resident: arm + mint PairSession + print QR_A v2 (required nonce).
-    /// Joiner: `dual --join --resident <id>`.
-    Dual {
-        /// Join as guest toward this resident (hex or 24 words)
-        #[arg(long)]
-        join: bool,
-        /// Resident device id / words (required with --join)
-        #[arg(long, value_name = "DEVICE")]
-        resident: Option<String>,
-        /// Optional direct host base URL for ep=direct (`http://ip:port` or `https://…`)
-        #[arg(long)]
-        host: Option<String>,
-        /// Optional TLS SPKI pin (`sha256/<base64>`) for direct HTTPS host (requires `--host https://…`)
-        #[arg(long, value_name = "PIN")]
-        tlspin: Option<String>,
-        /// Arm / session TTL seconds (default: config arm_timeout_secs)
-        #[arg(long)]
-        ttl: Option<u64>,
-    },
-    /// Verify confirm code (HMAC Crockford 4-4); write JoinStore decision
-    Confirm {
-        /// Accept or deny code from phone (hyphens optional)
-        code: String,
-        /// Pair session id (default: unique active session)
-        #[arg(long)]
-        sid: Option<String>,
-        /// Joiner device id when multiple pending
-        #[arg(long)]
-        joiner: Option<String>,
-    },
-    /// Show active pair session status
-    Status {
-        #[arg(long)]
-        sid: Option<String>,
-    },
-    /// Expire previous session and arm a fresh dual
-    Retry {
-        /// Session to expire (default: active)
-        sid: Option<String>,
-    },
 }
 
 #[tokio::main]
@@ -1077,46 +1002,12 @@ async fn main() -> Result<()> {
             port,
             local,
         } => magic_cmd::cmd_expose(&paths, &device, port, local).await?,
-        Commands::Carrier { port, pair_v1 } => {
-            magic_cmd::cmd_carrier(&paths, port, pair_v1).await?
-        }
-        Commands::Pair { action } => match action {
-            PairCmd::Dual {
-                join,
-                resident,
-                host,
-                tlspin,
-                ttl,
-            } => {
-                if join {
-                    let r = resident.ok_or_else(|| {
-                        anyhow::anyhow!("--join requires --resident <device-id-or-words>")
-                    })?;
-                    pair_cmd::cmd_pair_dual_join(&paths, &r).await?
-                } else {
-                    pair_cmd::cmd_pair_dual(&paths, host, ttl, tlspin).await?
-                }
-            }
-            PairCmd::Confirm { code, sid, joiner } => {
-                pair_cmd::cmd_pair_confirm(&paths, &code, sid, joiner).await?
-            }
-            PairCmd::Status { sid } => pair_cmd::cmd_pair_status(&paths, sid).await?,
-            PairCmd::Retry { sid } => pair_cmd::cmd_pair_retry(&paths, sid).await?,
-        },
         Commands::Magic => magic_cmd::print_magic_help(),
         Commands::Firewall { action } => match action {
             FirewallCmd::Explain => firewall::print_help(),
             FirewallCmd::Status => firewall::cmd_status()?,
-            FirewallCmd::Ufw { action } => match action {
-                FirewallAction::Status => firewall::ufw_status()?,
-                FirewallAction::Allow => firewall::ufw_allow()?,
-                FirewallAction::Deny => firewall::ufw_deny()?,
-            },
-            FirewallCmd::Firewalld { action } => match action {
-                FirewallAction::Status => firewall::firewalld_status()?,
-                FirewallAction::Allow => firewall::firewalld_allow()?,
-                FirewallAction::Deny => firewall::firewalld_deny()?,
-            },
+            FirewallCmd::Ufw => firewall::ufw_status()?,
+            FirewallCmd::Firewalld => firewall::firewalld_status()?,
         },
     }
     Ok(())
@@ -2118,40 +2009,19 @@ async fn cmd_serve(paths: &Paths) -> Result<()> {
     );
     let transport = std::sync::Arc::new(IrohTransport::bind(&identity).await?);
     let agent = Agent::from_paths(&identity, paths, cfg.clone())?;
-    // KD-F16: serve owns pair/v2 + mesh/v1. Fail closed so MMA1 never mints a
-    // QR against a port we do not hold (lab `mymesh carrier` leftover, etc.).
-    let http = agent
-        .spawn_pair_http(paths, PAIR_HTTP_PORT)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "pair HTTP bind :{PAIR_HTTP_PORT} failed: {e}\n\
-             stop lab `mymesh carrier` if it owns the port"
-            )
-        })?;
-    println!("  pair HTTP   0.0.0.0:{PAIR_HTTP_PORT}  /pair/v2 /mesh/v1");
-    if cfg.admin_mailbox_url().is_some() {
-        println!("  admin mailbox poller  (self-host, not a product)");
-    }
-    let host_base = http.host_base;
     // Single iroh endpoint: dial proxy so CLI/TUI never re-bind the same identity.
-    // MMA1 arm_pair_qr shares this socket; MMD1 dial is unchanged after 4-byte magic.
     let sock = std::path::PathBuf::from(&cfg.daemon.control_socket);
-    let admin = std::sync::Arc::new(PairArmAdmin {
-        paths: paths.clone(),
-        secret: identity.to_secret_bytes(),
-        host_base: std::sync::Arc::new(tokio::sync::Mutex::new(host_base)),
-    });
     {
         let t: std::sync::Arc<dyn Transport> = transport.clone();
         let sock = sock.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_control_socket(sock, t, Some(admin)).await {
+            // No admin handler — carrier HTTP pairing removed per REWORK-UNIFY.md
+            if let Err(e) = serve_control_socket(sock, t, None).await {
                 tracing::error!(%e, "dial proxy exited");
             }
         });
     }
-    println!("  dial proxy  {}  (MMD1 dial, MMA1 admin)", sock.display());
+    println!("  dial proxy  {}", sock.display());
     // Magic plane: DNS, SOCKS5, mesh-IP auto ports, reconnect probes (shared transport)
     mymesh_session::MagicPlane::new(
         paths.clone(),

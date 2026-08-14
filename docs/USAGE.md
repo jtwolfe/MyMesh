@@ -1,6 +1,6 @@
 # MyMesh usage guide (v0.1.0-alpha.3)
 
-This is the practical reference for day-to-day use. For design limits of the magic plane see [ALPHA-3.md](ALPHA-3.md). For linking security see [JOIN.md](JOIN.md) and [SECURITY.md](SECURITY.md). Next-phase contracts: [PAIR-V2.md](PAIR-V2.md), [MASTER-KEY.md](MASTER-KEY.md), [GRANTS.md](GRANTS.md), [GUEST.md](GUEST.md), [CARRIER-NEXT.md](CARRIER-NEXT.md), [CARRIER-ADMIN-NEXT.md](CARRIER-ADMIN-NEXT.md) (Wave F: enrollment, domains, gateway). Wave A pair demo (dual-scan + confirm): [DEMO-PAIR.md](DEMO-PAIR.md). Dual-authority recovery (lost phone/MMK, guest, rotate, sealed backup): [RECOVERY.md](RECOVERY.md).
+This is the practical reference for day-to-day use. For design limits of the magic plane see [ALPHA-3.md](ALPHA-3.md). For linking security see [JOIN.md](JOIN.md) and [SECURITY.md](SECURITY.md). Next-phase contracts: [MASTER-KEY.md](MASTER-KEY.md), [GRANTS.md](GRANTS.md), [GUEST.md](GUEST.md). Dual-authority recovery (lost phone/MMK, guest, rotate, sealed backup): [RECOVERY.md](RECOVERY.md). Design direction: [REWORK-UNIFY.md](REWORK-UNIFY.md).
 
 ---
 
@@ -9,7 +9,7 @@ This is the practical reference for day-to-day use. For design limits of the mag
 | Term | Meaning |
 |------|---------|
 | **Identity** | Ed25519 key; **DeviceId** = iroh EndpointId (hex or 24 BIP39 words) |
-| **Agent / serve** | Long-lived process: sessions, mesh sync, magic plane, **the only iroh endpoint**, and **pair/v2 + mesh/v1 HTTP** (`:17878`) |
+| **Agent / serve** | Long-lived process: sessions, mesh sync, magic plane, **the only iroh endpoint** |
 | **Dial proxy** | Unix socket (`$XDG_RUNTIME_DIR/mymesh.sock`) so CLI/TUI dial *through* the agent |
 | **Trust** | Device record `Trusted` / `Pending` / `Revoked` |
 | **Arm** | Host temporarily accepts new join requests |
@@ -95,49 +95,6 @@ mymesh connect-request deny         # disarm early
 ```
 
 Arm auto-disarms after accept / timeout.
-
-### Pair v2 dual-scan + confirm (Wave A product path)
-
-Internet-first decide without requiring phone HTTP to the host. Full demo checklist: **[DEMO-PAIR.md](DEMO-PAIR.md)**. Contract: [PAIR-V2.md](PAIR-V2.md).
-
-```bash
-# Machine A (resident) — mymesh serve must be running (owns :17878 /pair/v2 + /mesh/v1)
-mymesh pair dual                    # QR_A v2 (nonce; ep=confirm if no --host)
-# optional: put a private last-mile hint in QR_A (not product copy; TUI / start_carrier already emit host=):
-# mymesh pair dual --host http://<lan-ip>:17878
-
-# Machine B (joiner)
-mymesh pair dual --join --resident <did-or-words-from-A>   # QR_B + iroh dial
-
-# Phone: scan QR_A then QR_B → L2 Accept/Deny
-#   default → confirm codes + enroll-via-hint (POST /enrollments using host= privately)
-#   Advanced LAN helper / HTTP decide → POST /pair/v2/decide
-#   then on A:
-mymesh pair confirm <CODE>          # Crockford 4-4; hyphens optional
-mymesh pair status                  # optional
-```
-
-**Honesty:** Carrier `mock-pair-host` is **lab-only** (not in this repo) — not a production pair path. See [DEMO-PAIR.md](DEMO-PAIR.md).
-
-### Connect-by-carrier (phone as scanner — default pair/v2 QR)
-
-Default bootstrap QR is **pair/v2** with LAN `host=` + `ep=direct` (D5 / KD23). That `host=` is a **private last-mile hint** (never shown in the TUI). Serve owns `/pair/v2`. Prefer dual-scan + confirm above; HTTP decide is Carrier Advanced LAN helper.
-
-```bash
-# Machine A — serve owns /pair/v2 + /mesh/v1 on :17878; TUI arms QR via MMA1
-mymesh serve                        # pair HTTP + iroh (required)
-# mymesh carrier                    # lab-only if serve is down; refuses bind when serve owns :17878
-# mymesh carrier --pair-v1          # escape: alpha.1 pair/v1 LAN QR
-# scan QR with phone (TUI pair / carrier action)
-
-# Machine B
-mymesh id --uri                     # show URI/QR
-# paste/scan into phone page  (or: mymesh link <host-id>)
-
-# A completes join over iroh (not through the phone as a node)
-```
-
-If the phone cannot load the page / API, check **host firewall** (see below). Carrier binds `0.0.0.0` so LAN clients can connect.
 
 ### Optional: SPAKE + local mailbox
 
@@ -318,7 +275,7 @@ mymesh expose laptop 7878 --local-port 17878
 
 ## Firewall helper (explicit only)
 
-MyMesh **never** opens firewall ports by default. Pair HTTP (`TCP 17878`) is bound by **`mymesh serve`** and often needs a hole for a phone on the LAN. Lab `mymesh carrier` only binds that port if serve is down.
+MyMesh **never** opens firewall ports by default. Mesh traffic typically works without firewall changes (iroh uses outbound + relays).
 
 ```bash
 mymesh firewall explain             # ports & rationale
@@ -344,7 +301,6 @@ TUI may try `pkexec` for elevation when available.
 ```bash
 mymesh mesh
 mymesh mesh init                    # first MMK on this box (TTY prints recovery codes)
-mymesh mesh allow-create --secs 300 # let Carrier POST /meshes init an uninited box
 mymesh mesh recovery-show-once      # print + delete mesh-recovery-once.txt
 mymesh mesh sync
 mymesh kick <device>                # interactive double confirm
@@ -365,7 +321,7 @@ mymesh tui
 
 | Area | Actions (representative) |
 |------|---------------------------|
-| **Home** | Status, arm, carrier, link join, copy id/uri/qr, install/service refresh |
+| **Home** | Status, arm, link join, copy id/uri/qr, install/service refresh |
 | **Peers** | Select peer, ping/bw/metrics, kick, labels, navigate tools |
 | **Files** | Dual pane, multi-select, any→any node, auto refresh |
 | **Term** | Peer select, interactive PTY (Ctrl+D detaches cleanly) |
@@ -439,8 +395,6 @@ ping ok, ssh hangs?
   → alpha.3+ both sides? sshd on remote? proxy-ssh stderr?
 browser *.mym fails?
   → SOCKS5h to socks_bind? service listening on peer?
-carrier phone timeout?
-  → firewall explain + ufw allow carrier port?
 ```
 
 ---
@@ -453,6 +407,6 @@ carrier phone timeout?
 - [RECOVERY.md](RECOVERY.md) — dual-authority recovery runbooks  
 - [SECURITY.md](SECURITY.md) — operator security model  
 - [THREATS.md](THREATS.md) — threat catalog + S9 control checklist C1–C7  
-- [CARRIER-NEXT.md](CARRIER-NEXT.md) — S0–S9 design  
+- [REWORK-UNIFY.md](REWORK-UNIFY.md) — design direction
 
 - [ROADMAP.md](ROADMAP.md) — next releases  

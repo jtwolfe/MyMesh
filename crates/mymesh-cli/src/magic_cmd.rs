@@ -1,14 +1,10 @@
-//! Alpha.3 magic: names, hosts, ssh config, tcp expose, DNS/socks status, carrier.
+//! Alpha.3 magic: names, hosts, ssh config, tcp expose, DNS/socks status.
 use anyhow::{bail, Result};
 use console::style;
 use mymesh_core::{mesh_ip_string, Config, DeviceLabel, DeviceStore, Paths, TrustState};
-use mymesh_crypto::{parse_device_id, Identity};
-use mymesh_session::{
-    carrier_pending_path, client_bridge, run_join_as_guest, start_carrier, Session,
-};
-use qrcode::QrCode;
+use mymesh_crypto::Identity;
+use mymesh_session::{client_bridge, Session};
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use crate::resolve_device_pub;
 
@@ -375,133 +371,9 @@ pub async fn cmd_expose(
     }
 }
 
-pub async fn cmd_carrier(paths: &Paths, port: u16, pair_v1: bool) -> Result<()> {
-    let identity = Identity::load_or_create(paths.identity_file())?;
-    let cfg = Config::load(paths.config_file())?;
-    let sock = std::path::PathBuf::from(&cfg.daemon.control_socket);
-    if mymesh_net::serve_owns_pair_http(port, &sock) {
-        bail!("serve owns pair HTTP");
-    }
-    eprintln!("warning: mymesh serve is not running; lab-only bind of pair HTTP (emulator/airgap)");
-    // clear pending
-    let pend = carrier_pending_path(paths);
-    let _ = std::fs::remove_file(&pend);
-
-    let handle = start_carrier(
-        paths.clone(),
-        Identity::from_secret_bytes(identity.to_secret_bytes()),
-        cfg.device_label.clone(),
-        port,
-        None,
-        pair_v1,
-    )
-    .await?;
-
-    let pair_prefix = if handle.pair_protocol_version == 1 {
-        "pair/v1"
-    } else {
-        "pair/v2"
-    };
-    println!("{}", style("connect by carrier").bold());
-    println!(
-        "  pair API  /{}  (QR v{}; host= is a private last-mile hint)",
-        pair_prefix, handle.pair_protocol_version
-    );
-    println!("  page      (deprecated HTML fallback; URL not shown)");
-    if pair_v1 {
-        println!("  mode      pair/v1 LAN escape (--pair-v1)");
-    } else {
-        println!("  mode      pair/v2 default (use --pair-v1 for alpha.1 LAN QR)");
-    }
-    println!();
-    println!("  scan this QR with Carrier (lab CLI prints the payload):");
-    println!("  {}", handle.pair_qr);
-    if let Ok(code) = QrCode::new(handle.pair_qr.as_bytes()) {
-        let qr = code
-            .render::<char>()
-            .quiet_zone(false)
-            .module_dimensions(2, 1)
-            .build();
-        println!("{qr}");
-    }
-    println!();
-    println!("Join path: other machine runs  mymesh link <this-host-id>");
-    println!(
-        "Phone approves via {pair_prefix} (JoinStore). HTML paste path still works as fallback."
-    );
-    println!("Waiting for join approval or phone paste… (Ctrl+C to cancel)");
-
-    loop {
-        if pend.exists() {
-            let uri = std::fs::read_to_string(&pend)?.trim().to_string();
-            let _ = std::fs::remove_file(&pend);
-            if uri.is_empty() {
-                continue;
-            }
-            println!(
-                "{} got peer from phone — dialing join…",
-                style("ok").green().bold()
-            );
-            let host_id = parse_join_target(&uri)?;
-            let mut store = DeviceStore::open(paths.devices_file())?;
-            let sock = std::path::PathBuf::from(&cfg.daemon.control_socket);
-            match mymesh_net::connect_mesh(&identity, host_id, &sock).await {
-                Ok((conn, transport)) => {
-                    match run_join_as_guest(
-                        conn,
-                        &identity,
-                        &cfg.device_label,
-                        &mut store,
-                        &paths.mesh_file(),
-                        mymesh_core::Capability::all(),
-                    )
-                    .await
-                    {
-                        Ok(peer) => {
-                            println!(
-                                "{} linked via carrier to {} ({})",
-                                style("ok").green().bold(),
-                                peer.label,
-                                peer.id.short()
-                            );
-                            if let Some(tr) = transport {
-                                tr.shutdown().await;
-                            }
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            eprintln!("join failed: {e}");
-                            if let Some(tr) = transport {
-                                tr.shutdown().await;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("connect failed: {e}");
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(400)).await;
-    }
-}
-
-fn parse_join_target(uri: &str) -> Result<mymesh_core::DeviceId> {
-    // mymesh://join/<hex> or raw hex/words
-    let s = uri.trim();
-    if let Some(rest) = s.strip_prefix("mymesh://join/") {
-        let hex = rest.split(&['?', '#'][..]).next().unwrap_or(rest);
-        return Ok(parse_device_id(hex)?);
-    }
-    if let Some(rest) = s.strip_prefix("mymesh://") {
-        return Ok(parse_device_id(rest.split('/').next().unwrap_or(rest))?);
-    }
-    Ok(parse_device_id(s)?)
-}
-
 pub fn print_magic_help() {
     println!(
-        r#"MyMesh magic plane (alpha.3)
+        r#"MyMesh magic plane
 
   mymesh serve              # agent + DNS + SOCKS + auto port forwards + probes
   mymesh hosts              # names, mesh IPs, groups
@@ -512,8 +384,11 @@ pub fn print_magic_help() {
   mymesh ssh-config         # print Host *.mym ProxyCommand block
   mymesh proxy-ssh <host>   # used by OpenSSH ProxyCommand
   mymesh expose <dev> <port> [--local N]
-  mymesh carrier            # connect-by-carrier (default pair/v2 QR)
-  mymesh carrier --pair-v1  # escape: alpha.1 pair/v1 LAN QR
+
+Pairing:
+  mymesh connect-request allow  # arm host for joins
+  mymesh link <device-id>       # join from another machine (24 words or hex)
+  mymesh requests accept <id>   # approve pending request
 
 Browser:
   export ALL_PROXY=socks5://127.0.0.1:18080
@@ -610,101 +485,4 @@ pub fn magic_status_text(paths: &Paths) -> Result<String> {
         cfg.magic.socks_bind,
         cfg.magic.dns_bind,
     ))
-}
-
-/// Start or arm pair/v2 QR; returns page URL (internal) and pair QR deep link.
-///
-/// When serve owns `:17878`, arms via MMA1 (no second HTTP bind). Lab fallback
-/// binds only if serve/port is down. The QR still includes `host=` as a private
-/// last-mile hint (KD-F18 / F9 — do not strip). TUI must not display `host_base`.
-pub async fn start_carrier_ui(paths: &Paths, port: u16) -> Result<(String, String)> {
-    let identity = Identity::load_or_create(paths.identity_file())?;
-    let cfg = Config::load(paths.config_file())?;
-    let sock = std::path::PathBuf::from(&cfg.daemon.control_socket);
-    let pend = carrier_pending_path(paths);
-    let _ = std::fs::remove_file(&pend);
-
-    if mymesh_net::agent_control_live(&sock) {
-        match mymesh_net::arm_pair_qr_via_agent(&sock, 900).await {
-            Ok(armed) => {
-                let qr = armed.qr.unwrap_or_default();
-                let host = armed
-                    .host_base
-                    .unwrap_or_else(|| format!("http://127.0.0.1:{port}"));
-                let url = format!("{}/", host.trim_end_matches('/'));
-                return Ok((url, qr));
-            }
-            Err(e) => {
-                // Serve owns the socket — never steal :17878.
-                bail!("serve owns pair HTTP; arm_pair_qr failed: {e}");
-            }
-        }
-    }
-    if mymesh_net::pair_http_port_live(port) {
-        bail!("serve owns pair HTTP");
-    }
-
-    eprintln!("warning: mymesh serve is not running; lab-only bind of pair HTTP (emulator/airgap)");
-    // Arm *before* start so bootstrap token / session TTL matches arm.until
-    let _ = mymesh_core::ArmState::arm(paths.arm_file(), 900);
-    let handle = start_carrier(
-        paths.clone(),
-        Identity::from_secret_bytes(identity.to_secret_bytes()),
-        cfg.device_label.clone(),
-        port,
-        None,
-        false, // default pair/v2 QR (D5)
-    )
-    .await?;
-    Ok((handle.url, handle.pair_qr))
-}
-
-/// If phone posted a peer URI, complete join. Returns Some(msg) when done/attempted.
-pub async fn poll_carrier_join(paths: &Paths) -> Result<Option<String>> {
-    let pend = carrier_pending_path(paths);
-    if !pend.exists() {
-        return Ok(None);
-    }
-    let uri = std::fs::read_to_string(&pend)?.trim().to_string();
-    let _ = std::fs::remove_file(&pend);
-    if uri.is_empty() {
-        return Ok(None);
-    }
-    let identity = Identity::load_or_create(paths.identity_file())?;
-    let cfg = Config::load(paths.config_file())?;
-    let host_id = parse_join_target(&uri)?;
-    let mut store = DeviceStore::open(paths.devices_file())?;
-    let sock = std::path::PathBuf::from(&cfg.daemon.control_socket);
-    match mymesh_net::connect_mesh(&identity, host_id, &sock).await {
-        Ok((conn, transport)) => {
-            match run_join_as_guest(
-                conn,
-                &identity,
-                &cfg.device_label,
-                &mut store,
-                &paths.mesh_file(),
-                mymesh_core::Capability::all(),
-            )
-            .await
-            {
-                Ok(peer) => {
-                    if let Some(tr) = transport {
-                        tr.shutdown().await;
-                    }
-                    Ok(Some(format!(
-                        "carrier linked → {} ({})",
-                        peer.label,
-                        peer.id.short()
-                    )))
-                }
-                Err(e) => {
-                    if let Some(tr) = transport {
-                        tr.shutdown().await;
-                    }
-                    Ok(Some(format!("carrier join failed: {e}")))
-                }
-            }
-        }
-        Err(e) => Ok(Some(format!("carrier connect failed: {e}"))),
-    }
 }

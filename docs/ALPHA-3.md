@@ -2,7 +2,7 @@
 
 Theme: **use your mesh like a LAN** (without a full VPN).
 
-This release ships non-GUI “magic” features: names, SSH, TCP tunnels, SOCKS, DNS, carrier join, labels. Operational guide: [USAGE.md](USAGE.md).
+This release ships non-GUI “magic” features: names, SSH, TCP tunnels, SOCKS, DNS, labels. Operational guide: [USAGE.md](USAGE.md). See [REWORK-UNIFY.md](REWORK-UNIFY.md) for design direction.
 
 ---
 
@@ -64,23 +64,6 @@ curl -v http://laptop.mym:7878/
 
 SOCKS5 from `serve` (`magic.socks_bind`). Prefer **`socks5h`** / “proxy DNS” so names resolve inside MyMesh.
 
-### 7. Connect-by-carrier
-
-Phone is a **scanner only** (no mesh node, no Android app).
-
-```bash
-# A (phone on a network that can reach A's :17878)
-mymesh serve      # owns /pair/v2; TUI arms QR via MMA1
-# mymesh carrier  # lab-only if serve is down
-
-# B
-mymesh id --uri   # scan/paste into phone page
-
-# A dials B over iroh and completes join
-```
-
-Symmetric: either side can host the page. Firewall may block LAN access to `:17878` — use `mymesh firewall explain`.
-
 ---
 
 ## Config
@@ -133,7 +116,6 @@ reconnect_probe_secs = 30
 | UDP | Not tunneled |
 | Desktop GUI control | Deferred |
 | Hyprland fullscreen TUI chrome | Known imperfect; parked |
-| Carrier port | Often needs explicit host firewall allow |
 
 ---
 
@@ -144,6 +126,5 @@ reconnect_probe_secs = 30
 - [ ] `shell` + `cp` both directions  
 - [ ] `ssh host.mym` both directions  
 - [ ] SOCKS `curl` to a peer HTTP port  
-- [ ] Carrier join once on LAN  
 - [ ] Kick + pending kick when offline  
 - [ ] Restart agents; dial proxy still works  

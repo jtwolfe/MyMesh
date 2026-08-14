@@ -10,8 +10,8 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use mymesh_core::{
-    apply_pair_confirm, record_pair_decide, ArmState, Config, DeviceStore, JoinStore, MeshState,
-    NodeFingerprint, PairSessionStore, Paths, PeerMetrics, PendingKickStore, TrustState,
+    ArmState, Config, DeviceStore, JoinStore, MeshState, Paths, PeerMetrics, PendingKickStore,
+    TrustState,
 };
 use mymesh_crypto::{
     clear_tui_attached, device_id_to_words, device_join_uri, mark_tui_attached, take_recovery_once,
@@ -205,7 +205,6 @@ enum PromptKind {
     #[allow(dead_code)]
     DenyRequest,
     ExposePort,
-    PairConfirm,
     AllowCreatePassword,
     RecoveryShow,
 }
@@ -240,17 +239,10 @@ struct App {
     poll: PeerPoll,
     kick: KickWizard,
     prompt: Prompt,
-    /// Internal pair-HTTP host_base (remint / join poll). Never render (KD-F18).
-    carrier_url: Option<String>,
-    /// Advanced: show raw QR URI / LAN host (operator LAN-helper chrome).
-    show_lan_helper: bool,
     /// Scrollable detail text for Status tab extras
     detail: String,
     /// Pending join list selection index on Home
     req_sel: usize,
-    /// Resident pair/v2 QR_A shown on Home (Carrier scans this first).
-    pair_qr_a: Option<String>,
-    pair_sid: Option<String>,
     /// Last *applied* terminal size (backend buffer).
     term_size: (u16, u16),
     /// Most recent size observed from the OS (may be mid-animation).
@@ -320,19 +312,14 @@ pub async fn run_tui(paths: Paths) -> Result<()> {
         },
         kick: KickWizard::default(),
         prompt: Prompt::default(),
-        carrier_url: None,
-        show_lan_helper: false,
         detail: String::new(),
         req_sel: 0,
-        pair_qr_a: None,
-        pair_sid: None,
         term_size: (0, 0),
         pending_size: None,
         pending_since: None,
         recovery_snooze: false,
     };
     let _ = mark_tui_attached(app.paths.tui_attached_file());
-    ensure_pair_qr_a(&mut app).await;
 
     let res = run_loop(&mut terminal, &mut app).await;
 
@@ -443,95 +430,6 @@ fn node_cwd_default(node: &BrowserNode, home: &Path) -> String {
         BrowserNode::Local => home.display().to_string(),
         BrowserNode::Peer { .. } => ".".into(),
     }
-}
-
-fn sid_from_pair_qr(qr: &str) -> Option<String> {
-    let q = qr.split_once('?')?.1;
-    for part in q.split('&') {
-        if let Some(v) = part.strip_prefix("sid=") {
-            if !v.is_empty() {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Drop `host=` from a pair QR for **display**. The scan payload is unchanged (KD-F18).
-fn redact_pair_qr_host(qr: &str) -> String {
-    let Some((base, query)) = qr.split_once('?') else {
-        return qr.to_string();
-    };
-    let kept: Vec<&str> = query
-        .split('&')
-        .filter(|p| !p.starts_with("host="))
-        .collect();
-    if kept.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base}?{}", kept.join("&"))
-    }
-}
-
-fn host_from_page_url(url: &str) -> String {
-    url.trim_end_matches('/').to_string()
-}
-
-/// Arm QR_A via MMA1 / lab carrier. QR still carries `host=` as a private
-/// last-mile hint (KD-F18); do not render `carrier_url`.
-async fn ensure_pair_qr_a(app: &mut App) {
-    if app.carrier_url.is_none() {
-        match crate::magic_cmd::start_carrier_ui(&app.paths, 17878).await {
-            Ok((url, pair_qr)) => {
-                app.carrier_url = Some(url);
-                app.pair_sid = sid_from_pair_qr(&pair_qr);
-                app.pair_qr_a = Some(pair_qr);
-                app.status =
-                    "pair HTTP + QR armed — scan this first, then the other machine".into();
-                return;
-            }
-            Err(e) => {
-                app.status = format!("pair HTTP unavailable ({e}); confirm-only QR");
-            }
-        }
-    } else if let Some(url) = app.carrier_url.clone() {
-        let host = host_from_page_url(&url);
-        match crate::pair_cmd::mint_pair_dual_qr(&app.paths, Some(host), None, None) {
-            Ok((qr, sid, _)) => {
-                app.pair_qr_a = Some(qr);
-                app.pair_sid = Some(sid);
-                app.status = "pair QR reminted (LAN host) — scan this first".into();
-            }
-            Err(e) => app.status = format!("pair QR: {e}"),
-        }
-        return;
-    }
-    match crate::pair_cmd::mint_pair_dual_qr(&app.paths, None, None, None) {
-        Ok((qr, sid, _)) => {
-            app.pair_qr_a = Some(qr);
-            app.pair_sid = Some(sid);
-            if !app.status.starts_with("pair HTTP unavailable") {
-                app.status =
-                    "pair QR armed — scan this first on Carrier, then scan the other machine"
-                        .into();
-            }
-        }
-        Err(e) => app.status = format!("pair QR: {e}"),
-    }
-}
-
-/// Phone-scannable identity for this node (Carrier second-machine QR).
-fn pair_peer_uri(id: &Identity, paths: &Paths) -> String {
-    let did = id.device_id().to_string();
-    let fp = NodeFingerprint::from_device_id(&id.device_id());
-    let label = Config::load(paths.config_file())
-        .map(|c| c.device_label)
-        .unwrap_or_default();
-    format!(
-        "mymesh://pair-peer?v=1&did={did}&fp={}&label={}",
-        crate::pair_cmd::percent_encode(fp.as_str()),
-        crate::pair_cmd::percent_encode(&label),
-    )
 }
 
 // ─── QR: half-block unicode (correct aspect for terminals) ───────────
@@ -655,12 +553,6 @@ async fn run_loop(
     loop {
         // drain terminal VT output (non-blocking)
         term_pane::drain_output(&mut app.term);
-        if app.carrier_url.is_some() {
-            if let Ok(Some(msg)) = crate::magic_cmd::poll_carrier_join(&app.paths).await {
-                app.status = msg;
-                // keep page up for more joins
-            }
-        }
         if app.tab == Tab::Term {
             term_pane::refresh_peers(&app.paths, &mut app.term);
             term_pane::maybe_resize(&mut app.term);
@@ -919,22 +811,6 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 "Link by device id",
                 "paste hex id or 24 words, then Enter",
             ),
-            KeyCode::Char('C') => start_carrier(app).await,
-            KeyCode::Char('P') => ensure_pair_qr_a(app).await,
-            KeyCode::Char('f') => start_prompt(
-                app,
-                PromptKind::PairConfirm,
-                "Pair confirm code",
-                "4-4 code from Carrier after Accept (hyphens optional)",
-            ),
-            KeyCode::Char('H') => {
-                app.show_lan_helper = !app.show_lan_helper;
-                app.status = if app.show_lan_helper {
-                    "LAN helper QR text on (Advanced) — host= visible".into()
-                } else {
-                    "LAN helper QR text off — host= stays a private hint".into()
-                };
-            }
             KeyCode::Char('M') => start_allow_create(app),
             KeyCode::Char('h') => {
                 app.detail =
@@ -1208,14 +1084,8 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 app.status = "firewall summary in detail pane".into();
             }
             KeyCode::Char('F') => {
-                app.status = "firewall open (pkexec/sudo)…".into();
-                match crate::firewall::tui_try_open_carrier() {
-                    Ok(m) => app.status = m,
-                    Err(e) => {
-                        app.detail = format!("{e}");
-                        app.status = "firewall needs elevation — see detail / status".into();
-                    }
-                }
+                app.detail = crate::firewall::tui_summary();
+                app.status = "firewall status shown".into();
             }
             KeyCode::Char('S') => match crate::magic_cmd::ssh_config_text(&app.paths, None) {
                 Ok(txt) => {
@@ -1313,22 +1183,6 @@ async fn click_button(app: &mut App, id: &str) {
             "Link by device id",
             "hex or 24 words",
         ),
-        "carrier" => start_carrier(app).await,
-        "pair_qr" => ensure_pair_qr_a(app).await,
-        "pair_confirm" => start_prompt(
-            app,
-            PromptKind::PairConfirm,
-            "Pair confirm code",
-            "4-4 code from Carrier after Accept",
-        ),
-        "lan_helper" => {
-            app.show_lan_helper = !app.show_lan_helper;
-            app.status = if app.show_lan_helper {
-                "LAN helper QR text on (Advanced)".into()
-            } else {
-                "LAN helper QR text off".into()
-            };
-        },
         "allow_create" => start_allow_create(app),
         "copy_id" => copy_id(app),
         "words" => show_words(app),
@@ -1443,14 +1297,8 @@ async fn click_button(app: &mut App, id: &str) {
             app.status = "firewall summary".into();
         }
         "fw_open" => {
-            app.status = "firewall open…".into();
-            match crate::firewall::tui_try_open_carrier() {
-                Ok(m) => app.status = m,
-                Err(e) => {
-                    app.detail = format!("{e}");
-                    app.status = "needs elevation — see detail".into();
-                }
-            }
+            app.detail = crate::firewall::tui_summary();
+            app.status = "firewall info shown".into();
         }
         "ssh_cfg" => match crate::magic_cmd::ssh_config_text(&app.paths, None) {
             Ok(txt) => {
@@ -1573,40 +1421,6 @@ fn show_uri(app: &mut App) {
             app.detail = u.clone();
             app.status = format!("uri: {u}");
         }
-    }
-}
-
-async fn start_carrier(app: &mut App) {
-    app.status = "starting carrier…".into();
-    match crate::magic_cmd::start_carrier_ui(&app.paths, 17878).await {
-        Ok((url, pair_qr)) => {
-            app.carrier_url = Some(url.clone());
-            app.pair_sid = sid_from_pair_qr(&pair_qr);
-            app.pair_qr_a = Some(pair_qr.clone());
-            app.detail = if app.show_lan_helper {
-                format!(
-                    "Connect-by-carrier (pair/v2 default)\n\n\
-Carrier QR (scan with app; host= is a private last-mile hint):\n  {pair_qr}\n\n\
-Other machine: mymesh link <host-id>  then approve on phone.\n\
-CLI escape: mymesh carrier --pair-v1  (lab only if serve is down)\n\
-Firewall: if phone times out, Status → [F] Open or:\n  {}\n",
-                    crate::firewall::sudo_firewall_cmd("ufw allow")
-                )
-            } else {
-                format!(
-                    "Connect-by-carrier (pair/v2 default)\n\n\
-Pair QR armed on Home — scan the QR with Carrier.\n\
-host= stays in the QR payload as a private last-mile hint (not shown).\n\
-[H] toggles Advanced LAN-helper text.\n\n\
-Other machine: mymesh link <host-id>  then approve on phone.\n\
-CLI escape: mymesh carrier --pair-v1  (lab only if serve is down)\n\
-Firewall: if phone times out, Status → [F] Open or:\n  {}\n",
-                    crate::firewall::sudo_firewall_cmd("ufw allow")
-                )
-            };
-            app.status = "pair QR armed".into();
-        }
-        Err(e) => app.status = format!("carrier: {e}"),
     }
 }
 
@@ -1733,33 +1547,6 @@ async fn submit_prompt(app: &mut App) {
         PromptKind::DenyRequest => {
             deny_selected_request(app).await;
         }
-        PromptKind::PairConfirm => {
-            let store = match PairSessionStore::open(app.paths.pair_sessions_dir()) {
-                Ok(s) => s,
-                Err(e) => {
-                    app.status = format!("pair confirm: {e}");
-                    return;
-                }
-            };
-            let joins = match JoinStore::open(app.paths.join_dir()) {
-                Ok(j) => j,
-                Err(e) => {
-                    app.status = format!("pair confirm: {e}");
-                    return;
-                }
-            };
-            match apply_pair_confirm(&store, &joins, &buf, app.pair_sid.as_deref(), None) {
-                Ok(res) => {
-                    let kind = match res.decision {
-                        mymesh_core::JoinDecision::Accept => "accept",
-                        mymesh_core::JoinDecision::Deny { .. } => "deny",
-                    };
-                    record_pair_decide(app.paths.metrics_dir(), kind);
-                    app.status = format!("pair confirm {kind} — join can complete Trusted");
-                }
-                Err(e) => app.status = format!("pair confirm: {e}"),
-            }
-        }
         PromptKind::AllowCreatePassword => {
             if buf.is_empty() {
                 app.status = "password must not be empty".into();
@@ -1769,7 +1556,7 @@ async fn submit_prompt(app: &mut App) {
             match win.save(app.paths.create_window_file()) {
                 Ok(()) => {
                     app.status =
-                        "create window open 300s — Carrier POST /meshes may init this box".into();
+                        "create window open 300s — remote POST /meshes may init this box".into();
                 }
                 Err(e) => app.status = format!("allow-create: {e}"),
             }
@@ -2685,10 +2472,6 @@ fn draw_action_bar(f: &mut TuiFrame, area: Rect, app: &mut App) {
             ("accept", "[y] Accept"),
             ("deny", "[n] Deny"),
             ("link", "[l] Link"),
-            ("carrier", "[C] Carrier"),
-            ("pair_qr", "[P] Pair QR"),
-            ("pair_confirm", "[f] Confirm"),
-            ("lan_helper", "[H] LAN QR"),
             ("allow_create", "[M] Allow create"),
             ("copy_id", "[c] ID"),
             ("words", "[w] Words"),
@@ -2898,14 +2681,6 @@ fn draw_home(f: &mut TuiFrame, area: Rect, app: &App) {
             }
         }
     }
-    // host_base / carrier_url is QR payload only (KD-F18) — do not render LAN :17878.
-    if app.carrier_url.is_some() {
-        left_lines.push(Line::from(Span::styled(
-            "Pair QR armed",
-            Style::default().fg(C_OK).add_modifier(Modifier::BOLD),
-        )));
-        left_lines.push(Line::from(""));
-    }
     left_lines.push(Line::from(""));
     left_lines.push(Line::from(Span::styled(
         format!("Pending joins ({})", pending.len()),
@@ -2939,25 +2714,19 @@ fn draw_home(f: &mut TuiFrame, area: Rect, app: &App) {
         cols[0],
     );
 
-    // QR panel: resident pair/v2 first (Carrier scan 1), pair-peer is the other-machine QR.
-    let mut qr_lines = vec![Line::from(Span::styled(
-        "Carrier: scan this QR first (pair dual)",
+    // QR panel: device join URI QR (for mymesh link)
+    let mut qr_lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+        "Device join QR (24-word pairing)",
         Style::default().fg(C_MUTED),
     ))];
-    if let Some(qr) = &app.pair_qr_a {
-        // Graphic encodes the full payload (including host=). Text omits host=
-        // unless Advanced LAN-helper chrome is on (KD-F18 / F9).
-        let shown = if app.show_lan_helper {
-            qr.clone()
-        } else {
-            redact_pair_qr_host(qr)
-        };
+    if let Some(id) = id {
+        let uri = device_join_uri(&id.device_id()).unwrap_or_default();
         qr_lines.push(Line::from(Span::styled(
-            shown,
+            uri.clone(),
             Style::default().fg(C_ACCENT),
         )));
         qr_lines.push(Line::from(""));
-        for row in qr_half_block_lines(qr) {
+        for row in qr_half_block_lines(&uri) {
             qr_lines.push(Line::from(Span::styled(
                 row,
                 Style::default().fg(C_TEXT).bg(C_PANEL),
@@ -2965,29 +2734,17 @@ fn draw_home(f: &mut TuiFrame, area: Rect, app: &App) {
         }
         qr_lines.push(Line::from(""));
         qr_lines.push(Line::from(Span::styled(
-            "Scan with Carrier. Accept shows confirm codes; host= is a private last-mile hint.",
+            "Other machine: mymesh link <this-id-or-words>",
             Style::default().fg(C_MUTED),
         )));
         qr_lines.push(Line::from(Span::styled(
-            "[f] paste confirm code from the phone (default pair path)",
+            "Then: mymesh requests accept <joiner>",
             Style::default().fg(C_MUTED),
         )));
-    } else if let Some(id) = id {
-        let peer = pair_peer_uri(&id, &app.paths);
-        qr_lines.push(Line::from(Span::styled(
-            "fallback joiner QR (other machine)",
-            Style::default().fg(C_MUTED),
-        )));
-        for row in qr_half_block_lines(&peer) {
-            qr_lines.push(Line::from(Span::styled(
-                row,
-                Style::default().fg(C_TEXT).bg(C_PANEL),
-            )));
-        }
     }
     f.render_widget(
         Paragraph::new(qr_lines)
-            .block(panel("QR · pair this machine"))
+            .block(panel("QR · link this device"))
             .wrap(Wrap { trim: false }),
         cols[1],
     );
@@ -3611,23 +3368,4 @@ async fn mesh_sync_all(paths: &Paths) -> anyhow::Result<usize> {
         crate::mesh_conn::shutdown_opt(transport).await;
     }
     Ok(added)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::redact_pair_qr_host;
-
-    #[test]
-    fn redact_pair_qr_host_strips_only_host() {
-        let qr = "carrier://pair?v=2&sid=s1&did=aa&token=tt&nonce=nn&fp=ff&ep=direct&host=http%3A%2F%2F192.168.1.10%3A17878&mesh=m1";
-        let shown = redact_pair_qr_host(qr);
-        assert!(!shown.contains("host="));
-        assert!(!shown.contains("192.168"));
-        assert!(!shown.contains("17878"));
-        assert!(shown.contains("sid=s1"));
-        assert!(shown.contains("ep=direct"));
-        assert!(shown.contains("mesh=m1"));
-        // Payload itself is not mutated.
-        assert!(qr.contains("host=http%3A%2F%2F192.168.1.10%3A17878"));
-    }
 }

@@ -1,42 +1,27 @@
-//! Pairing, join requests, sessions, agent, magic plane, carrier, mesh/v1 API.
+//! Pairing, join requests, sessions, agent, magic plane.
+//!
+//! Note: Carrier HTTP pairing (pair/v1, pair/v2, /mesh/v1) removed per REWORK-UNIFY.md.
+//! 24-word device-to-device pairing retained.
 
 mod agent;
-mod carrier;
 mod host_metrics;
 mod join;
 mod magic;
-mod mailbox_poller;
-mod mesh_api;
 mod mesh_sync;
 mod pair;
 mod session;
 mod tcp_tunnel;
 
 #[cfg(test)]
-mod e6_continuity_facet_harness;
-#[cfg(test)]
-mod guest_e2e_harness;
-#[cfg(test)]
 mod two_agent_harness;
 
 pub use agent::Agent;
-pub use carrier::{
-    arm_pair_qr, build_pair_qr, build_pair_qr_v2, build_pair_qr_v2_checked, carrier_pending_path,
-    decode_pair_nonce, encode_pair_nonce, start_carrier, start_pair_http, ArmPairQr, CarrierHandle,
-    PairArmAdmin, PairHttpHandle, PairQrV2Params, PAIR_HTTP_PORT, PAIR_V1_PREFIX, PAIR_V2_PREFIX,
-};
-pub use mesh_api::{
-    auth_challenge_preimage, execute_admin_envelope, mrk_admin_identity, AuthMethod, MeshApiState,
-    MESH_V1_PREFIX,
-};
-// Re-export owner types from crypto for callers that used mesh_api::MeshOwnerFile (B3).
 pub use host_metrics::sample_metrics;
 pub use join::{
     handle_join_as_host, handle_join_as_host_with_grants, run_join_as_guest,
     spawn_join_as_guest_to_resident, JoinHostOutcome,
 };
 pub use magic::MagicPlane;
-pub use mailbox_poller::spawn_admin_mailbox_poller;
 pub use mesh_sync::{
     apply_grant_revoke, apply_kick_notice_local, apply_kick_target, apply_membership,
     apply_membership_gossip, build_announce, build_grant_revoke, build_snapshot, bump_mesh_dirty,
