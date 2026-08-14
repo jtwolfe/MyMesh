@@ -50,7 +50,7 @@ After a successful link, the allowlist is identity-based. A laptop that leaves h
 |------|-------------|
 | **Hex** | Canonical 32-byte public key, 64 hex characters |
 | **Words** | BIP39 English, **24 words**, same 32 bytes + checksum |
-| **URI** | `mymesh:v1:join:<hex>` — for QR generators / future scanners |
+| **URI** | `mymesh:v1:join:<hex>` — for QR generators |
 
 ```bash
 mymesh id
@@ -137,62 +137,15 @@ The kickee then sends **KickLeaveAck** to all known peers so the mesh converges.
 
 ---
 
-## Connect-by-carrier (default pair/v2)
-
-Phone acts as a **scanner / approver only** (not a mesh node). See [USAGE.md](USAGE.md) and [ALPHA-3.md](ALPHA-3.md).
-
-```bash
-mymesh serve                # machine A — owns /pair/v2 + /mesh/v1 on :17878
-# TUI arms QR_A via MMA1 (or: mymesh pair dual --host http://<lan>:17878)
-# mymesh carrier            # lab-only if serve is down; refuses when serve owns :17878
-# mymesh carrier --pair-v1  # escape: alpha.1 pair/v1 LAN QR
-mymesh id --uri             # machine B → phone page / link
-```
-
-### Pair v1 (compat escape)
-
-| Field | Behavior |
-|-------|----------|
-| QR | `carrier://pair?v=1&host=<LAN>&token&fp&mesh` via lab `mymesh carrier --pair-v1` |
-| `host` | **Required** |
-| Endpoints | `/pair/v1/status`, `pending`, `decide` (still served) |
-| Decide | Phone HTTP to host; L2 step-up on Carrier |
-| Outcome | JoinStore decision → member Accept + **full** membership snapshot |
-
-### Pair v2 (S0 contract — implement S1–S2)
-
-Internet-first product path: **optional** `host`, required session **nonce**, dual-scan + **confirm-on-machine** when phone cannot reach pair HTTP. Full freeze: **[PAIR-V2.md](PAIR-V2.md)**.
-
-| | pair/v1 (alpha) | pair/v2 (next) |
-|--|-----------------|----------------|
-| `host` | Required | Optional |
-| `nonce` | — | **Required** (16B base64url) |
-| `sid` / `did` / `ep` | — | Required |
-| Zero-HTTP decide | — | Confirm codes (Crockford **4-4**, e.g. `ABCD-EFGH`) |
-| Unbound confirm | — | **`not_bound` fail closed** (no hang) |
-| Endpoints | `/pair/v1/*` | `/pair/v2/*` + v1 compat |
-
-```text
-# v2 QR sketch
-carrier://pair?v=2&sid=<ulid>&did=<64hex>&token=<b64url>&nonce=<b64url-16B>&fp=<fp>
-                 &ep=direct|confirm|relay&host=<optional>&mesh=<optional>
-```
-
-CLI (implemented): `mymesh pair dual`, `pair dual --join`, `pair confirm <code>`, `pair status`, `pair retry`. E2E demo steps and lab honesty: **[DEMO-PAIR.md](DEMO-PAIR.md)**.
-
-**Migration policy:** v1 accepted through compat window; `pair dual` emits v2 after A3; serve-owned `/pair/v2` after F4p; lab `mymesh carrier` defaults to v2 after D5 with `--pair-v1` escape. Details in [PAIR-V2.md](PAIR-V2.md) and [CARRIER-NEXT.md](CARRIER-NEXT.md) Appendix A.
-
----
-
-## Ceremonies catalog (S0)
+## Linking ceremonies
 
 | Ceremony | Phone? | Success |
 |----------|--------|---------|
-| **CLI link** | No | Both Trusted **members**; full roster snapshot |
-| **Single-host pair (v1/v2 direct)** | Yes if Carrier decide; or CLI accept | Member join + full snapshot |
-| **Dual-scan + confirm** | Scan UX needs phone; confirm can be operator-only | Bound session → decided → iroh complete |
+| **CLI link** (24-word / hex) | No | Both Trusted **members**; full roster snapshot |
 | **Guest share** | Optional | Bilateral trust + Grant; **no full roster** — [GUEST.md](GUEST.md) |
 | **Master key bootstrap** | No | [MASTER-KEY.md](MASTER-KEY.md) |
+
+**Note:** Carrier HTTP pairing (`pair/v1`, `pair/v2`, `/mesh/v1`) removed per [REWORK-UNIFY.md](REWORK-UNIFY.md). 24-word device-to-device join is the primary pairing mechanism.
 
 ---
 
@@ -206,11 +159,10 @@ CLI (implemented): `mymesh pair dual`, `pair dual --join`, `pair confirm <code>`
 
 ## See also
 
-- [PAIR-V2.md](PAIR-V2.md) — pair v2 wire, nonce, confirm 4-4 Crockford, `not_bound`  
 - [MASTER-KEY.md](MASTER-KEY.md) — mesh master key / policy root  
 - [GRANTS.md](GRANTS.md) — grant schema  
 - [GUEST.md](GUEST.md) — guest membership; no full roster  
 - [SECURITY.md](SECURITY.md) — trust and arming model  
-- [CARRIER-NEXT.md](CARRIER-NEXT.md) — full S0–S9 design  
+- [REWORK-UNIFY.md](REWORK-UNIFY.md) — design direction  
 - [ROADMAP.md](ROADMAP.md) — release plan  
-- [USAGE.md](USAGE.md) / [ALPHA-3.md](ALPHA-3.md) — carrier and magic plane  
+- [USAGE.md](USAGE.md) / [ALPHA-3.md](ALPHA-3.md) — magic plane  

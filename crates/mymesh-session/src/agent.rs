@@ -153,22 +153,6 @@ impl Agent {
         Identity::from_secret_bytes(self.secret)
     }
 
-    /// KD-F16: bind pair/v2 + mesh/v1 in-process. Serve owns `:17878`.
-    pub async fn spawn_pair_http(
-        &self,
-        paths: &Paths,
-        port: u16,
-    ) -> anyhow::Result<crate::carrier::PairHttpHandle> {
-        crate::carrier::start_pair_http(
-            paths.clone(),
-            &self.identity(),
-            self.label.clone(),
-            port,
-            None,
-        )
-        .await
-    }
-
     fn store(&self) -> Result<DeviceStore> {
         DeviceStore::open(&self.devices_path)
     }

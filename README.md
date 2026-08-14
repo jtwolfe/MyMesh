@@ -28,7 +28,6 @@ Inspired by **Signal linked devices** (explicit trust) and **Syncthing** (dial b
 | **SSH over mesh** | `ssh-config` + `proxy-ssh` → peer `127.0.0.1:22` |
 | **TCP tunnels** | `expose`, magic auto-ports, SOCKS5 for browsers |
 | **Userspace DNS** | `127.0.0.1:5353` answers `*.mym` (not system-wide by default) |
-| **Connect-by-carrier** | Phone scans QR; phone is **not** a mesh node |
 | **Firewall helpers** | Explicit `mymesh firewall …` for ufw/firewalld (never auto-open) |
 | **TUI** | Default when you run `mymesh` with no args |
 
@@ -40,7 +39,6 @@ Inspired by **Signal linked devices** (explicit trust) and **Syncthing** (dial b
 | Full L3 VPN / TUN | Not a goal for alpha.3 |
 | Desktop / remote GUI control | Stub only |
 | Native GUI / web admin | Not built (TUI is the UI) |
-| Android “carrier as mesh node” app | Future |
 | Packages (deb/rpm/AUR) + one-line curl installer | Planned |
 | CI (Linux) | Workflow present, **disabled** |
 | Stable API / CLI freeze | **No** — alpha |
@@ -150,10 +148,10 @@ Linking model: **[docs/JOIN.md](docs/JOIN.md)**
 
 | Doc | Contents |
 |-----|----------|
-| **[docs/REWORK-UNIFY.md](docs/REWORK-UNIFY.md)** | Design: unify carrier + MyMesh |
+| **[docs/REWORK-UNIFY.md](docs/REWORK-UNIFY.md)** | Design: strip carrier, unify pairing |
 | **[docs/USAGE.md](docs/USAGE.md)** | Comprehensive CLI + TUI + SSH + SOCKS + ops |
 | [docs/ALPHA-3.md](docs/ALPHA-3.md) | Magic plane design & limits |
-| [docs/JOIN.md](docs/JOIN.md) | Arming, ids, carrier, SPAKE, pair v1→v2 migration |
+| [docs/JOIN.md](docs/JOIN.md) | Arming, device ids, 24-word join, SPAKE |
 | [docs/PAIR-V2.md](docs/PAIR-V2.md) | S0: pair v2 wire, nonce, confirm 4-4, not_bound |
 | [docs/DEMO-PAIR.md](docs/DEMO-PAIR.md) | Wave A E2E: dual-scan+confirm; mock-pair-host lab-only |
 | [docs/MASTER-KEY.md](docs/MASTER-KEY.md) | S0: mesh master key / policy root |
@@ -182,7 +180,7 @@ crates/
   mymesh-crypto    identity, SPAKE2, 24-word ids
   mymesh-protocol  frames + messages
   mymesh-net       iroh transport, dial proxy, mailboxes
-  mymesh-session   join, agent, mesh sync, magic, carrier, TCP tunnel
+  mymesh-session   join, agent, mesh sync, magic, TCP tunnel
   mymesh-terminal  PTY host/client
   mymesh-files     sandboxed transfer
   mymesh-desktop   stub (deferred)
@@ -209,7 +207,7 @@ Threat model and S9 controls **C1–C7** (session fixation, wrong joiner, backup
 |---------|--------|
 | **v0.1.0-alpha.1** | Link + shell + cp |
 | **v0.1.0-alpha.2** | Install, TUI, mesh gossip, kick |
-| **v0.1.0-alpha.3** | Magic names, SSH, SOCKS, carrier, labels (**this**) |
+| **v0.1.0-alpha.3** | Magic names, SSH, SOCKS, labels (**this**) |
 | Later | System DNS helper, packages, GUI, desktop, CI |
 
 ---
