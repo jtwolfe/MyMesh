@@ -209,7 +209,6 @@ impl PeerConnection for IrohConn {
     }
 
     async fn recv_raw(&self) -> Result<Vec<u8>> {
-        use tokio::io::AsyncReadExt;
         let mut recv = self.recv.lock().await;
         let mut len_buf = [0u8; 4];
         recv.read_exact(&mut len_buf)

@@ -1805,8 +1805,8 @@ async fn cmd_enroll_start(paths: &Paths, _timeout: u64) -> Result<()> {
                 match alpn {
                     AcceptedAlpn::Enroll => {
                         // Create a challenge prompt callback that reads from stdin
-                        let prompt_fn: mymesh_session::ChallengePromptFn =
-                            Box::new(|_phone_digits| {
+                        let prompt_fn: mymesh_session::ChallengePromptFn = Box::new(
+                            |_phone_digits| {
                                 Box::pin(async move {
                                     println!();
                                     println!(
@@ -1826,7 +1826,8 @@ async fn cmd_enroll_start(paths: &Paths, _timeout: u64) -> Result<()> {
                                     })?;
                                     Ok(input.trim().to_string())
                                 })
-                            });
+                            },
+                        );
 
                         let outcome = handle_enroll_connection(
                             conn,

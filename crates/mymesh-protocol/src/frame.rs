@@ -89,7 +89,9 @@ pub const MAX_JSON_MSG_BYTES: usize = 1024 * 1024;
 pub fn encode_json_msg<T: Serialize>(msg: &T) -> mymesh_core::Result<Bytes> {
     let json = serde_json::to_vec(msg).map_err(|e| mymesh_core::Error::Protocol(e.to_string()))?;
     if json.len() > MAX_JSON_MSG_BYTES {
-        return Err(mymesh_core::Error::Protocol("JSON message too large".into()));
+        return Err(mymesh_core::Error::Protocol(
+            "JSON message too large".into(),
+        ));
     }
     let len = json.len() as u32;
     let mut out = BytesMut::with_capacity(4 + json.len());

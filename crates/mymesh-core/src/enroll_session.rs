@@ -369,9 +369,7 @@ mod tests {
         let err = sess.verify_phone_challenge("12345", "12345").unwrap_err();
         assert!(err.to_string().contains("6 digits"));
 
-        let err = sess
-            .verify_phone_challenge("12345a", "12345a")
-            .unwrap_err();
+        let err = sess.verify_phone_challenge("12345a", "12345a").unwrap_err();
         assert!(err.to_string().contains("6 digits"));
     }
 
@@ -425,9 +423,7 @@ mod tests {
         let did = DeviceId::from_bytes([0x42u8; 32]);
         let mut sess = EnrollSession::new(did);
         sess.expires_at = Utc::now() - Duration::seconds(1);
-        let err = sess
-            .verify_phone_challenge("123456", "123456")
-            .unwrap_err();
+        let err = sess.verify_phone_challenge("123456", "123456").unwrap_err();
         assert!(err.to_string().contains("expired"));
     }
 }

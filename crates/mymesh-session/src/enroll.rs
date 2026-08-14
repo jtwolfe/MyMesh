@@ -337,7 +337,9 @@ async fn send_json_msg<M: serde::Serialize>(conn: &dyn PeerConnection, msg: &M) 
 async fn recv_json_msg<M: serde::de::DeserializeOwned>(conn: &dyn PeerConnection) -> Result<M> {
     let data = conn.recv_raw().await?;
     if data.len() < 4 {
-        return Err(Error::Protocol("message too short for length prefix".into()));
+        return Err(Error::Protocol(
+            "message too short for length prefix".into(),
+        ));
     }
     let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
     if data.len() < 4 + len {
@@ -592,9 +594,7 @@ mod tests {
         let (node_res, carrier_res) = tokio::join!(node_task, carrier_task);
         assert_eq!(node_res.unwrap().unwrap(), EnrollOutcome::Denied);
         match carrier_res.unwrap() {
-            EnrollMessage::Result {
-                success, error, ..
-            } => {
+            EnrollMessage::Result { success, error, .. } => {
                 assert!(!success);
                 assert!(error.unwrap().contains("mismatch"));
             }
