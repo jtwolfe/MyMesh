@@ -441,8 +441,10 @@ pub enum TcpMessage {
 /// 4. Node verifies ticket + session not expired, sends `EnrollChallengeWaiting`
 /// 5. Carrier displays a 6-digit code on the phone, sends `EnrollChallengeOffer { digits }`
 /// 6. Node prompts human on stdin to type the digits; constant-time compare
-/// 7. On match: store owner, send `EnrollResult { success: true, device_id, device_label }`
+/// 7. On match: store owner, send `EnrollResult { success: true, device_id: "<hex>", device_label }`
 /// 8. On mismatch/timeout/expired: send `EnrollResult { success: false, error }`
+///
+/// Note: `device_id` in the result is a hex string (64 chars), matching the QR `device` field.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EnrollMessage {
@@ -465,12 +467,18 @@ pub enum EnrollMessage {
         digits: String,
     },
     /// Node → Carrier: enrollment result (step 7/8).
+    ///
+    /// Wire format example (success):
+    /// ```json
+    /// {"type":"result","success":true,"device_id":"<64 hex chars>","device_label":"my-node"}
+    /// ```
     Result {
         /// True if enrollment succeeded.
         success: bool,
-        /// Node device id (on success).
+        /// Node device id as hex string (64 chars, on success).
+        /// Same format as QR `device` field and DeviceId::Display.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        device_id: Option<DeviceId>,
+        device_id: Option<String>,
         /// Node label (on success).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device_label: Option<String>,
@@ -504,4 +512,61 @@ pub enum EnrollMessageLegacy {
     },
     /// Node → Carrier: enrollment denied.
     EnrollDeny { reason: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enroll_result_success_wire_format() {
+        // device_id must be a hex string, not a JSON array of numbers
+        let result = EnrollMessage::Result {
+            success: true,
+            device_id: Some("a1".repeat(32)), // 64 hex chars
+            device_label: Some("my-node".into()),
+            error: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        // Verify it's a string, not an array
+        assert!(json.contains(r#""device_id":"a1a1a1"#));
+        assert!(json.contains(r#""type":"result""#));
+        assert!(json.contains(r#""success":true"#));
+        assert!(json.contains(r#""device_label":"my-node""#));
+        // Verify it does NOT contain array brackets for device_id
+        assert!(!json.contains(r#""device_id":["#));
+
+        // Verify round-trip
+        let parsed: EnrollMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            EnrollMessage::Result {
+                success,
+                device_id,
+                device_label,
+                error,
+            } => {
+                assert!(success);
+                assert_eq!(device_id, Some("a1".repeat(32)));
+                assert_eq!(device_label.as_deref(), Some("my-node"));
+                assert!(error.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn enroll_result_failure_wire_format() {
+        let result = EnrollMessage::Result {
+            success: false,
+            device_id: None,
+            device_label: None,
+            error: Some("challenge mismatch".into()),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains(r#""type":"result""#));
+        assert!(json.contains(r#""success":false"#));
+        assert!(json.contains(r#""error":"challenge mismatch""#));
+        // device_id should be omitted (skip_serializing_if = "Option::is_none")
+        assert!(!json.contains("device_id"));
+    }
 }

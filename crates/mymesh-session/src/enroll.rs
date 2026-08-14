@@ -222,7 +222,7 @@ pub async fn handle_enroll_connection(
 
             let result = EnrollMessage::Result {
                 success: true,
-                device_id: Some(device_id),
+                device_id: Some(hex::encode(device_id.as_bytes())),
                 device_label: Some(label.to_string()),
                 error: None,
             };
@@ -518,7 +518,8 @@ mod tests {
                 ..
             } => {
                 assert!(success);
-                assert_eq!(device_id, Some(node_id));
+                // device_id is now a hex string (64 chars)
+                assert_eq!(device_id, Some(hex::encode(node_id.as_bytes())));
                 assert_eq!(device_label.as_deref(), Some("test-node"));
             }
             other => panic!("expected Result success, got {other:?}"),
