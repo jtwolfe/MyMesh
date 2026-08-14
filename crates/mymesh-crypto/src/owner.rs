@@ -6,8 +6,8 @@
 //! - Agent co-sign (MRK unlocked) or CLI `allow-claim` window
 //! - Sealed backup: independent password-AEAD (MRK does **not** wrap person seed)
 
-use crate::master_key::{derive_wrap_key, KdfParams, DEFAULT_M_KIB, DEFAULT_P, DEFAULT_T};
 use crate::identity::{Identity, IdentityPublic};
+use crate::master_key::{derive_wrap_key, KdfParams, DEFAULT_M_KIB, DEFAULT_P, DEFAULT_T};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -50,7 +50,9 @@ pub fn owner_claim_preimage(
     let mesh_b = mesh_id.as_bytes();
     let person_b = person_id.as_bytes();
     if mesh_b.len() > u16::MAX as usize {
-        return Err(Error::MasterKey("mesh_id too long for claim preimage".into()));
+        return Err(Error::MasterKey(
+            "mesh_id too long for claim preimage".into(),
+        ));
     }
     if person_b.len() > u16::MAX as usize {
         return Err(Error::MasterKey(
@@ -79,11 +81,7 @@ pub fn owner_claim_preimage(
 }
 
 /// Verify person Ed25519 signature over the claim preimage.
-pub fn verify_owner_claim_sig(
-    person_pk: &[u8; 32],
-    preimage: &[u8],
-    sig: &[u8; 64],
-) -> Result<()> {
+pub fn verify_owner_claim_sig(person_pk: &[u8; 32], preimage: &[u8], sig: &[u8; 64]) -> Result<()> {
     let pubk = IdentityPublic {
         verifying_key: *person_pk,
     };
@@ -331,13 +329,17 @@ pub fn accept_owner_claim(
     out_path: impl AsRef<Path>,
 ) -> Result<MeshOwnerFile> {
     if mrk_fingerprint.is_empty() {
-        return Err(Error::MasterKey("mrk_fingerprint required for claim".into()));
+        return Err(Error::MasterKey(
+            "mrk_fingerprint required for claim".into(),
+        ));
     }
 
     // Replace / second-claim policy.
     if let Some(prev) = existing {
         let same_person = prev.person_id == req.person_id
-            && prev.person_public_key_hex.eq_ignore_ascii_case(&req.person_public_key_hex);
+            && prev
+                .person_public_key_hex
+                .eq_ignore_ascii_case(&req.person_public_key_hex);
         if same_person {
             // Idempotent: return existing without rewrite if sig matches, else rewrite.
             return Ok(prev.clone());
@@ -499,12 +501,13 @@ pub fn seal_owner_backup(
     if password.is_empty() {
         return Err(Error::MasterKey("backup password must not be empty".into()));
     }
-    let params = params.unwrap_or(KdfParams {
-        m: DEFAULT_M_KIB,
-        t: DEFAULT_T,
-        p: DEFAULT_P,
-    })
-    .validate()?;
+    let params = params
+        .unwrap_or(KdfParams {
+            m: DEFAULT_M_KIB,
+            t: DEFAULT_T,
+            p: DEFAULT_P,
+        })
+        .validate()?;
     let mut salt = [0u8; SALT_LEN];
     let mut nonce = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut salt);
@@ -575,7 +578,9 @@ pub fn unseal_owner_backup(
 
     let plain = cipher
         .decrypt(XNonce::from_slice(&nonce), ct.as_ref())
-        .map_err(|_| Error::MasterKey("wrong backup password or corrupt owner-backup.sealed".into()))?;
+        .map_err(|_| {
+            Error::MasterKey("wrong backup password or corrupt owner-backup.sealed".into())
+        })?;
     unpack_backup_plaintext(&plain)
 }
 
@@ -590,9 +595,7 @@ impl OwnerBackupSealed {
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        Self::try_load(path)?.ok_or_else(|| {
-            Error::NotFound("owner-backup.sealed missing".into())
-        })
+        Self::try_load(path)?.ok_or_else(|| Error::NotFound("owner-backup.sealed missing".into()))
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
@@ -666,18 +669,15 @@ mod tests {
     fn claim_preimage_domain_and_roundtrip_sig() {
         let person = Identity::generate();
         let pk = person.verifying_key_bytes();
-        let pre = owner_claim_preimage(
-            "mesh-uuid-1",
-            "01PERSON",
-            &pk,
-            "deadbeef",
-            1_700_000_000,
-        )
-        .unwrap();
+        let pre = owner_claim_preimage("mesh-uuid-1", "01PERSON", &pk, "deadbeef", 1_700_000_000)
+            .unwrap();
         assert!(pre.starts_with(OWNER_CLAIM_DOMAIN));
         // mesh_id length prefix
         assert_eq!(
-            u16::from_le_bytes([pre[OWNER_CLAIM_DOMAIN.len()], pre[OWNER_CLAIM_DOMAIN.len() + 1]]),
+            u16::from_le_bytes([
+                pre[OWNER_CLAIM_DOMAIN.len()],
+                pre[OWNER_CLAIM_DOMAIN.len() + 1]
+            ]),
             "mesh-uuid-1".len() as u16
         );
         let sig = sign_owner_claim(&person, &pre);
@@ -721,13 +721,11 @@ mod tests {
         assert!(check_claim_authorized(&runtime_path, &window_path).is_err());
 
         // Unlock MMK → co-sign path.
-        MmkRuntime::from_mrk(&init.mrk)
-            .save(&runtime_path)
-            .unwrap();
+        MmkRuntime::from_mrk(&init.mrk).save(&runtime_path).unwrap();
         let auth = check_claim_authorized(&runtime_path, &window_path).unwrap();
         assert_eq!(auth, ClaimAuthMethod::MrkUnlocked);
-        let claim_fp = resolve_claim_fingerprint(auth, &runtime_path, &window_path, &master_path)
-            .unwrap();
+        let claim_fp =
+            resolve_claim_fingerprint(auth, &runtime_path, &window_path, &master_path).unwrap();
         let file = accept_owner_claim(&req, &claim_fp, auth, None, &owner_path).unwrap();
         assert_eq!(file.person_id, "pid-1");
         assert_eq!(file.mrk_fingerprint, fp);
@@ -751,7 +749,9 @@ mod tests {
         };
         let existing = MeshOwnerFile::load(&owner_path).unwrap();
         let err = accept_owner_claim(&req2, &fp, auth, Some(&existing), &owner_path).unwrap_err();
-        assert!(err.to_string().contains("already claimed") || err.to_string().contains("Permission"));
+        assert!(
+            err.to_string().contains("already claimed") || err.to_string().contains("Permission")
+        );
     }
 
     #[test]
@@ -767,9 +767,7 @@ mod tests {
         let fp = init.mrk.fingerprint();
 
         // Mint window while "unlocked", then no runtime (simulates lock after allow-claim).
-        ClaimWindowFile::mint(&fp, 300)
-            .save(&window_path)
-            .unwrap();
+        ClaimWindowFile::mint(&fp, 300).save(&window_path).unwrap();
         assert!(!runtime_path.exists());
 
         let auth = check_claim_authorized(&runtime_path, &window_path).unwrap();

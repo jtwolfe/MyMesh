@@ -41,7 +41,13 @@ impl FsMailbox {
         };
         let safe: String = code
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         self.root.join(format!("{safe}.{lane}.jsonl"))
     }
@@ -76,8 +82,8 @@ impl Rendezvous for FsMailbox {
                 let raw = std::fs::read_to_string(&path)?;
                 let mut lines: Vec<&str> = raw.lines().filter(|l| !l.is_empty()).collect();
                 if let Some(first) = lines.first().copied() {
-                    let msg: PairingMessage = serde_json::from_str(first)
-                        .map_err(|e| Error::Protocol(e.to_string()))?;
+                    let msg: PairingMessage =
+                        serde_json::from_str(first).map_err(|e| Error::Protocol(e.to_string()))?;
                     lines.remove(0);
                     let rest = lines.join("\n");
                     if rest.is_empty() {

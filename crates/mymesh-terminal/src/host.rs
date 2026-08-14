@@ -107,7 +107,7 @@ impl TerminalHost {
                 }
                 killer_bg.kill();
             })
-            .map_err(|e| Error::Io(e))?;
+            .map_err(Error::Io)?;
 
         Ok((
             Self {

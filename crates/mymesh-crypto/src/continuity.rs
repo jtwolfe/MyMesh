@@ -320,11 +320,9 @@ fn open_from_host_x25519(
         .map_err(|e| ContinuityError::Crypto(format!("wrap cipher: {e}")))?;
     key.zeroize();
 
-    cipher
-        .decrypt(XNonce::from_slice(&nonce), ct)
-        .map_err(|_| {
-            ContinuityError::Crypto("wrap decrypt failed (wrong host key or corrupt)".into())
-        })
+    cipher.decrypt(XNonce::from_slice(&nonce), ct).map_err(|_| {
+        ContinuityError::Crypto("wrap decrypt failed (wrong host key or corrupt)".into())
+    })
 }
 
 // ── Payload AEAD ────────────────────────────────────────────────────────────
@@ -404,12 +402,9 @@ fn hex_eq_fold(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.bytes()
-        .zip(b.bytes())
-        .fold(0u8, |acc, (x, y)| {
-            acc | (x.to_ascii_lowercase() ^ y.to_ascii_lowercase())
-        })
-        == 0
+    a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| {
+        acc | (x.to_ascii_lowercase() ^ y.to_ascii_lowercase())
+    }) == 0
 }
 
 // ── Public seal / open API ──────────────────────────────────────────────────

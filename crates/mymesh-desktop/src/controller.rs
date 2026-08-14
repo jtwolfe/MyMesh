@@ -9,7 +9,6 @@ pub struct DesktopController {
     running: bool,
 }
 
-
 impl DesktopController {
     pub fn handle(&mut self, msg: DesktopMessage) -> Result<Vec<DesktopMessage>> {
         match msg {

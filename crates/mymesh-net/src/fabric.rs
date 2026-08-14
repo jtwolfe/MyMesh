@@ -7,18 +7,10 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
+#[derive(Default)]
 struct Inbox {
     queue: VecDeque<Box<dyn PeerConnection>>,
     waiters: VecDeque<oneshot::Sender<Box<dyn PeerConnection>>>,
-}
-
-impl Default for Inbox {
-    fn default() -> Self {
-        Self {
-            queue: VecDeque::new(),
-            waiters: VecDeque::new(),
-        }
-    }
 }
 
 /// Shared registry of local endpoints for same-process / test networking.

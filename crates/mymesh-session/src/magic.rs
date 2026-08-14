@@ -276,7 +276,7 @@ impl MagicPlane {
         loop {
             let map = self.name_map();
             let mut peers: HashMap<DeviceId, Ipv4Addr> = HashMap::new();
-            for (_n, (id, ip)) in &map {
+            for (id, ip) in map.values() {
                 peers.insert(*id, *ip);
             }
             for (id, ip) in peers {
@@ -300,18 +300,13 @@ impl MagicPlane {
                             }
                         };
                         info!(%addr, peer = %id.short(), "magic port forward");
-                        loop {
-                            match listener.accept().await {
-                                Ok((sock, _)) => {
-                                    let this2 = this.clone();
-                                    tokio::spawn(async move {
-                                        if let Err(e) = this2.open_tunnel(id, port, sock).await {
-                                            debug!(%e, "tunnel end");
-                                        }
-                                    });
+                        while let Ok((sock, _)) = listener.accept().await {
+                            let this2 = this.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = this2.open_tunnel(id, port, sock).await {
+                                    debug!(%e, "tunnel end");
                                 }
-                                Err(_) => break,
-                            }
+                            });
                         }
                         this.active_binds.lock().await.remove(&addr);
                     });

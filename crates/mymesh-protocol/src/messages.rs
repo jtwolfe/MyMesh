@@ -194,6 +194,31 @@ pub enum ControlMessage {
         #[serde(with = "crate::ser_fixed::array64")]
         signature: [u8; 64],
     },
+    /// Owner → node: revoke a person enrollment (node forgets this owner).
+    OwnerRevoke {
+        /// Person id to revoke.
+        person_id: String,
+        /// Requesting owner's person id (must match an enrolled owner).
+        by_person_id: String,
+        ts: i64,
+        /// Signature over owner_revoke preimage.
+        #[serde(with = "crate::ser_fixed::array64")]
+        signature: [u8; 64],
+    },
+    /// Owner → node: update an enrolled owner's display name or label.
+    OwnerUpdate {
+        /// Person id to update.
+        person_id: String,
+        /// New display label (if any).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        /// Requesting owner's person id.
+        by_person_id: String,
+        ts: i64,
+        /// Signature over owner_update preimage.
+        #[serde(with = "crate::ser_fixed::array64")]
+        signature: [u8; 64],
+    },
 }
 
 /// Wire form of a mesh member (protocol crate — mirrors core::MeshMember fields).
@@ -433,7 +458,5 @@ pub enum EnrollMessage {
         label: String,
     },
     /// Node → Carrier: enrollment denied.
-    EnrollDeny {
-        reason: String,
-    },
+    EnrollDeny { reason: String },
 }

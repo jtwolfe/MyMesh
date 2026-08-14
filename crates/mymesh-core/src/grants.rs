@@ -146,10 +146,7 @@ impl AllowContext {
         self
     }
 
-    pub fn with_locations(
-        mut self,
-        tags: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
+    pub fn with_locations(mut self, tags: impl IntoIterator<Item = impl Into<String>>) -> Self {
         for tag in tags {
             self = self.with_location(tag);
         }
@@ -481,15 +478,7 @@ pub fn allows_with(
     cap: &Capability,
     ctx: &AllowContext,
 ) -> bool {
-    allows_at(
-        devices,
-        grants,
-        local_device_id,
-        peer,
-        cap,
-        Utc::now(),
-        ctx,
-    )
+    allows_at(devices, grants, local_device_id, peer, cap, Utc::now(), ctx)
 }
 
 /// Same as [`allows`] with an explicit clock (tests). Default empty context.
@@ -869,8 +858,7 @@ mod tests {
     #[test]
     fn identity_facet_required_fail_closed_missing_and_mismatch() {
         let dir = temp_dir("facet-req");
-        let (devices, grants, local, gid) =
-            guest_with_grant(&dir, Some(IdentityFacet::Work), None);
+        let (devices, grants, local, gid) = guest_with_grant(&dir, Some(IdentityFacet::Work), None);
 
         // No facet presented → deny
         assert!(!allows(

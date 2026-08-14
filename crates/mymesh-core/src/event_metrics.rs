@@ -57,13 +57,17 @@ impl EventCounters {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(Self::path(dir), std::fs::Permissions::from_mode(0o600));
+            let _ =
+                std::fs::set_permissions(Self::path(dir), std::fs::Permissions::from_mode(0o600));
         }
         Ok(())
     }
 
     pub fn inc_pair_decide(&mut self, result: &str) {
-        *self.pair_decide_total.entry(result.to_string()).or_insert(0) += 1;
+        *self
+            .pair_decide_total
+            .entry(result.to_string())
+            .or_insert(0) += 1;
     }
 
     pub fn inc_pair_status(&mut self) {

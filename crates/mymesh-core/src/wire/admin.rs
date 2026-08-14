@@ -369,6 +369,75 @@ pub fn person_enrolled_auth_preimage(
     out
 }
 
+/// Owner revoke preimage domain (carrier mesh owner operations).
+pub const OWNER_REVOKE_DOMAIN: &[u8] = b"mymesh-owner-revoke-v1";
+/// Owner update preimage domain.
+pub const OWNER_UPDATE_DOMAIN: &[u8] = b"mymesh-owner-update-v1";
+
+/// Canonical owner revoke preimage:
+///
+/// ```text
+/// mymesh-owner-revoke-v1
+///   || device_id_32
+///   || u16le(len) || person_id_utf8
+///   || u16le(len) || by_person_id_utf8
+///   || i64le(ts_unix)
+/// ```
+pub fn owner_revoke_preimage(
+    device_id: &[u8; 32],
+    person_id: &str,
+    by_person_id: &str,
+    ts_unix: i64,
+) -> Result<Vec<u8>, AdminWireError> {
+    let mut out = Vec::with_capacity(
+        OWNER_REVOKE_DOMAIN.len() + 32 + 2 + person_id.len() + 2 + by_person_id.len() + 8,
+    );
+    out.extend_from_slice(OWNER_REVOKE_DOMAIN);
+    out.extend_from_slice(device_id);
+    write_u16le_bytes(&mut out, person_id.as_bytes())?;
+    write_u16le_bytes(&mut out, by_person_id.as_bytes())?;
+    out.extend_from_slice(&ts_unix.to_le_bytes());
+    Ok(out)
+}
+
+/// Canonical owner update preimage:
+///
+/// ```text
+/// mymesh-owner-update-v1
+///   || device_id_32
+///   || u16le(len) || person_id_utf8
+///   || u16le(len) || label_utf8_or_empty
+///   || u16le(len) || by_person_id_utf8
+///   || i64le(ts_unix)
+/// ```
+pub fn owner_update_preimage(
+    device_id: &[u8; 32],
+    person_id: &str,
+    label: Option<&str>,
+    by_person_id: &str,
+    ts_unix: i64,
+) -> Result<Vec<u8>, AdminWireError> {
+    let label_str = label.unwrap_or("");
+    let mut out = Vec::with_capacity(
+        OWNER_UPDATE_DOMAIN.len()
+            + 32
+            + 2
+            + person_id.len()
+            + 2
+            + label_str.len()
+            + 2
+            + by_person_id.len()
+            + 8,
+    );
+    out.extend_from_slice(OWNER_UPDATE_DOMAIN);
+    out.extend_from_slice(device_id);
+    write_u16le_bytes(&mut out, person_id.as_bytes())?;
+    write_u16le_bytes(&mut out, label_str.as_bytes())?;
+    write_u16le_bytes(&mut out, by_person_id.as_bytes())?;
+    out.extend_from_slice(&ts_unix.to_le_bytes());
+    Ok(out)
+}
+
 /// Wire parse / preimage error. `code` is always `bad_request` (fail closed).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdminWireError {

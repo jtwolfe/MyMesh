@@ -3,9 +3,25 @@
 //! When a carrier (phone) scans the node's QR and connects using the enrollment
 //! ALPN, this handler verifies the ticket, checks that the challenge was confirmed
 //! locally, and either accepts or denies the enrollment.
+//!
+//! ## ALPN `mymesh-enroll/1` wire protocol
+//!
+//! The carrier sends an [`EnrollMessage::EnrollRequest`] containing:
+//! - `ticket`: one-time ticket from the QR code
+//! - `person_public_key_hex`: person's Ed25519 public key (hex)
+//! - `person_id`: person identity id (e.g. ULID)
+//! - `mesh_name`: display name for the mesh/person
+//!
+//! This matches the DESIGN protocol for QR+challenge enrollment. The node
+//! verifies the ticket against its pending session, checks the local challenge
+//! confirmation, stores the owner enrollment, and replies with `EnrollAccept`
+//! or `EnrollDeny`. Note: this handler bypasses the full `carrier-enroll-v1`
+//! signature verification because enrollment is via direct iroh connection
+//! with challenge confirmation—the carrier proves key ownership via the
+//! authenticated iroh/QUIC connection.
 
-use mymesh_core::{DeviceId, EnrollSessionFile, EnrollmentStore, Error, Paths, Result};
 use mymesh_core::wire::PersonFacet;
+use mymesh_core::{DeviceId, EnrollSessionFile, EnrollmentStore, Error, Paths, Result};
 use mymesh_crypto::Identity;
 use mymesh_net::PeerConnection;
 use mymesh_protocol::{decode_msg, encode_msg, EnrollMessage, Frame};
@@ -53,7 +69,7 @@ pub async fn handle_enroll_connection(
             let deny = EnrollMessage::EnrollDeny {
                 reason: "expected EnrollRequest".into(),
             };
-            let _ = send_msg(&conn, &deny).await;
+            let _ = send_msg(conn.as_ref(), &deny).await;
             let _ = conn.close().await;
             return Ok(EnrollOutcome::Denied);
         }
@@ -74,7 +90,7 @@ pub async fn handle_enroll_connection(
             let deny = EnrollMessage::EnrollDeny {
                 reason: "no pending enrollment session".into(),
             };
-            let _ = send_msg(&conn, &deny).await;
+            let _ = send_msg(conn.as_ref(), &deny).await;
             let _ = conn.close().await;
             return Ok(EnrollOutcome::Denied);
         }
@@ -89,7 +105,7 @@ pub async fn handle_enroll_connection(
         let deny = EnrollMessage::EnrollDeny {
             reason: "enrollment session expired".into(),
         };
-        let _ = send_msg(&conn, &deny).await;
+        let _ = send_msg(conn.as_ref(), &deny).await;
         let _ = conn.close().await;
         return Ok(EnrollOutcome::Denied);
     }
@@ -100,7 +116,7 @@ pub async fn handle_enroll_connection(
         let deny = EnrollMessage::EnrollDeny {
             reason: "invalid ticket".into(),
         };
-        let _ = send_msg(&conn, &deny).await;
+        let _ = send_msg(conn.as_ref(), &deny).await;
         let _ = conn.close().await;
         return Ok(EnrollOutcome::Denied);
     }
@@ -111,7 +127,7 @@ pub async fn handle_enroll_connection(
         let deny = EnrollMessage::EnrollDeny {
             reason: "challenge not confirmed on node".into(),
         };
-        let _ = send_msg(&conn, &deny).await;
+        let _ = send_msg(conn.as_ref(), &deny).await;
         let _ = conn.close().await;
         return Ok(EnrollOutcome::Denied);
     }
@@ -143,7 +159,7 @@ pub async fn handle_enroll_connection(
                 device_id,
                 label: label.to_string(),
             };
-            send_msg(&conn, &accept).await?;
+            send_msg(conn.as_ref(), &accept).await?;
             let _ = conn.close().await;
             Ok(EnrollOutcome::Accepted)
         }
@@ -152,7 +168,7 @@ pub async fn handle_enroll_connection(
             let deny = EnrollMessage::EnrollDeny {
                 reason: format!("enrollment failed: {e}"),
             };
-            let _ = send_msg(&conn, &deny).await;
+            let _ = send_msg(conn.as_ref(), &deny).await;
             let _ = conn.close().await;
             Ok(EnrollOutcome::Denied)
         }
@@ -202,7 +218,11 @@ fn store_enrollment(
     };
 
     // Check if already enrolled with this person_id
-    if let Some(pos) = file.enrollments.iter().position(|e| e.person_id == person_id) {
+    if let Some(pos) = file
+        .enrollments
+        .iter()
+        .position(|e| e.person_id == person_id)
+    {
         // Update existing
         file.enrollments[pos] = record;
     } else {
@@ -230,7 +250,7 @@ fn store_enrollment(
     Ok(())
 }
 
-async fn send_msg<M: serde::Serialize>(conn: &Box<dyn PeerConnection>, msg: &M) -> Result<()> {
+async fn send_msg<M: serde::Serialize>(conn: &dyn PeerConnection, msg: &M) -> Result<()> {
     conn.send_frame(Frame {
         channel: mymesh_protocol::ChannelId::control(),
         payload: encode_msg(msg)?,
@@ -299,7 +319,10 @@ mod tests {
 
         let (node_res, carrier_res) = tokio::join!(node_task, carrier_task);
         assert_eq!(node_res.unwrap().unwrap(), EnrollOutcome::Denied);
-        assert!(matches!(carrier_res.unwrap(), EnrollMessage::EnrollDeny { .. }));
+        assert!(matches!(
+            carrier_res.unwrap(),
+            EnrollMessage::EnrollDeny { .. }
+        ));
 
         let _ = std::fs::remove_dir_all(paths.data_dir);
     }

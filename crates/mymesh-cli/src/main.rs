@@ -14,7 +14,7 @@ use mymesh_core::wire::{CatalogRole, EnrollWriteBody};
 use mymesh_core::{
     not_after_days, parse_capabilities, parse_enroll_facet, read_enroll_sig_hex,
     status_pack as continuity_status_pack, wipe_pack as continuity_wipe_pack, ArmState, Capability,
-    Config, DeviceStore, EnrollmentStore, EnrollSession, EnrollSessionFile, GrantRole, GrantStore,
+    Config, DeviceStore, EnrollSession, EnrollSessionFile, EnrollmentStore, GrantRole, GrantStore,
     IssuedBy, JoinDecision, JoinStore, MembershipStore, MeshState, Paths,
 };
 use mymesh_crypto::{
@@ -32,7 +32,8 @@ use mymesh_net::{
 use mymesh_protocol::{decode_msg, encode_msg, ChannelId, FileMessage, Frame, TerminalMessage};
 use mymesh_session::{
     apply_kick_target, apply_membership_gossip, build_announce, handle_enroll_connection,
-    run_guest_pair, run_host_pair_code, run_join_as_guest, sign_kick, Agent, EnrollOutcome, Session,
+    run_guest_pair, run_host_pair_code, run_join_as_guest, sign_kick, Agent, EnrollOutcome,
+    Session,
 };
 use mymesh_terminal::TerminalClient;
 use std::net::SocketAddr;
@@ -1743,7 +1744,11 @@ async fn cmd_enroll_start(paths: &Paths, _timeout: u64) -> Result<()> {
     // Generate and display QR code
     let qr_json = qr_payload.to_json();
     if let Ok(code) = qrcode::QrCode::new(qr_json.as_bytes()) {
-        let image = code.render::<char>().quiet_zone(false).module_dimensions(2, 1).build();
+        let image = code
+            .render::<char>()
+            .quiet_zone(false)
+            .module_dimensions(2, 1)
+            .build();
         println!("{image}");
     } else {
         println!("QR: {qr_json}");
@@ -1752,9 +1757,14 @@ async fn cmd_enroll_start(paths: &Paths, _timeout: u64) -> Result<()> {
     println!();
     println!(
         "Challenge: {}",
-        style(format!("{} {} {}", &challenge[0..2], &challenge[2..4], &challenge[4..6]))
-            .bold()
-            .yellow()
+        style(format!(
+            "{} {} {}",
+            &challenge[0..2],
+            &challenge[2..4],
+            &challenge[4..6]
+        ))
+        .bold()
+        .yellow()
     );
     println!();
     println!("1. Scan the QR code with your phone (carrier app)");
@@ -1789,7 +1799,9 @@ async fn cmd_enroll_start(paths: &Paths, _timeout: u64) -> Result<()> {
     );
 
     // Start iroh transport and wait for enrollment connection
-    let transport = IrohTransport::bind(&identity).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let transport = IrohTransport::bind(&identity)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Wait for enrollment connection with timeout
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
@@ -1805,7 +1817,11 @@ async fn cmd_enroll_start(paths: &Paths, _timeout: u64) -> Result<()> {
             println!(
                 "{} enrolled {}",
                 style("success").green().bold(),
-                session_file.session.enrolled_person_id.as_deref().unwrap_or("(unknown)")
+                session_file
+                    .session
+                    .enrolled_person_id
+                    .as_deref()
+                    .unwrap_or("(unknown)")
             );
             transport.shutdown().await;
             return Ok(());
@@ -1819,36 +1835,41 @@ async fn cmd_enroll_start(paths: &Paths, _timeout: u64) -> Result<()> {
 
         // Accept with timeout
         let accept_fut = transport.accept_with_alpn();
-        let accept_result = tokio::time::timeout(std::time::Duration::from_secs(5), accept_fut).await;
+        let accept_result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), accept_fut).await;
 
         match accept_result {
             Ok(Ok((conn, alpn))) => {
                 match alpn {
                     AcceptedAlpn::Enroll => {
-                        let outcome = handle_enroll_connection(
-                            conn,
-                            &identity,
-                            &cfg.device_label,
-                            paths,
-                        )
-                        .await
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        let outcome =
+                            handle_enroll_connection(conn, &identity, &cfg.device_label, paths)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("{e}"))?;
 
                         match outcome {
                             EnrollOutcome::Accepted => {
                                 // Reload session to get the enrolled person id
-                                let session_file = EnrollSessionFile::load(paths.enroll_session_file())?;
+                                let session_file =
+                                    EnrollSessionFile::load(paths.enroll_session_file())?;
                                 println!();
                                 println!(
                                     "{} device owned by {}",
                                     style("success").green().bold(),
-                                    session_file.session.enrolled_person_id.as_deref().unwrap_or("(unknown)")
+                                    session_file
+                                        .session
+                                        .enrolled_person_id
+                                        .as_deref()
+                                        .unwrap_or("(unknown)")
                                 );
                                 transport.shutdown().await;
                                 return Ok(());
                             }
                             EnrollOutcome::Denied => {
-                                println!("{} enrollment denied (invalid ticket or not confirmed)", style("error").red().bold());
+                                println!(
+                                    "{} enrollment denied (invalid ticket or not confirmed)",
+                                    style("error").red().bold()
+                                );
                                 // Continue waiting for another attempt
                             }
                         }
@@ -1908,7 +1929,10 @@ fn cmd_enroll_status(paths: &Paths) -> Result<()> {
 
 fn cmd_enroll_cancel(paths: &Paths) -> Result<()> {
     if EnrollSessionFile::clear(paths.enroll_session_file())? {
-        println!("{} enrollment session cancelled", style("ok").green().bold());
+        println!(
+            "{} enrollment session cancelled",
+            style("ok").green().bold()
+        );
     } else {
         println!("No pending enrollment session.");
     }

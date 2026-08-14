@@ -15,15 +15,15 @@ pub async fn cmd_hosts(paths: &Paths, group: Option<String>) -> Result<()> {
     let id = Identity::load_or_create(paths.identity_file())?;
     let local = id.device_id();
     println!(
-        "{:<18} {:<16} {:<14} {}",
-        "NAME", "MESH-IP", "ID", "ALIASES/GROUPS"
+        "{:<18} {:<16} {:<14} ALIASES/GROUPS",
+        "NAME", "MESH-IP", "ID"
     );
     println!(
-        "{:<18} {:<16} {:<14} {}",
+        "{:<18} {:<16} {:<14} *.{domain}",
         format!("{} (self)", cfg.device_label),
         mesh_ip_string(&local),
         local.short(),
-        format!("*.{domain}")
+        domain = domain
     );
     for d in store.list() {
         if d.trust != TrustState::Trusted {

@@ -27,7 +27,7 @@ struct Lane {
 }
 
 enum Pending {
-    Ready(PairingMessage),
+    Ready(Box<PairingMessage>),
     Wait(oneshot::Receiver<PairingMessage>),
 }
 
@@ -42,7 +42,7 @@ impl Lane {
 
     fn take_or_wait(&mut self) -> Pending {
         if let Some(msg) = self.queue.pop_front() {
-            Pending::Ready(msg)
+            Pending::Ready(Box::new(msg))
         } else {
             let (tx, rx) = oneshot::channel();
             self.waiters.push_back(tx);
@@ -102,7 +102,7 @@ impl Rendezvous for LocalRendezvous {
             }
         };
         match pending {
-            Pending::Ready(msg) => Ok(msg),
+            Pending::Ready(msg) => Ok(*msg),
             Pending::Wait(rx) => rx
                 .await
                 .map_err(|_| Error::Pairing("rendezvous closed".into())),

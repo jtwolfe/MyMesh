@@ -254,7 +254,9 @@ pub fn check_direct_host_tls_pin(
     let Some(pin) = pin else {
         return Ok(());
     };
-    let spki = peer_spki_der.filter(|s| !s.is_empty()).ok_or(TlsPinError::Mismatch)?;
+    let spki = peer_spki_der
+        .filter(|s| !s.is_empty())
+        .ok_or(TlsPinError::Mismatch)?;
     verify_tls_pin(pin, spki)
 }
 
@@ -265,7 +267,7 @@ mod tests {
     fn sample_spki(seed: u8) -> Vec<u8> {
         // Synthetic DER-ish bytes (not a real SPKI); pin is over opaque SPKI DER.
         let mut v = vec![0x30, 0x82, 0x01, 0x22]; // SEQUENCE header-ish
-        v.extend(std::iter::repeat(seed).take(64));
+        v.extend(std::iter::repeat_n(seed, 64));
         v
     }
 
@@ -350,12 +352,10 @@ mod tests {
         // no pin → ok
         assert!(check_direct_host_tls_pin(None, Some("http://x"), None).is_ok());
         // pin + https + match
-        assert!(check_direct_host_tls_pin(
-            Some(&pin),
-            Some("https://example:8443"),
-            Some(&spki)
-        )
-        .is_ok());
+        assert!(
+            check_direct_host_tls_pin(Some(&pin), Some("https://example:8443"), Some(&spki))
+                .is_ok()
+        );
         // pin + http → https required
         assert_eq!(
             check_direct_host_tls_pin(Some(&pin), Some("http://x"), Some(&spki)).unwrap_err(),
@@ -373,12 +373,8 @@ mod tests {
         );
         // pin + https + wrong spki
         assert_eq!(
-            check_direct_host_tls_pin(
-                Some(&pin),
-                Some("https://x"),
-                Some(&sample_spki(9))
-            )
-            .unwrap_err(),
+            check_direct_host_tls_pin(Some(&pin), Some("https://x"), Some(&sample_spki(9)))
+                .unwrap_err(),
             TlsPinError::Mismatch
         );
         // pin + empty host string → https required

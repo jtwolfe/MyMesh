@@ -38,7 +38,9 @@ MyMesh typically does NOT require firewall rules because:
   mymesh firewall firewalld
 "#,
         style("MyMesh firewall helper").bold(),
-        style("Loopback-only (no firewall rule needed)").cyan().bold(),
+        style("Loopback-only (no firewall rule needed)")
+            .cyan()
+            .bold(),
         style("About SSH / mesh").cyan().bold(),
         style("Commands").cyan().bold(),
     );

@@ -33,6 +33,7 @@ pub struct Agent {
     label: String,
     devices_path: PathBuf,
     grants_path: PathBuf,
+    enrollments_path: PathBuf,
     arm_path: PathBuf,
     join_dir: PathBuf,
     mesh_path: PathBuf,
@@ -120,7 +121,8 @@ impl Agent {
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
-        let _ = EnrollmentStore::open_or_create(data_dir.join("enrollments.json"))?;
+        let enrollments_path = data_dir.join("enrollments.json");
+        let _ = EnrollmentStore::open_or_create(&enrollments_path)?;
         // Serve owns admin-nonces.json (F4p). Replay consume is F4 AdminEnvelope.
         let _ = AdminNonceStore::open_or_create(data_dir.join("admin-nonces.json"))?;
         // F8: one primary catalog row from mesh.json when the file is missing.
@@ -137,6 +139,7 @@ impl Agent {
             label,
             devices_path,
             grants_path,
+            enrollments_path,
             arm_path,
             join_dir,
             mesh_path,
@@ -163,6 +166,10 @@ impl Agent {
 
     fn pending(&self) -> Result<PendingKickStore> {
         PendingKickStore::open(&self.pending_kicks_path)
+    }
+
+    fn enrollments(&self) -> Result<EnrollmentStore> {
+        EnrollmentStore::open(&self.enrollments_path)
     }
 
     pub async fn run<T: Transport + ?Sized>(&self, transport: &T) -> Result<()> {
@@ -456,7 +463,7 @@ impl Agent {
                             }
                         }
                         ChannelKind::Control => {
-                            self.handle_control(&conn, &identity, peer, decode_msg(&frame.payload)?).await?;
+                            self.handle_control(conn.as_ref(), &identity, peer, decode_msg(&frame.payload)?).await?;
                         }
                         ChannelKind::Desktop => {
                             warn!("desktop not enabled yet");
@@ -505,7 +512,7 @@ impl Agent {
 
     async fn handle_control(
         &self,
-        conn: &Box<dyn mymesh_net::PeerConnection>,
+        conn: &dyn mymesh_net::PeerConnection,
         identity: &Identity,
         peer: mymesh_core::DeviceId,
         msg: ControlMessage,
@@ -849,6 +856,144 @@ impl Agent {
                     "GrantAnnounce received"
                 );
             }
+            ControlMessage::OwnerRevoke {
+                person_id,
+                by_person_id,
+                ts,
+                signature,
+            } => {
+                // Owner revoke: verify sender is enrolled owner, verify sig, then remove.
+                let enrollments = self.enrollments()?;
+                let by_owner = match enrollments.get(&by_person_id) {
+                    Some(e) if e.can_drive => e,
+                    _ => {
+                        warn!(by = %by_person_id, "OwnerRevoke from non-owner rejected");
+                        return Ok(());
+                    }
+                };
+                // Verify signature over revoke preimage.
+                let device_id = identity.device_id();
+                let preimage = match mymesh_core::wire::owner_revoke_preimage(
+                    device_id.as_bytes(),
+                    &person_id,
+                    &by_person_id,
+                    ts,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(%e, "OwnerRevoke preimage failed");
+                        return Ok(());
+                    }
+                };
+                let pk_bytes = match hex::decode(by_owner.person_public_key_hex.trim()) {
+                    Ok(b) if b.len() == 32 => {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&b);
+                        arr
+                    }
+                    _ => {
+                        warn!("OwnerRevoke invalid owner public key");
+                        return Ok(());
+                    }
+                };
+                if verify_owner_signature(&pk_bytes, &preimage, &signature).is_err() {
+                    warn!("OwnerRevoke signature verification failed");
+                    return Ok(());
+                }
+                // Timestamp skew check (±5 min).
+                let now = chrono::Utc::now().timestamp();
+                if (now - ts).abs() > 300 {
+                    warn!("OwnerRevoke timestamp outside skew window");
+                    return Ok(());
+                }
+                // Apply revoke.
+                let mut enrollments = self.enrollments()?;
+                match enrollments.revoke(&person_id) {
+                    Ok(rec) => {
+                        info!(person = %person_id, by = %by_person_id, "owner revoked, node forgets owner");
+                        // Notify sender of success (optional ack).
+                        let _ = conn
+                            .send_frame(Frame {
+                                channel: ChannelId::control(),
+                                payload: encode_msg(&ControlMessage::Pong { nonce: ts as u64 })?,
+                            })
+                            .await;
+                        let _ = rec; // silence unused
+                    }
+                    Err(e) => {
+                        warn!(%e, person = %person_id, "OwnerRevoke failed");
+                    }
+                }
+            }
+            ControlMessage::OwnerUpdate {
+                person_id,
+                label,
+                by_person_id,
+                ts,
+                signature,
+            } => {
+                // Owner update: verify sender is enrolled owner, verify sig, then update label.
+                let enrollments = self.enrollments()?;
+                let by_owner = match enrollments.get(&by_person_id) {
+                    Some(e) if e.can_drive => e,
+                    _ => {
+                        warn!(by = %by_person_id, "OwnerUpdate from non-owner rejected");
+                        return Ok(());
+                    }
+                };
+                // Verify signature over update preimage.
+                let device_id = identity.device_id();
+                let preimage = match mymesh_core::wire::owner_update_preimage(
+                    device_id.as_bytes(),
+                    &person_id,
+                    label.as_deref(),
+                    &by_person_id,
+                    ts,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(%e, "OwnerUpdate preimage failed");
+                        return Ok(());
+                    }
+                };
+                let pk_bytes = match hex::decode(by_owner.person_public_key_hex.trim()) {
+                    Ok(b) if b.len() == 32 => {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&b);
+                        arr
+                    }
+                    _ => {
+                        warn!("OwnerUpdate invalid owner public key");
+                        return Ok(());
+                    }
+                };
+                if verify_owner_signature(&pk_bytes, &preimage, &signature).is_err() {
+                    warn!("OwnerUpdate signature verification failed");
+                    return Ok(());
+                }
+                // Timestamp skew check (±5 min).
+                let now = chrono::Utc::now().timestamp();
+                if (now - ts).abs() > 300 {
+                    warn!("OwnerUpdate timestamp outside skew window");
+                    return Ok(());
+                }
+                // Apply update.
+                let mut enrollments = self.enrollments()?;
+                match enrollments.update_label(&person_id, label.clone()) {
+                    Ok(rec) => {
+                        info!(
+                            person = %person_id,
+                            label = ?label,
+                            by = %by_person_id,
+                            "owner label updated"
+                        );
+                        let _ = rec; // silence unused
+                    }
+                    Err(e) => {
+                        warn!(%e, person = %person_id, "OwnerUpdate failed");
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -1166,4 +1311,18 @@ fn write_leave_outbox(
         .collect();
     std::fs::write(&path, serde_json::to_string_pretty(&LeaveOutbox { items })?)?;
     Ok(())
+}
+
+/// Verify Ed25519 signature from an enrolled owner (person public key).
+fn verify_owner_signature(
+    person_pk: &[u8; 32],
+    preimage: &[u8],
+    signature: &[u8; 64],
+) -> Result<()> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let vk = VerifyingKey::from_bytes(person_pk)
+        .map_err(|_| mymesh_core::Error::PermissionDenied("invalid person public key".into()))?;
+    let sig = Signature::from_bytes(signature);
+    vk.verify(preimage, &sig)
+        .map_err(|_| mymesh_core::Error::PermissionDenied("owner signature invalid".into()))
 }
