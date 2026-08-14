@@ -4,6 +4,11 @@
 //! - **Local fabric**: in-process tests / demos
 //! - **Mailboxes**: filesystem (multiproc local) + HTTP (self-hosted)
 
+// Allow double_must_use: async_trait macro adds #[must_use] to futures,
+// and Result is already #[must_use]. This is a false positive from clippy
+// when using async_trait with functions that return Result.
+#![allow(clippy::double_must_use)]
+
 mod fabric;
 mod iroh_transport;
 mod local_dial;

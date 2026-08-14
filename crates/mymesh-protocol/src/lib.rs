@@ -11,5 +11,8 @@ mod messages;
 mod ser_fixed;
 
 pub use channel::{ChannelId, ChannelKind};
-pub use frame::{decode_msg, encode_msg, read_frame, write_frame, Frame, MAX_FRAME_BYTES};
+pub use frame::{
+    decode_json_msg, decode_msg, encode_json_msg, encode_msg, read_frame, read_json_msg,
+    write_frame, write_json_msg, Frame, MAX_FRAME_BYTES, MAX_JSON_MSG_BYTES,
+};
 pub use messages::*;

@@ -1726,16 +1726,15 @@ async fn cmd_enroll_start(paths: &Paths, _timeout: u64) -> Result<()> {
     let cfg = Config::load(paths.config_file())?;
     let device_id = identity.device_id();
 
-    // Create a new enrollment session
+    // Create a new enrollment session (no challenge generated - phone will provide it)
     let session = EnrollSession::new(device_id);
     let qr_payload = session.qr_payload();
-    let challenge = session.challenge.clone();
 
-    // Save the session (not yet confirmed)
+    // Save the session
     let file = EnrollSessionFile::new(session);
     file.save(paths.enroll_session_file())?;
 
-    // Display the QR code
+    // Display the QR code (no challenge printed - phone shows the code)
     println!("{}", style("Enrollment Mode").bold().cyan());
     println!();
     println!("Device: {}", style(device_id.short()).cyan());
@@ -1755,48 +1754,11 @@ async fn cmd_enroll_start(paths: &Paths, _timeout: u64) -> Result<()> {
     }
 
     println!();
-    println!(
-        "Challenge: {}",
-        style(format!(
-            "{} {} {}",
-            &challenge[0..2],
-            &challenge[2..4],
-            &challenge[4..6]
-        ))
-        .bold()
-        .yellow()
-    );
-    println!();
     println!("1. Scan the QR code with your phone (carrier app)");
-    println!("2. Enter the 6-digit challenge below to confirm physical presence");
+    println!("2. Your phone will show a 6-digit code");
+    println!("3. Type that code here when prompted");
     println!();
-
-    // Read challenge confirmation from stdin
-    print!("Enter challenge: ");
-    use std::io::Write;
-    std::io::stdout().flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    let input = input.trim();
-
-    // Load the session again and confirm the challenge
-    let mut session_file = EnrollSessionFile::load(paths.enroll_session_file())?;
-    if !session_file.session.is_valid() {
-        EnrollSessionFile::clear(paths.enroll_session_file())?;
-        bail!("enrollment session expired");
-    }
-
-    session_file
-        .session
-        .confirm_challenge(input)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    session_file.save(paths.enroll_session_file())?;
-
-    println!();
-    println!(
-        "{} challenge confirmed — waiting for carrier connection…",
-        style("ok").green().bold()
-    );
+    println!("{}", style("Waiting for phone connection…").dim());
 
     // Start iroh transport and wait for enrollment connection
     let transport = IrohTransport::bind(&identity)
@@ -1842,10 +1804,40 @@ async fn cmd_enroll_start(paths: &Paths, _timeout: u64) -> Result<()> {
             Ok(Ok((conn, alpn))) => {
                 match alpn {
                     AcceptedAlpn::Enroll => {
-                        let outcome =
-                            handle_enroll_connection(conn, &identity, &cfg.device_label, paths)
-                                .await
-                                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        // Create a challenge prompt callback that reads from stdin
+                        let prompt_fn: mymesh_session::ChallengePromptFn = Box::new(
+                            |_phone_digits| {
+                                Box::pin(async move {
+                                    println!();
+                                    println!(
+                                        "{}",
+                                        style("Phone connected! Enter the 6-digit code shown on your phone:")
+                                            .bold()
+                                            .yellow()
+                                    );
+                                    print!("Code: ");
+                                    use std::io::Write;
+                                    std::io::stdout().flush().map_err(|e| {
+                                        mymesh_core::Error::Other(format!("stdout flush: {e}"))
+                                    })?;
+                                    let mut input = String::new();
+                                    std::io::stdin().read_line(&mut input).map_err(|e| {
+                                        mymesh_core::Error::Other(format!("stdin read: {e}"))
+                                    })?;
+                                    Ok(input.trim().to_string())
+                                })
+                            },
+                        );
+
+                        let outcome = handle_enroll_connection(
+                            conn,
+                            &identity,
+                            &cfg.device_label,
+                            paths,
+                            prompt_fn,
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
                         match outcome {
                             EnrollOutcome::Accepted => {
@@ -1867,7 +1859,7 @@ async fn cmd_enroll_start(paths: &Paths, _timeout: u64) -> Result<()> {
                             }
                             EnrollOutcome::Denied => {
                                 println!(
-                                    "{} enrollment denied (invalid ticket or not confirmed)",
+                                    "{} enrollment denied (wrong code or invalid ticket)",
                                     style("error").red().bold()
                                 );
                                 // Continue waiting for another attempt
@@ -1897,12 +1889,17 @@ fn cmd_enroll_status(paths: &Paths) -> Result<()> {
             println!("{}", style("Enrollment Session").bold());
             println!("  session_id:  {}", sess.session_id);
             println!("  device_id:   {}", sess.device_id.short());
-            println!(
-                "  challenge:   {} {} {}",
-                &sess.challenge[0..2],
-                &sess.challenge[2..4],
-                &sess.challenge[4..6]
-            );
+            // Challenge is now provided by the phone, not generated by the node
+            if sess.challenge.len() == 6 {
+                println!(
+                    "  challenge:   {} {} {} (from phone)",
+                    &sess.challenge[0..2],
+                    &sess.challenge[2..4],
+                    &sess.challenge[4..6]
+                );
+            } else {
+                println!("  challenge:   (waiting for phone)");
+            }
             println!("  confirmed:   {}", sess.challenge_confirmed);
             println!("  created_at:  {}", sess.created_at);
             println!("  expires_at:  {}", sess.expires_at);
