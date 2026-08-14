@@ -13,7 +13,7 @@ mod rendezvous;
 mod traits;
 
 pub use fabric::{FabricConnection, LocalFabric};
-pub use iroh_transport::{IrohTransport, SharedIroh};
+pub use iroh_transport::{AcceptedAlpn, IrohTransport, SharedIroh};
 pub use local_dial::{
     admin_request, agent_control_live, agent_proxy_available, arm_pair_qr_via_agent, connect_mesh,
     connect_via_agent, default_control_socket, pair_http_port_live, serve_control_socket,

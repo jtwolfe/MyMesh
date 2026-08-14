@@ -5,6 +5,9 @@ use uuid::Uuid;
 /// ALPN identifier for MyMesh over QUIC/iroh.
 pub const ALPN: &[u8] = b"mymesh/1";
 
+/// ALPN identifier for device enrollment from carrier (phone).
+pub const ALPN_ENROLL: &[u8] = b"mymesh-enroll/1";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ControlMessage {
     Hello {
@@ -397,6 +400,40 @@ pub enum TcpMessage {
         data: Vec<u8>,
     },
     Close {
+        reason: String,
+    },
+}
+
+/// Enrollment protocol messages (ALPN `mymesh-enroll/1`).
+///
+/// Flow:
+/// 1. Carrier scans QR containing node device id and one-time ticket
+/// 2. Carrier connects over iroh using the enrollment ALPN
+/// 3. Carrier sends EnrollRequest with ticket, person identity, mesh name
+/// 4. Node verifies ticket + checks challenge was confirmed locally
+/// 5. Node stores owner person id, replies EnrollAccept or EnrollDeny
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum EnrollMessage {
+    /// Carrier → Node: request ownership enrollment.
+    EnrollRequest {
+        /// One-time ticket from QR code.
+        ticket: String,
+        /// Person public key (Ed25519, hex).
+        person_public_key_hex: String,
+        /// Person identity id (e.g. ULID).
+        person_id: String,
+        /// Display name for the mesh/person.
+        mesh_name: String,
+    },
+    /// Node → Carrier: enrollment accepted.
+    EnrollAccept {
+        /// Node device id (same as QR).
+        device_id: DeviceId,
+        /// Node's human-readable label.
+        label: String,
+    },
+    /// Node → Carrier: enrollment denied.
+    EnrollDeny {
         reason: String,
     },
 }

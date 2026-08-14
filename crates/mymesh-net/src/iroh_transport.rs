@@ -5,10 +5,19 @@ use iroh::endpoint::{presets, Connection, Endpoint, RecvStream, SendStream};
 use iroh::{EndpointId, SecretKey};
 use mymesh_core::{DeviceId, Error, Result};
 use mymesh_crypto::Identity;
-use mymesh_protocol::{read_frame, write_frame, Frame, ALPN};
+use mymesh_protocol::{read_frame, write_frame, Frame, ALPN, ALPN_ENROLL};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+/// Which ALPN was negotiated on an accepted connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcceptedAlpn {
+    /// Standard mymesh/1 protocol.
+    Mesh,
+    /// Enrollment protocol mymesh-enroll/1.
+    Enroll,
+}
 
 pub struct IrohTransport {
     endpoint: Endpoint,
@@ -17,7 +26,34 @@ pub struct IrohTransport {
 
 impl IrohTransport {
     /// Bind an iroh endpoint using the MyMesh identity seed.
+    /// Accepts both standard mesh ALPN and enrollment ALPN.
     pub async fn bind(identity: &Identity) -> Result<Self> {
+        let secret = SecretKey::from_bytes(&identity.to_secret_bytes());
+        let endpoint = Endpoint::builder(presets::N0)
+            .secret_key(secret)
+            .alpns(vec![ALPN.to_vec(), ALPN_ENROLL.to_vec()])
+            .bind()
+            .await
+            .map_err(|e| Error::Session(format!("iroh bind: {e}")))?;
+
+        let local_id = identity.device_id();
+        let iroh_id = endpoint.id();
+        if iroh_id.as_bytes() != local_id.as_bytes() {
+            return Err(Error::Identity(
+                "iroh EndpointId does not match MyMesh DeviceId".into(),
+            ));
+        }
+
+        info!(
+            id = %local_id.short(),
+            "iroh endpoint bound (mesh + enroll ALPNs)"
+        );
+
+        Ok(Self { endpoint, local_id })
+    }
+
+    /// Bind with only the standard mesh ALPN (for tests/compat).
+    pub async fn bind_mesh_only(identity: &Identity) -> Result<Self> {
         let secret = SecretKey::from_bytes(&identity.to_secret_bytes());
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret)
@@ -36,10 +72,54 @@ impl IrohTransport {
 
         info!(
             id = %local_id.short(),
-            "iroh endpoint bound"
+            "iroh endpoint bound (mesh ALPN only)"
         );
 
         Ok(Self { endpoint, local_id })
+    }
+
+    /// Accept a connection and return which ALPN was negotiated.
+    pub async fn accept_with_alpn(&self) -> Result<(Box<dyn PeerConnection>, AcceptedAlpn)> {
+        loop {
+            let incoming = self
+                .endpoint
+                .accept()
+                .await
+                .ok_or_else(|| Error::Session("endpoint closed".into()))?;
+            let conn = match incoming.await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(%e, "incoming connection failed");
+                    continue;
+                }
+            };
+            let alpn = match conn.alpn() {
+                alpn if alpn == ALPN => AcceptedAlpn::Mesh,
+                alpn if alpn == ALPN_ENROLL => AcceptedAlpn::Enroll,
+                other => {
+                    warn!(alpn = ?other, "unknown ALPN, rejecting");
+                    conn.close(1u32.into(), b"unknown ALPN");
+                    continue;
+                }
+            };
+            match IrohConn::open_as_acceptor(conn).await {
+                Ok(c) => return Ok((Box::new(c), alpn)),
+                Err(e) => warn!(%e, "accept_bi failed"),
+            }
+        }
+    }
+
+    /// Connect using the enrollment ALPN.
+    pub async fn connect_enroll(&self, peer: DeviceId) -> Result<Box<dyn PeerConnection>> {
+        let eid = EndpointId::from_bytes(peer.as_bytes())
+            .map_err(|e| Error::Session(format!("bad peer id: {e}")))?;
+        debug!(peer = %peer.short(), "iroh connect (enroll)");
+        let conn = self
+            .endpoint
+            .connect(eid, ALPN_ENROLL)
+            .await
+            .map_err(|e| Error::Session(format!("iroh connect enroll: {e}")))?;
+        Ok(Box::new(IrohConn::open_as_dialer(conn).await?))
     }
 
     pub fn endpoint(&self) -> &Endpoint {

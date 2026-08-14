@@ -14,8 +14,8 @@ use mymesh_core::wire::{CatalogRole, EnrollWriteBody};
 use mymesh_core::{
     not_after_days, parse_capabilities, parse_enroll_facet, read_enroll_sig_hex,
     status_pack as continuity_status_pack, wipe_pack as continuity_wipe_pack, ArmState, Capability,
-    Config, DeviceStore, EnrollmentStore, GrantRole, GrantStore, IssuedBy, JoinDecision, JoinStore,
-    MembershipStore, MeshState, Paths,
+    Config, DeviceStore, EnrollmentStore, EnrollSession, EnrollSessionFile, GrantRole, GrantStore,
+    IssuedBy, JoinDecision, JoinStore, MembershipStore, MeshState, Paths,
 };
 use mymesh_crypto::{
     accept_owner_claim, admin_verifying_key_bytes, apply_first_mesh_init, check_claim_authorized,
@@ -26,13 +26,13 @@ use mymesh_crypto::{
     OwnerBackupSealed, OwnerClaimRequest, RecoveryCode,
 };
 use mymesh_net::{
-    serve_control_socket, FsMailbox, HttpMailbox, IrohTransport, LocalFabric, LocalRendezvous,
-    Rendezvous, Transport,
+    serve_control_socket, AcceptedAlpn, FsMailbox, HttpMailbox, IrohTransport, LocalFabric,
+    LocalRendezvous, Rendezvous, Transport,
 };
 use mymesh_protocol::{decode_msg, encode_msg, ChannelId, FileMessage, Frame, TerminalMessage};
 use mymesh_session::{
-    apply_kick_target, apply_membership_gossip, build_announce, run_guest_pair,
-    run_host_pair_code, run_join_as_guest, sign_kick, Agent, Session,
+    apply_kick_target, apply_membership_gossip, build_announce, handle_enroll_connection,
+    run_guest_pair, run_host_pair_code, run_join_as_guest, sign_kick, Agent, EnrollOutcome, Session,
 };
 use mymesh_terminal::TerminalClient;
 use std::net::SocketAddr;
@@ -411,6 +411,16 @@ enum GrantCmd {
 enum EnrollCmd {
     /// List verified person drive bindings
     List,
+    /// Start QR+challenge enrollment (carrier scans QR, you enter challenge)
+    Start {
+        /// Timeout in seconds (default 120)
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+    },
+    /// Show current enrollment session status
+    Status,
+    /// Cancel pending enrollment session
+    Cancel,
     /// Revoke drive for a person (filesystem root)
     Revoke {
         #[arg(value_name = "PERSON_ID")]
@@ -837,6 +847,9 @@ async fn main() -> Result<()> {
         },
         Commands::Enroll { action } => match action {
             EnrollCmd::List => cmd_enroll_list(&paths)?,
+            EnrollCmd::Start { timeout } => cmd_enroll_start(&paths, timeout).await?,
+            EnrollCmd::Status => cmd_enroll_status(&paths)?,
+            EnrollCmd::Cancel => cmd_enroll_cancel(&paths)?,
             EnrollCmd::Revoke { person_id } => cmd_enroll_revoke(&paths, &person_id)?,
             EnrollCmd::Add {
                 person_id,
@@ -1703,6 +1716,202 @@ fn cmd_enroll_add(
     println!("  can_drive  {}", rec.can_drive);
     println!("  file       {}", paths.enrollments_file().display());
     println!("  revoke     mymesh enroll revoke {}", rec.person_id);
+    Ok(())
+}
+
+async fn cmd_enroll_start(paths: &Paths, _timeout: u64) -> Result<()> {
+    let identity = Identity::load(paths.identity_file())
+        .with_context(|| "no identity — run mymesh init first")?;
+    let cfg = Config::load(paths.config_file())?;
+    let device_id = identity.device_id();
+
+    // Create a new enrollment session
+    let session = EnrollSession::new(device_id);
+    let qr_payload = session.qr_payload();
+    let challenge = session.challenge.clone();
+
+    // Save the session (not yet confirmed)
+    let file = EnrollSessionFile::new(session);
+    file.save(paths.enroll_session_file())?;
+
+    // Display the QR code
+    println!("{}", style("Enrollment Mode").bold().cyan());
+    println!();
+    println!("Device: {}", style(device_id.short()).cyan());
+    println!();
+
+    // Generate and display QR code
+    let qr_json = qr_payload.to_json();
+    if let Ok(code) = qrcode::QrCode::new(qr_json.as_bytes()) {
+        let image = code.render::<char>().quiet_zone(false).module_dimensions(2, 1).build();
+        println!("{image}");
+    } else {
+        println!("QR: {qr_json}");
+    }
+
+    println!();
+    println!(
+        "Challenge: {}",
+        style(format!("{} {} {}", &challenge[0..2], &challenge[2..4], &challenge[4..6]))
+            .bold()
+            .yellow()
+    );
+    println!();
+    println!("1. Scan the QR code with your phone (carrier app)");
+    println!("2. Enter the 6-digit challenge below to confirm physical presence");
+    println!();
+
+    // Read challenge confirmation from stdin
+    print!("Enter challenge: ");
+    use std::io::Write;
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let input = input.trim();
+
+    // Load the session again and confirm the challenge
+    let mut session_file = EnrollSessionFile::load(paths.enroll_session_file())?;
+    if !session_file.session.is_valid() {
+        EnrollSessionFile::clear(paths.enroll_session_file())?;
+        bail!("enrollment session expired");
+    }
+
+    session_file
+        .session
+        .confirm_challenge(input)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    session_file.save(paths.enroll_session_file())?;
+
+    println!();
+    println!(
+        "{} challenge confirmed — waiting for carrier connection…",
+        style("ok").green().bold()
+    );
+
+    // Start iroh transport and wait for enrollment connection
+    let transport = IrohTransport::bind(&identity).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Wait for enrollment connection with timeout
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        // Check if session is still valid
+        let session_file = EnrollSessionFile::load(paths.enroll_session_file())?;
+        if !session_file.session.is_valid() {
+            EnrollSessionFile::clear(paths.enroll_session_file())?;
+            transport.shutdown().await;
+            bail!("enrollment session expired");
+        }
+        if session_file.session.completed_at.is_some() {
+            println!(
+                "{} enrolled {}",
+                style("success").green().bold(),
+                session_file.session.enrolled_person_id.as_deref().unwrap_or("(unknown)")
+            );
+            transport.shutdown().await;
+            return Ok(());
+        }
+
+        if std::time::Instant::now() > deadline {
+            EnrollSessionFile::clear(paths.enroll_session_file())?;
+            transport.shutdown().await;
+            bail!("enrollment timed out waiting for carrier connection");
+        }
+
+        // Accept with timeout
+        let accept_fut = transport.accept_with_alpn();
+        let accept_result = tokio::time::timeout(std::time::Duration::from_secs(5), accept_fut).await;
+
+        match accept_result {
+            Ok(Ok((conn, alpn))) => {
+                match alpn {
+                    AcceptedAlpn::Enroll => {
+                        let outcome = handle_enroll_connection(
+                            conn,
+                            &identity,
+                            &cfg.device_label,
+                            paths,
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                        match outcome {
+                            EnrollOutcome::Accepted => {
+                                // Reload session to get the enrolled person id
+                                let session_file = EnrollSessionFile::load(paths.enroll_session_file())?;
+                                println!();
+                                println!(
+                                    "{} device owned by {}",
+                                    style("success").green().bold(),
+                                    session_file.session.enrolled_person_id.as_deref().unwrap_or("(unknown)")
+                                );
+                                transport.shutdown().await;
+                                return Ok(());
+                            }
+                            EnrollOutcome::Denied => {
+                                println!("{} enrollment denied (invalid ticket or not confirmed)", style("error").red().bold());
+                                // Continue waiting for another attempt
+                            }
+                        }
+                    }
+                    AcceptedAlpn::Mesh => {
+                        // Not an enrollment connection, close and continue
+                        let _ = conn.close().await;
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(%e, "accept error");
+            }
+            Err(_) => {
+                // Timeout, loop again
+            }
+        }
+    }
+}
+
+fn cmd_enroll_status(paths: &Paths) -> Result<()> {
+    match EnrollSessionFile::try_load(paths.enroll_session_file())? {
+        Some(file) => {
+            let sess = &file.session;
+            println!("{}", style("Enrollment Session").bold());
+            println!("  session_id:  {}", sess.session_id);
+            println!("  device_id:   {}", sess.device_id.short());
+            println!(
+                "  challenge:   {} {} {}",
+                &sess.challenge[0..2],
+                &sess.challenge[2..4],
+                &sess.challenge[4..6]
+            );
+            println!("  confirmed:   {}", sess.challenge_confirmed);
+            println!("  created_at:  {}", sess.created_at);
+            println!("  expires_at:  {}", sess.expires_at);
+            println!("  valid:       {}", sess.is_valid());
+            if let Some(ref pid) = sess.enrolled_person_id {
+                println!("  enrolled:    {}", pid);
+            }
+            if !sess.is_valid() {
+                println!();
+                println!(
+                    "{}",
+                    style("Session expired or completed. Run `mymesh enroll start` for a new session.")
+                        .yellow()
+                );
+            }
+        }
+        None => {
+            println!("No pending enrollment session.");
+            println!("  start:   mymesh enroll start");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_enroll_cancel(paths: &Paths) -> Result<()> {
+    if EnrollSessionFile::clear(paths.enroll_session_file())? {
+        println!("{} enrollment session cancelled", style("ok").green().bold());
+    } else {
+        println!("No pending enrollment session.");
+    }
     Ok(())
 }
 
