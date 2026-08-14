@@ -180,6 +180,7 @@ impl Default for ByteLane {
 }
 
 impl ByteLane {
+    #[allow(dead_code)]
     fn new() -> Self {
         Self::default()
     }
@@ -237,18 +238,10 @@ impl ByteLane {
     }
 }
 
+#[derive(Default)]
 struct AdminBox {
     inbox: ByteLane,
     outbox: ByteLane,
-}
-
-impl Default for AdminBox {
-    fn default() -> Self {
-        Self {
-            inbox: ByteLane::default(),
-            outbox: ByteLane::default(),
-        }
-    }
 }
 
 struct BoundDid {

@@ -2544,6 +2544,7 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
+ "ed25519-dalek 2.2.0",
  "hex",
  "mymesh-core",
  "mymesh-crypto",

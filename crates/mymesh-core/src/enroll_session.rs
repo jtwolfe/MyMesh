@@ -187,8 +187,7 @@ impl EnrollSessionFile {
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        Self::try_load(path)?
-            .ok_or_else(|| Error::NotFound("enroll-session.json missing".into()))
+        Self::try_load(path)?.ok_or_else(|| Error::NotFound("enroll-session.json missing".into()))
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
@@ -286,11 +285,11 @@ mod tests {
         let mut sess = EnrollSession::new(did);
         assert!(sess.is_valid());
         assert!(!sess.can_enroll()); // Not confirmed yet
-        
+
         // Wrong challenge fails
         let wrong = sess.confirm_challenge("000000");
         assert!(wrong.is_err() || sess.challenge == "000000");
-        
+
         // Correct challenge works
         let challenge = sess.challenge.clone();
         sess.confirm_challenge(&challenge).unwrap();
@@ -322,10 +321,7 @@ mod tests {
 
     #[test]
     fn session_file_roundtrip() {
-        let dir = std::env::temp_dir().join(format!(
-            "mymesh-enroll-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("mymesh-enroll-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("enroll-session.json");
 

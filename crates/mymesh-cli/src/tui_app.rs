@@ -193,8 +193,9 @@ struct KickWizard {
     target_label: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum PromptKind {
+    #[default]
     None,
     LinkJoin,
     ArmSecs,
@@ -207,12 +208,6 @@ enum PromptKind {
     ExposePort,
     AllowCreatePassword,
     RecoveryShow,
-}
-
-impl Default for PromptKind {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 #[derive(Clone, Default)]
@@ -2057,13 +2052,11 @@ async fn transfer_selected(app: &mut App) {
             app.files.src.iter().find(|e| e.path == path).cloned()
         })
         .collect();
-    if paths.is_empty() {
-        if !app.files.src.is_empty() {
-            let i = app.files.src_sel.min(app.files.src.len() - 1);
-            let e = app.files.src[i].clone();
-            if !e.is_dir && e.name != ".." {
-                paths.push(e);
-            }
+    if paths.is_empty() && !app.files.src.is_empty() {
+        let i = app.files.src_sel.min(app.files.src.len() - 1);
+        let e = app.files.src[i].clone();
+        if !e.is_dir && e.name != ".." {
+            paths.push(e);
         }
     }
     paths.retain(|e| !e.is_dir && e.name != "..");
@@ -2268,8 +2261,6 @@ fn ui(f: &mut TuiFrame, app: &mut App) {
     // Undersized status was a common cause of "half missing" bottom bars on resize.
     let (header_h, action_h, status_h) = if root.height < 12 {
         (3u16, 0u16, 3u16)
-    } else if root.height < 18 {
-        (3, 3, 3)
     } else {
         (3, 3, 3)
     };
@@ -2540,7 +2531,7 @@ fn draw_action_bar(f: &mut TuiFrame, area: Rect, app: &mut App) {
             x,
             y: inner.y,
             width: bw,
-            height: inner.height.min(1).max(1),
+            height: inner.height.max(1),
         };
         let hot = match id {
             "arm" => ArmState::load(app.paths.arm_file())

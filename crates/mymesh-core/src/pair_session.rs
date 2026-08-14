@@ -541,7 +541,9 @@ pub enum PairConfirmError {
     AmbiguousPending,
     BadCode,
     /// S9: decide/confirm share 10 / min / token.
-    RateLimited { retry_after_secs: u64 },
+    RateLimited {
+        retry_after_secs: u64,
+    },
     Other(String),
 }
 

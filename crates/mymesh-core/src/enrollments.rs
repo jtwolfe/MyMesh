@@ -136,6 +136,24 @@ impl EnrollmentStore {
         Ok(rec)
     }
 
+    /// Update the label for an enrolled person. Returns the updated record.
+    pub fn update_label(
+        &mut self,
+        person_id: &str,
+        new_label: Option<String>,
+    ) -> Result<EnrollmentRecord> {
+        let rec = self
+            .file
+            .enrollments
+            .iter_mut()
+            .find(|e| e.person_id == person_id)
+            .ok_or_else(|| Error::NotFound(format!("enrollment {person_id}")))?;
+        rec.label = new_label;
+        let updated = rec.clone();
+        self.flush()?;
+        Ok(updated)
+    }
+
     fn flush(&self) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;

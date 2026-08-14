@@ -26,10 +26,7 @@ fn normalize_device_id_input(input: &str) -> String {
         s = rest.to_string();
     }
     // Collapse common separators for hex check first
-    let hex_candidate: String = s
-        .chars()
-        .filter(|c| c.is_ascii_hexdigit())
-        .collect();
+    let hex_candidate: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     if hex_candidate.len() == 64 {
         return hex_candidate;
     }
@@ -42,15 +39,17 @@ fn normalize_device_id_input(input: &str) -> String {
 
     // Word path: drop list markers like "1." "2)" "01:"
     let mut words = Vec::new();
-    for tok in s.split(|c: char| {
-        c.is_whitespace() || matches!(c, ',' | ';' | '|' | '/' | '\\' | '+' | '=')
-    }) {
+    for tok in s
+        .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '|' | '/' | '\\' | '+' | '='))
+    {
         let t = tok.trim();
         if t.is_empty() {
             continue;
         }
         // skip pure numbers / list indices
-        if t.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ')') {
+        if t.chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == ')')
+        {
             continue;
         }
         // "12.word" or "12)word"
