@@ -4,6 +4,7 @@ mod admin_nonces;
 mod config;
 mod continuity;
 mod device;
+mod enroll_session;
 mod enrollments;
 mod error;
 mod event_metrics;
@@ -32,6 +33,10 @@ pub use continuity::{
 pub use device::{
     remote_admin_authority, AdminAuthority, Capability, DeviceRecord, DeviceStore, MeshRole,
     TrustState,
+};
+pub use enroll_session::{
+    EnrollQrPayload, EnrollSession, EnrollSessionFile, ENROLL_ALPN, ENROLL_SESSION_EXPIRY_SECS,
+    QR_PAYLOAD_VERSION,
 };
 pub use enrollments::{
     parse_enroll_facet, read_enroll_sig_hex, verify_enroll_write, EnrollmentStore, MAX_ENROLLMENTS,

@@ -145,6 +145,11 @@ impl Paths {
         self.data_dir.join("tui.attached")
     }
 
+    /// Pending enrollment session (`enroll-session.json`, mode 0600).
+    pub fn enroll_session_file(&self) -> PathBuf {
+        self.data_dir.join("enroll-session.json")
+    }
+
     /// Continuity packs root: `continuity/<pack_id>/` mode 0700 (S8).
     pub fn continuity_dir(&self) -> PathBuf {
         self.data_dir.join("continuity")

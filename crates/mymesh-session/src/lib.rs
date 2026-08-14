@@ -4,6 +4,7 @@
 //! 24-word device-to-device pairing retained.
 
 mod agent;
+mod enroll;
 mod host_metrics;
 mod join;
 mod magic;
@@ -16,6 +17,7 @@ mod tcp_tunnel;
 mod two_agent_harness;
 
 pub use agent::Agent;
+pub use enroll::{handle_enroll_connection, EnrollOutcome};
 pub use host_metrics::sample_metrics;
 pub use join::{
     handle_join_as_host, handle_join_as_host_with_grants, run_join_as_guest,
